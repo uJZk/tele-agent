@@ -1,7 +1,10 @@
 package proto
 
 // WatchEvent is a batch of changes pushed by the server on the watch stream
-// (docs/telefs.md "一致性", "变更监视"). Seq increases by one per event.
+// (docs/telefs.md "一致性", "变更监视"). Seq increases by one per event. Each
+// event fits in MaxControlFrame. The server cannot know which events a
+// previous watch stream delivered, so every watch stream starts with an
+// event carrying a new Epoch.
 type WatchEvent struct {
 	Seq uint64 `cbor:"1,keyasint"`
 	// Epoch changes when the server lost events (queue overflow, watch
@@ -24,7 +27,8 @@ const (
 )
 
 // Change is one change inside a watched directory. An empty Name refers to
-// Dir itself.
+// Dir itself; a ChangeEntry with an empty Name means Dir was removed or
+// moved and the server no longer watches it under that path.
 type Change struct {
 	Dir  string     `cbor:"1,keyasint"`
 	Name string     `cbor:"2,keyasint,omitempty"`
