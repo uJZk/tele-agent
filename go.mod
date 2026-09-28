@@ -6,7 +6,11 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.4
 	github.com/hashicorp/yamux v0.1.2
 	go.uber.org/goleak v1.3.0
+	golang.org/x/net v0.59.0
 	golang.org/x/sys v0.48.0
 )
 
-require github.com/x448/float16 v0.8.4 // indirect
+require (
+	github.com/x448/float16 v0.8.4 // indirect
+	golang.org/x/text v0.42.0 // indirect
+)
