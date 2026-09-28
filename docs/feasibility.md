@@ -196,7 +196,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 服务端:  ═►fakeTCP relay(tele-server 内) :443/tcp → udp 127.0.0.1:Qs ─► swgp-server → udp 127.0.0.1:51820 ─► wg0(10.77.x.2)
 ```
 
-两层都可以关掉。关掉某一层时，WG peer 的 endpoint 直接指向下一层（或远端公网地址）。三种组合都要进入测试矩阵：{WG}、{WG+swgp}、{WG+phantun}、{WG+swgp+phantun}。
+两层都可以关掉。关掉某一层时，WG peer 的 endpoint 直接指向下一层（或远端公网地址）。四种组合都要进入测试矩阵：{WG}、{WG+swgp}、{WG+faketcp}、{WG+swgp+faketcp}。
 
 **拓扑**：本地一个 `tele0` 接口，**每台远端主机一个 peer**，每台主机独立一条 swgp 进程 + fake-TCP relay 链。地址按主机分配 `10.77.<n>.0/30`，或者 ULA `fd7e:1e::/64`。AllowedIPs 只包含对端的那个 /32，**不做**全局路由，避免影响本机的其他流量。
 
