@@ -2,3 +2,4 @@
 /internal/teleswitch/lib/*.so
 *.test
 *.out
+/.claude/worktrees/

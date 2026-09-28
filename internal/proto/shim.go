@@ -1,6 +1,6 @@
 package proto
 
-// Shim ↔ session main protocol (docs/exec.md section 2).
+// Shim ↔ session main protocol (docs/exec.md "shim 与会话主进程").
 //
 // The shim connects to the session's abstract unix socket and first sends a
 // single byte whose SCM_RIGHTS control message carries its fds 0, 1 and 2,

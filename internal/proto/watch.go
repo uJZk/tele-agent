@@ -1,7 +1,7 @@
 package proto
 
 // WatchEvent is a batch of changes pushed by the server on the watch stream
-// (docs/telefs.md sections 3 and 4). Seq increases by one per event.
+// (docs/telefs.md "一致性", "变更监视"). Seq increases by one per event.
 type WatchEvent struct {
 	Seq uint64 `cbor:"1,keyasint"`
 	// Epoch changes when the server lost events (queue overflow, watch

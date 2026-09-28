@@ -64,7 +64,7 @@ type HelloReply struct {
 	Err     *Error     `cbor:"2,keyasint,omitempty"`
 	Target  TargetInfo `cbor:"3,keyasint"`
 	// ScratchDir is the server-side directory that holds this session's
-	// scratch areas (docs/exec.md section 5).
+	// scratch areas (docs/exec.md "scratch 路径改写与回传").
 	ScratchDir string `cbor:"4,keyasint"`
 }
 
@@ -81,13 +81,13 @@ type TargetInfo struct {
 	Home         string `cbor:"8,keyasint"`
 	Shell        string `cbor:"9,keyasint"`
 	// LoginPath is PATH as set by the user's login shell; argv-form
-	// commands are looked up in it (docs/exec.md section 1).
+	// commands are looked up in it (docs/exec.md "shim").
 	LoginPath string `cbor:"10,keyasint"`
 }
 
 // SessionIDLen is the length of a session ID: lowercase hex of 8 random
 // bytes. The ID appears in paths that Claude sees, so it must never contain
-// characters that need quoting (docs/claude-code.md section 2).
+// characters that need quoting (docs/claude-code.md "CLAUDE_CODE_SHELL_PREFIX").
 const SessionIDLen = 16
 
 // CheckSessionID validates a session ID received from a peer.

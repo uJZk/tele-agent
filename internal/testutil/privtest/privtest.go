@@ -1,7 +1,7 @@
 // Package privtest gates tests that need privileges the environment may not
 // grant (user namespaces, FUSE). Such tests skip with the reason, unless
 // TELE_TEST_REQUIRE_PRIV=1 is set, in which case they fail so that CI never
-// skips them silently (docs/coding-standards.md section 11).
+// skips them silently (docs/coding-standards.md "测试").
 package privtest
 
 import (

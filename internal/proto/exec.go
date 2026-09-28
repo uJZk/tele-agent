@@ -2,7 +2,7 @@ package proto
 
 import "fmt"
 
-// Scratch limits (docs/exec.md section 5).
+// Scratch limits (docs/exec.md "scratch 路径改写与回传").
 const (
 	// ScratchFileMax bounds one scratch file carried in either direction.
 	ScratchFileMax = 1 << 20
@@ -19,7 +19,7 @@ type ExecStart struct {
 	// Dir is the working directory on the target host.
 	Dir string `cbor:"2,keyasint"`
 	// Env holds KEY=VALUE entries applied over the server's base
-	// environment for this session (docs/exec.md section 3).
+	// environment for this session (docs/exec.md "环境变量").
 	Env []string `cbor:"3,keyasint,omitempty"`
 	// TTY requests a pseudo-terminal of this size; nil means pipes, with
 	// stdout and stderr kept separate.
@@ -84,7 +84,7 @@ type ExecStatus struct {
 	Signal int `cbor:"2,keyasint,omitempty"`
 	// WatchSeq is the exec barrier: the client must apply every
 	// WatchEvent with Seq <= WatchSeq before reporting the exit
-	// (docs/exec.md section 6).
+	// (docs/exec.md "exec 屏障").
 	WatchSeq uint64 `cbor:"3,keyasint,omitempty"`
 	// Scratch lists scratch files that changed while the command ran.
 	Scratch []ScratchFile `cbor:"4,keyasint,omitempty"`
@@ -94,7 +94,7 @@ type ExecStatus struct {
 }
 
 // ScratchArea identifies one of the scratch prefixes (docs/exec.md
-// section 5).
+// "scratch 路径改写与回传").
 type ScratchArea uint8
 
 // Scratch areas.

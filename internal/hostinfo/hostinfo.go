@@ -123,7 +123,7 @@ func ParsePasswdShell(b []byte, uid uint32) string {
 
 // LoginPath runs shell as a login shell and returns the PATH it sets, or
 // FallbackPath if that fails. Commands in argv form are looked up in it
-// (docs/exec.md section 1).
+// (docs/exec.md "shim").
 func LoginPath(ctx context.Context, shell string) string {
 	ctx, cancel := context.WithTimeout(ctx, loginPathTimeout)
 	defer cancel()

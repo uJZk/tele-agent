@@ -28,7 +28,7 @@ type Session struct {
 func config() *yamux.Config {
 	c := yamux.DefaultConfig()
 	// Liveness belongs to the session layer below (heartbeats and resumption,
-	// docs/transport.md section 2). yamux must not close the connection
+	// docs/transport.md "可恢复会话层"). yamux must not close the connection
 	// while it is paused for a reconnect, so its own keepalive and open
 	// timeout are off and its write timeout matches the session lease.
 	c.EnableKeepAlive = false

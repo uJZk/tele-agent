@@ -5,7 +5,7 @@
 // Messages are CBOR maps with integer keys, carried in frames prefixed with a
 // 4-byte big-endian payload length. Fields may be added but never change
 // meaning, and the keys of removed fields are never reused
-// (docs/coding-standards.md section 7). All input from a peer is untrusted:
+// (docs/coding-standards.md "协议"). All input from a peer is untrusted:
 // the frame length is checked before decoding, and callers validate paths
 // and enum values with the Check* helpers.
 package proto

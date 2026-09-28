@@ -1,6 +1,6 @@
 // Command tele runs Claude Code locally against a remote host. It is a
 // multi-call binary: the role is chosen by the name it was invoked as
-// (shims) or by its first argument (docs/architecture.md section 4).
+// (shims) or by its first argument (docs/architecture.md "进程与角色").
 package main
 
 import (

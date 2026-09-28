@@ -9,11 +9,11 @@ make build        # 构建 bin/tele（先编译 teleswitch 预加载库，再嵌
 make test         # 单元测试（-race），不需要特权
 make lint         # golangci-lint，必须零告警
 make check        # 提交前检查：格式、vet、lint、test
-make test-priv    # 特权集成测试（userns、FUSE），要求环境具备能力，否则失败
+make test-priv    # 特权集成测试（userns、FUSE）：设置 TELE_TEST_REQUIRE_PRIV=1，环境不具备能力时失败而不是跳过
 go test ./internal/<pkg> -run TestName   # 运行单个测试
 ```
 
-`TELE_TEST_CLAUDE=<claude 路径>` 启用 Claude 兼容性测试（[docs/claude-code.md](docs/claude-code.md) 第 8 节）。
+`TELE_TEST_CLAUDE=<claude 路径>` 启用 Claude 兼容性测试（见 [docs/claude-code.md](docs/claude-code.md#验证方法)）。
 
 ## 文档
 
@@ -21,28 +21,29 @@ go test ./internal/<pkg> -run TestName   # 运行单个测试
 
 | 文档 | 内容 |
 |---|---|
-| [architecture.md](docs/architecture.md) | 目标与非目标、设计决策及理由、进程与角色 |
-| [claude-code.md](docs/claude-code.md) | 与 Claude Code 的隐式契约：注入点、scratch 文件、注入的环境、系统提示词 |
-| [filesystem.md](docs/filesystem.md) | 远端视图、本地集合、命名空间构建、teleswitch、已知陷阱、待验证假设 |
-| [telefs.md](docs/telefs.md) | FUSE 文件系统：协议、一致性、变更监视、断线恢复 |
-| [exec.md](docs/exec.md) | shim、shim 与会话主进程的约定、环境变量、信号、scratch 改写、exec 屏障 |
-| [transport.md](docs/transport.md) | SS2022、可恢复会话层、断线语义 |
-| [cli.md](docs/cli.md) | 命令行、启动流程、安装配对、预检与修复策略 |
+| [architecture.md](docs/architecture.md) | 目标、非目标与关键设计决策 |
+| [claude-code.md](docs/claude-code.md) | tele 依赖的 Claude Code 行为（隐式契约）及其验证方法 |
+| [filesystem.md](docs/filesystem.md) | Claude 进程看到的文件系统视图及其构建方式 |
+| [telefs.md](docs/telefs.md) | 远端文件系统的 FUSE 实现 |
+| [exec.md](docs/exec.md) | 命令的远程执行与 shim |
+| [transport.md](docs/transport.md) | 传输与可恢复会话层 |
+| [cli.md](docs/cli.md) | 命令行、启动流程、安装与预检 |
 | [security.md](docs/security.md) | 信任边界与安全约束 |
 
 ## 容易出错的地方
 
-- **Go 运行时是多线程的**：`unshare`、`setns`、`capset` 不能在普通 goroutine 中调用，要通过重新 exec 自己完成（coding-standards 第 6 节）。
+- **Go 运行时是多线程的**：`unshare`、`setns`、`capset` 不能在普通 goroutine 中调用，要通过重新 exec 自己完成（见[系统调用、命名空间与进程](docs/coding-standards.md#系统调用命名空间与进程)）。
 - **shim 的 stdio 属于被代理的命令**：绝不向其中写诊断信息，否则会破坏命令输出和 MCP 的 JSON-RPC 流。
 - **视图切换必须失败关闭**：Claude 进程在本地视图中继续运行，会把本地文件当作远端文件修改。
 - **errno 保真**：远端的 errno 原样传回本地，不折叠成 `EIO`。
 - **抽象 unix socket 没有权限保护**：必须校验 `SO_PEERCRED` 和会话 token。
-- **不要对本地集合的挂载点及其祖先发送 FUSE entry 失效**：可能卸下 bind 挂载（filesystem 第 6 节）。
+- **不要对本地集合的挂载点及其祖先发送 FUSE entry 失效**：可能卸下 bind 挂载（见[已知陷阱](docs/filesystem.md#已知陷阱)）。
 - **Claude Code 的行为大多没有文档**：兼容性测试失败时，先确认并更新 `docs/claude-code.md`，再改代码。
 
 ## 约定
 
 - 文档用中文；代码、注释、标识符和提交信息用英文。
+- 文档之间、代码注释到文档都按小节标题引用，不写小节编号。
 - 提交前运行 `make check`。改变行为的代码，与相应的文档更新放在同一个提交里。
 
 ## 文档规范

@@ -1,7 +1,7 @@
 package proto
 
 // FSOp identifies an FSRequest. The operations mirror FUSE operations; paths
-// are absolute paths on the target host (docs/telefs.md section 2).
+// are absolute paths on the target host (docs/telefs.md "组成").
 type FSOp uint8
 
 // File system operations. "Path" and "Name" below refer to FSRequest fields.
@@ -85,7 +85,7 @@ type FSRequest struct {
 
 // FSResponse is the only server frame on an FS stream. Errno is the remote
 // errno, returned unchanged to the kernel (docs/coding-standards.md
-// section 4).
+// "错误处理").
 type FSResponse struct {
 	Errno   uint32     `cbor:"1,keyasint,omitempty"`
 	Attr    *Attr      `cbor:"2,keyasint,omitempty"`
