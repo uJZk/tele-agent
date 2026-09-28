@@ -8,7 +8,9 @@ type FSOp uint8
 const (
 	// FSLookup: Name in directory Path → Attr.
 	FSLookup FSOp = 1
-	// FSGetattr: Path → Attr.
+	// FSGetattr: Path → Attr. When Handle is set, the attributes of that
+	// open file instead, which still works after it was renamed or
+	// unlinked.
 	FSGetattr FSOp = 2
 	// FSSetattr: Path (and Handle if set) with SetAttr → Attr.
 	FSSetattr FSOp = 3
@@ -60,7 +62,14 @@ const (
 	// FSRemovexattr: attribute Name2 of Path.
 	FSRemovexattr FSOp = 26
 	// FSForget: the client dropped directory Path from its cache; the
-	// server stops watching it. No response is expected.
+	// server stops watching it. No response is expected; the server closes
+	// the stream once the watch is gone.
+	//
+	// The server starts watching a directory (docs/telefs.md section 4)
+	// when a request names it as the directory to look up, create, remove
+	// or rename entries in: Path of FSLookup, FSCreate, FSMkdir, FSMknod,
+	// FSUnlink, FSRmdir, FSSymlink and FSRename, Path2 of FSRename and
+	// FSLink, and the directory of FSOpendir and FSReaddir.
 	FSForget FSOp = 27
 )
 
@@ -97,6 +106,11 @@ type FSResponse struct {
 	Size    uint32     `cbor:"8,keyasint,omitempty"`
 	Statfs  *Statfs    `cbor:"9,keyasint,omitempty"`
 	Target  string     `cbor:"10,keyasint,omitempty"`
+	// Unwatched reports that the server could not watch the directory the
+	// request named (for example EACCES or the inotify watch limit), so no
+	// change to it will be pushed and the client must cache what this
+	// response returns only briefly (docs/telefs.md sections 3 and 4).
+	Unwatched bool `cbor:"11,keyasint,omitempty"`
 }
 
 // Attr is the result of lstat on the target host. Owners are the raw remote
@@ -143,7 +157,9 @@ type SetAttr struct {
 }
 
 // DirEntry is one directory entry with its attributes (readdirplus).
-// Offset is the value to pass in the next FSReaddir to continue after it.
+// Offset is the value to pass in the next FSReaddir to continue after it;
+// it is the directory cookie of the target host and never 0, which means
+// "from the start". Listings include "." and "..".
 type DirEntry struct {
 	Name   string `cbor:"1,keyasint"`
 	Attr   Attr   `cbor:"2,keyasint"`
