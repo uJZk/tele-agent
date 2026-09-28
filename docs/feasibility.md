@@ -168,7 +168,7 @@ Claude Code 是本地程序，它启动和运行时需要的文件原本都得�
 |---|---|---|
 | Claude 二进制与动态库（ld.so、libc 等） | **先在本地视图中加载，再切换**：Claude 在本地 mountns 中 exec，动态链接器完成所有 `DT_NEEDED` 库的映射之后、`main` 之前，由预加载库把整个进程切换到远端视图（4.4）。之后访问 `/proc/self/exe` 走的是 magic link，与路径无关，所以 bun 读取内嵌 JS 不受影响。会在运行时 dlopen 的库（如 libgcc_s）在切换前预先加载 | 不再需要本地例外 |
 | DNS（`resolv.conf`、`hosts`、`nsswitch.conf` 等） | 会话主进程在本地回环上提供 **CONNECT 代理**，并设置 `HTTPS_PROXY`/`HTTP_PROXY=http://127.0.0.1:<port>`。如果用户原本配置了代理，就串联在后面。Claude 自己不再做 DNS 解析，由代理在本地视图中完成 | 不再需要本地例外 |
-| CA 证书 | 直接使用**远端**的证书库（公网 CA 与本地一致）。如果用户设置了 `NODE_EXTRA_CA_CERTS` 或 `SSL_CERT_FILE` 指向本地文件，tele 把该文件复制到 `/.tele/<sid>/` 并改写环境变量 | 不再需要本地例外 |
+| CA 证书 | **使用本地的 CA**：Claude 的 TLS 连接经本地代理从本机网络出站，信任关系应当与本地网络一致（例如公司的 HTTPS 中间人 CA）；而远端可能根本没有安装 `ca-certificates`，或者版本很旧。启动时把本地系统 CA（以及用户原有的 `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`）合并为 `/.tele/<sid>/ca-bundle.pem`，并用 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS` 指向它。**不** bind 到 `/etc/ssl`，所以远端视图中的 `/etc/ssl/certs` 仍然是远端内容 | 使用本地 CA，但不增加本地例外 |
 | `git`、`rg`、`uname` | `PATH` 只包含 `/.tele/<sid>/bin` 中的转发 shim | 在远端执行 |
 | `/bin/sh`（hooks 的 `shell:true` 固定使用它） | 替换为 tele 的 multi-call `sh`：`-c` 收到的脚本如果是 `'<tele-exec>' '<cmd>'` 形式就直接 exec，否则交给远端的 sh 执行 | 在语义上等同远端 sh |
 | 需要本地运行的程序（例如 tree-kill 调用的 `ps`，它必须看到本地进程） | `PATH` 中放**本地 exec 代理**的符号链接：shim 通过 `SCM_RIGHTS` 把自己的 stdio 交给会话主进程，由会话主进程在本地视图中执行真实程序 | 本地执行 |
@@ -181,7 +181,7 @@ Claude Code 是本地程序，它启动和运行时需要的文件原本都得�
 | `/etc/claude-code/` | 企业托管策略必须来自本机 | 远端通常不存在 |
 | `/proc`、`/sys`、`/dev` | Claude 进程自身要用（`/proc/self` 等） | 实际不构成例外：Agent 通过 Bash 或 Grep/Glob（`rg` shim）访问这些路径，都在远端执行；只有 Read/Write/Edit 直接打开它们时看到的是本地内容，这种用法很少 |
 | `/bin/sh` | tele 的转发 sh（见上表） | 语义等同远端 sh |
-| `/.tele/<sid>/` | shim、scratch、`CLAUDE_CODE_TMPDIR`、预加载库、CA 副本 | 远端不存在该路径 |
+| `/.tele/<sid>/` | shim、scratch、`CLAUDE_CODE_TMPDIR`、预加载库、本地 CA bundle | 远端不存在该路径 |
 
 `/etc/hosts`、`/etc/resolv.conf`、`/usr/lib/...`、`/lib64/ld-linux...` 等路径在 Claude 看来**都是远端内容**。
 
@@ -191,6 +191,7 @@ Claude Code 是本地程序，它启动和运行时需要的文件原本都得�
 - 切换之后，Claude 是否还会 dlopen 或打开别的本地运行时文件（用 `strace` 对切换后的访问做差异比对）。
 - `getpwuid`：本地 uid 在远端 `/etc/passwd` 中可能不存在，要确认 `os.userInfo()` 等调用是否受影响，以及 `USER`/`HOME` 环境变量是否足以兜底。
 - Claude 的所有出站 HTTP（API、WebFetch、遥测、OAuth 刷新）都遵循代理；不走代理的出站流量会在远端视图中做 DNS 解析，从而失败。
+- 只靠 `SSL_CERT_FILE`/`NODE_EXTRA_CA_CERTS`，Claude（bun）就会使用 `/.tele/<sid>/ca-bundle.pem`，而不再依赖系统证书目录（strace 显示它会探测 `/etc/ssl/certs` 等目录）。**退路**：把本地证书目录 bind 到 `/etc/ssl` 等路径，代价是多一个本地例外。
 
 ### 4.3 HOME
 
@@ -435,7 +436,7 @@ This session operates on the remote host "{{alias}}" via tele.
 
 | 阶段 | 内容 | 预计 |
 |---|---|---|
-| **P0 验证** | 本地模拟远端（同机两个进程 + unix socket）：**`teleswitch.so`：main 前 setns 切换视图（最优先验证）**、pivot_root 到 FUSE 根 + 嵌套 mountns 的 bind 挂载、CONNECT 代理覆盖所有出站流量、切换后的 strace 差异、本地 exec 代理、`/bin/sh` 替换、HOME 映射、`getpwuid`；Bash（cd 持久化、后台任务、超时、Ctrl-C）、快照、scratch 改写与回传、两种形式的 hooks、stdio MCP、`rg`/`git` shim、userns + telefs 回环后端；建立 `claude -p` 兼容性测试 | 1–1.5 周 |
+| **P0 验证** | 本地模拟远端（同机两个进程 + unix socket）：**`teleswitch.so`：main 前 setns 切换视图（最优先验证）**、pivot_root 到 FUSE 根 + 嵌套 mountns 的 bind 挂载、CONNECT 代理覆盖所有出站流量、切换后的 strace 差异、本地 CA bundle 是否生效、本地 exec 代理、`/bin/sh` 替换、HOME 映射、`getpwuid`；Bash（cd 持久化、后台任务、超时、Ctrl-C）、快照、scratch 改写与回传、两种形式的 hooks、stdio MCP、`rg`/`git` shim、userns + telefs 回环后端；建立 `claude -p` 兼容性测试 | 1–1.5 周 |
 | **P1 MVP** | 单二进制；SS2022 + 会话层（续传、心跳）；exec 服务；telefs（exec 屏障 + 推送）；`tele <别名>[:<目录>]` 命令行与 `tele host`/`tele doctor`；系统提示词生成；配对安装 | 5–6 周 |
 | **P2 加固** | 先建后断与 netlink 主动重拨；故障注入测试矩阵；telefs 性能（readdirplus、小文件预取）；exec 形式 hooks 的改写 | 3 周 |
 | **P3 发布** | AppArmor profile、systemd --user 单元、发布流程（静态二进制、校验和）、文档 | 1–2 周 |
@@ -453,6 +454,7 @@ CLAUDE_CODE_SHELL_PREFIX=<sess>/bin/tele-exec      # hooks + stdio MCP
 CLAUDE_CODE_TMPDIR=<sess>/tmp                      # 本地 scratch；远端路径由 shim 改写（/tmp 本身是远端的）
 USE_BUILTIN_RIPGREP=0
 HTTPS_PROXY=http://127.0.0.1:<port>                # 本地 CONNECT 代理（4.2）；HTTP_PROXY 同理；用户原有代理串联在后
+SSL_CERT_FILE=<sess>/ca-bundle.pem                 # 本地 CA 合并而成（4.2）；NODE_EXTRA_CA_CERTS 同样指向它
 LD_PRELOAD=<sess>/lib/teleswitch.so                # main 前切换到远端视图，随后从环境中清除（4.4）
 PATH=<sess>/bin                                    # 只有 shim：bash/rg/git/uname/sh 转发远端，ps 等为本地 exec 代理（4.2）
 HOME=<目标主机上的远端 home>                       # ~/.claude* 在本地集合中挂到这里（4.3）
