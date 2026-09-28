@@ -7,7 +7,7 @@
 
 ## 0. 结论与已定决策
 
-**结论：可行。** Claude Code 仍在本地运行。活跃主机的**整个根文件系统**通过自研的 FUSE 文件系统 **telefs** 透明代理给 Claude 进程（pivot_root），只有 Claude 自身运行必需的少量路径保留在本地。所有执行类操作（Bash、hooks、stdio MCP、rg、git）通过 Claude Code 官方的环境变量注入点转发到远端。传输层是 **Shadowsocks 2022 over TCP**，上面叠一层**可恢复会话层**。客户端是**单一静态二进制**，**两端都不需要 root 或任何 capability**。Claude Code 本身不需要打补丁。
+**结论：可行。** Claude Code 仍在本地运行。目标主机的**整个根文件系统**通过自研的 FUSE 文件系统 **telefs** 透明代理给 Claude 进程（pivot_root），只有 Claude 自身运行必需的少量路径保留在本地。所有执行类操作（Bash、hooks、stdio MCP、rg、git）通过 Claude Code 官方的环境变量注入点转发到远端。传输层是 **Shadowsocks 2022 over TCP**，上面叠一层**可恢复会话层**。客户端是**单一静态二进制**，**两端都不需要 root 或任何 capability**。Claude Code 本身不需要打补丁。
 
 | # | 决策 | 结果 |
 |---|---|---|
@@ -15,18 +15,19 @@
 | D2 | 传输层 | **database64128/shadowsocks-go 的 SS2022（TCP）+ 可恢复会话层**；不用 WireGuard、swgp、fake-TCP，也**不保留**为可选后端 |
 | D3 | 许可证 | 全项目 **AGPL-3.0** |
 | D4 | 客户端形态 | **单一静态二进制 `tele`**（multi-call）；远端使用同一个二进制 |
-| D5 | 主机切换 | **热切换**（不重启 Claude） |
-| D6 | 多主机 | 任意时刻**只有一台活跃主机**，不需要同时挂载多台主机的路径 |
-| D7 | 名称 | 本地 MCP server 叫 **`tele-agent`**；远端服务叫 **`tele-server`**（与 `tele server` 子命令对应） |
+| D5 | 使用方式 | **`tele <主机别名> [-d <工作目录>] claude …`**：启动时选定一台主机，会话中**不切换**；`-d` 默认为远端用户的家目录 |
+| D6 | 本地 MCP | **不提供**：MCP 形式的冷切换和热切换都放弃，因为可能与 Claude Code 自带指令冲突，工作目录的切换也难以处理 |
+| D7 | 系统提示词 | `--append-system-prompt-file` **只写目标服务端的信息**（6.5） |
+| D8 | 名称 | 远端服务叫 **`tele-server`**（对应 `tele server` 子命令） |
 
 | 需求 | 可行性 | 实现方式 | 主要风险 |
 |---|---|---|---|
-| `tele claude` 启动 | ✅ 高 | 启动器：建 userns 和 mountns → 挂载 telefs → 设环境变量 → 启动 `claude` | AppArmor 对 userns 的限制（Ubuntu） |
+| `tele <别名> [-d 目录] claude` 启动 | ✅ 高 | 启动器：建立会话 → 建 userns 和 mountns → 挂载 telefs → 设环境变量 → 在工作目录中启动 `claude` | AppArmor 对 userns 的限制（Ubuntu） |
 | Bash 远程执行 | ✅ 高 | `CLAUDE_CODE_SHELL` → `bash` shim | 依赖未公开的内部行为（cwd 文件、快照） |
 | hooks / stdio MCP 远程执行 | ✅ 高 | `CLAUDE_CODE_SHELL_PREFIX` → `tele-exec` shim（已核实同时覆盖两者） | exec 形式的 hook 可能绕过 prefix |
-| 文件工具（Read/Write/Edit 等） | ✅ 高 | telefs 把活跃主机的**整个根文件系统**透明代理给 Claude 进程，只保留 Claude 自身运行所需的最小本地集合（第 4 节）；exec 屏障 + 失效推送保证一致性 | 需自研，约 3–4 周；本地集合需按版本实测 |
+| 文件工具（Read/Write/Edit 等） | ✅ 高 | telefs 把目标主机的**整个根文件系统**透明代理给 Claude 进程，只保留 Claude 自身运行所需的最小本地集合（第 4 节）；exec 屏障 + 失效推送保证一致性 | 需自研，约 3–4 周；本地集合需按版本实测 |
 | Grep/Glob、Claude 内部的 git 调用 | ✅ 高 | `USE_BUILTIN_RIPGREP=0` + `rg`/`git` shim，在远端执行 | 无 |
-| 本地 MCP `tele-agent` | ✅ 高 | `tele mcp`：list / status / switch / install_guide | 热切换的边界情况（第 6 节） |
+| 系统提示词 | ✅ 高 | `--append-system-prompt-file`，只写目标服务端的信息 | 无 |
 | 传输与重连 | ✅ 高 | SS2022 + 会话层（续传、心跳、网络变化时主动重拨） | 会话层需自研，约 2 周 |
 | 单二进制 | ✅ 已实测 | 4.5 MB 静态探针（SS2022 + go-fuse） | Go ≥ 1.27 |
 | 仅 Linux、Go 语言 | ✅ | — | — |
@@ -37,13 +38,12 @@
 
 **目标**
 
-1. `tele claude [args...]` 与 `claude [args...]` 的体验一致，只是「世界」在远端：Bash、hooks、MCP server 都在远端执行，**整个文件系统**也是远端的（除第 4.2 节的本地集合）。
+1. `tele <别名> [-d 目录] claude [args...]` 与 `claude [args...]` 的体验一致，只是「世界」在远端：Bash、hooks、MCP server 都在远端执行，**整个文件系统**也是远端的（除第 4.2 节的本地集合）。
 2. 远端**不需要**安装 Node 或 Claude Code，**不存放** Anthropic 凭证。凭证、会话历史和 `~/.claude` 都留在本地。
-3. 本地 MCP `tele-agent`：Claude 可以列出主机、查看状态、**热切换**主机（包括 `local`），并能拿到远端服务端的安装指引。
-4. 网络断开、切换网络时自动恢复，Claude 侧无感。
-5. Go 实现，仅支持 Linux，两端不需要特权。
+3. 网络断开、切换网络时自动恢复，Claude 侧无感。
+4. Go 实现，仅支持 Linux，两端不需要特权。
 
-**非目标**：macOS/Windows；同时挂载多台主机（D6）；多人共享同一个远端会话；远端进程重启后恢复正在运行的命令（见 5.4）；Claude Code 自带的 bubblewrap 沙箱与远程执行的组合。
+**非目标**：会话中切换主机，以及任何形式的本地 MCP（D5、D6）；同时挂载多台主机；macOS/Windows；多人共享同一个远端会话；远端进程重启后恢复正在运行的命令（见 5.4）；Claude Code 自带的 bubblewrap 沙箱与远程执行的组合。
 
 ---
 
@@ -51,18 +51,17 @@
 
 ```
 ┌──────────────────────────── 本地（普通用户，无特权）─────────────────────────────┐
-│ tele claude  (单二进制)                                                          │
+│ tele <别名> [-d 目录] claude  (单二进制)                                          │
 │  └─ [userns + mountns]  启动器第 2 阶段 = 会话主进程                              │
-│       ├─ telefs FUSE 服务端 ── 活跃主机的整个 / （claude 子进程 pivot_root 进去）   │
-│       ├─ 会话层 + SS2022 客户端 ── 每台已连接主机一个会话，其中一台为「活跃」      │
+│       ├─ telefs FUSE 服务端 ── 目标主机的整个 / （claude 子进程 pivot_root 进去）   │
+│       ├─ 会话层 + SS2022 客户端 ── 连接目标主机                                  │
 │       ├─ unix socket  ◄── shim 的请求（bash / tele-exec / rg / git）              │
 │       └─ claude（原版，子进程）                                                   │
 │            ├ Bash    → CLAUDE_CODE_SHELL=<sess>/bin/bash      ─┐                  │
 │            ├ hooks   → CLAUDE_CODE_SHELL_PREFIX=<sess>/bin/tele-exec              │
 │            ├ MCP     → 同上（长连接 stdio 代理）                ├─► 会话主进程     │
 │            ├ Grep/Glob/git → PATH 中的 <sess>/bin/{rg,git}   ─┘                  │
-│            ├ Read/Write/Edit → VFS → telefs                                        │
-│            └ MCP "tele-agent" → tele mcp（本地）                                   │
+│            └ Read/Write/Edit → VFS → telefs                                        │
 └────────────────────────────────────────┬───────────────────────────────────────┘
                                          │ SS2022 over TCP（多条连接，同属一个会话）
 ┌────────────────────────────────────────▼───────────────────────────────────────┐
@@ -75,12 +74,11 @@
 
 | 角色 | 调用方式 | 说明 |
 |---|---|---|
-| CLI | `tele host add/ls/rm`、`tele status` | — |
-| 启动器与会话主进程 | `tele claude …`，内部通过 `/proc/self/exe` 在新的 userns 中重新 exec | claude 的父进程；持有 FUSE、会话和 unix socket |
+| CLI | `tele host add/confirm/ls/rm`、`tele doctor` | — |
+| 启动器与会话主进程 | `tele <别名> [-d 目录] claude …`，内部通过 `/proc/self/exe` 在新的 userns 中重新 exec | claude 的父进程；持有 FUSE、会话和 unix socket |
 | Bash shim | `<sess>/bin/bash → tele` | `CLAUDE_CODE_SHELL` 的路径**必须包含 "bash"** |
 | hooks / MCP 前缀 | `<sess>/bin/tele-exec → tele` | stdio MCP 把整个 PREFIX 当作可执行文件名直接 spawn（已核实），所以不能写成 `tele --exec` 这种带参数的形式 |
 | `rg`、`git` shim | `<sess>/bin/{rg,git} → tele` | 通过 PATH 查找 |
-| MCP `tele-agent` | `tele mcp` | 写在 `--mcp-config` 里；本地执行，不经过 PREFIX |
 | 远端服务 | `tele server run` / `tele server install --pair …` | — |
 
 **实测**（Go 1.27.0，`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`）：把 shadowsocks-go 的 SS2022 客户端和服务端、go-fuse v2.11.0 链接在一起，得到一个 4.5 MB 的静态、stripped ELF。以 `bash` 为名调用时能正确分派到 shim。功能完整后预计 10–15 MB。
@@ -128,7 +126,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 | 文件 | 谁写 | 谁读 | 处理 |
 |---|---|---|---|
 | cwd 文件（`pwd -P >| …`，位于 `CLAUDE_CODE_TMPDIR`） | 远端脚本 | 本地 Claude | **回传**：exec 结束时连同退出码一起返回内容，shim 写入本地 |
-| shell 快照（`<config>/shell-snapshots/*.sh`） | 远端（生成脚本） | 远端脚本 source；本地 Claude 检查是否存在 | **按主机保存**：远端保留一份，本地保留副本以通过存在性检查；切换主机时在新主机上**重放生成脚本**（6.2） |
+| shell 快照（`<config>/shell-snapshots/*.sh`） | 远端（生成脚本） | 远端脚本 source；本地 Claude 检查是否存在 | 远端保留一份，回传一份本地副本以通过存在性检查 |
 | `CLAUDE_ENV_FILE`（`<config>/session-env/…`，由 SessionStart hook 写入） | 远端 hook | 本地 Claude | 回传 |
 | `tasks/` 标记文件（`echo 0 >| …/tasks`） | 远端脚本 | 本地 Claude | 回传 |
 | 后台任务输出文件 | Claude 在**本地** `open(path,"w")` 后，以 fd 作为子进程的 stdout（**已核实**） | 本地 | 不需要处理：远端输出经 shim 写入本地 fd |
@@ -142,10 +140,10 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 | 行为 | 处理 |
 |---|---|
 | Read/Write/Edit/NotebookEdit、图片和 PDF 读取、`@` 引用 | 进程内 fs 调用 → telefs |
-| 启动时加载的 `CLAUDE.md`、`.claude/*`、`.mcp.json` | 项目级的来自活跃主机（telefs）；全局的 `~/.claude/*` 和 `/etc/claude-code/*` 在本地集合中，来自本地 |
+| 启动时加载的 `CLAUDE.md`、`.claude/*`、`.mcp.json` | 项目级的来自目标主机（telefs）；全局的 `~/.claude/*` 和 `/etc/claude-code/*` 在本地集合中，来自本地 |
 | WebFetch / WebSearch | 在本地或 Anthropic 侧执行（出网 IP 是本地的） |
 | 超时与中断：先 SIGTERM，后 SIGKILL（tree-kill） | shim 转发可捕获的信号。SIGKILL 无法捕获，远端靠「shim 连接关闭 → 结束进程组」兜底，这与网络断线要区分开，见 5.3 |
-| 系统提示中的 OS 和平台 | Claude 启动时通过 `uname` 获取；`uname` 是转发 shim，所以反映的是**初始**活跃主机。热切换后以 `status`/`switch` 的结果为准（6.6） |
+| 系统提示中的 OS 和平台 | Claude 启动时通过 `uname` 获取；`uname` 是转发 shim，所以反映的就是目标主机。另有 6.5 的附加提示词 |
 | 会话存储 `~/.claude/projects/<cwd 编码>` | 路径同一，项目键稳定 |
 
 ---
@@ -154,9 +152,9 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 ### 4.1 原则
 
-**Claude 进程看到的整个文件系统（`/`）都是活跃主机的**，不只是项目根。`Read /etc/nginx/nginx.conf`、`Read /tmp/out.txt`、`Read ~/.bashrc`、`Read /usr/include/foo.h` 读到的都是远端内容，和远端 Bash 看到的一致。
+**Claude 进程看到的整个文件系统（`/`）都是目标主机的**，不只是项目根。`Read /etc/nginx/nginx.conf`、`Read /tmp/out.txt`、`Read ~/.bashrc`、`Read /usr/include/foo.h` 读到的都是远端内容，和远端 Bash 看到的一致。
 
-唯一的例外是 **Claude 进程自身运行必需的少量本地路径**（下文称为「本地集合」）。因为 Claude Code 是在本地运行的程序，它的可执行文件、动态库、DNS 与 TLS 配置、自己的配置和凭证都必须来自本机。本地集合要尽量小，按 Claude Code 版本实测得出，并且在 `status` 和系统提示词中**明确列出**。
+唯一的例外是 **Claude 进程自身运行必需的少量本地路径**（下文称为「本地集合」）。因为 Claude Code 是在本地运行的程序，它的可执行文件、动态库、DNS 与 TLS 配置、自己的配置和凭证都必须来自本机。本地集合要尽量小，按 Claude Code 版本实测得出，并由 `tele doctor` 和文档**明确列出**（系统提示词只写目标服务端的信息，D7）。
 
 为什么仍然需要挂载（而不是只转发命令）：Claude 的文件工具、配置加载、spawn `cwd`、编辑前的 mtime 检查、`/rewind`、`@` 引用都是**本地进程内**的 fs 访问（详见 v1 的 5A.0）。
 
@@ -183,19 +181,19 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 **PATH 与本地 exec**：Claude 进程还会 exec 一些程序（实测有 `git`、`rg`、`uname`、`sh`）。如果从远端视图里 exec 远端的二进制，会在本地用远端的库运行，这是不安全的。因此：
 
 - Claude 进程的 `PATH` **只包含** `/.tele/<sid>/bin`。
-- `bash`、`rg`、`git`、`uname` 是转发到远端的 shim。`uname` 也转发，这样系统提示里的 OS 版本反映的是初始的活跃主机。
+- `bash`、`rg`、`git`、`uname` 是转发到远端的 shim。`uname` 也转发，这样系统提示里的 OS 版本反映的是目标主机。
 - 其它需要在本地运行的程序（例如 tree-kill 用到的 `ps`，以及 P0 中实测到的其它程序）是**本地 exec 代理**的符号链接：shim 通过 `SCM_RIGHTS` 把自己的 stdin/stdout/stderr 交给会话主进程，由它在**原始本地视图**中执行真实程序，并转发退出码和信号。这样本地程序用的是本地的库，看到的也是本地文件。
 
 ### 4.3 HOME
 
-- Claude 进程的 `HOME` 设为**活跃主机上目标用户的 home 路径**（例如 `/home/bob`）。这样模型写 `~` 时，与远端 Bash 的 `~` 一致。
+- Claude 进程的 `HOME` 设为**目标主机上远端用户的 home 路径**（例如 `/home/bob`）。这样模型写 `~` 时，与远端 Bash 的 `~` 一致。
 - 本地的 `~/.claude` 和 `~/.claude.json` 作为本地集合，**挂在 `$HOME` 下的对应位置**（`/home/bob/.claude` → 本地 `/home/alice/.claude`）。Claude 通过 `HOME` 找到自己的配置和凭证，不受影响。
-- 会话中 `HOME` 无法改变。热切换到 home 路径不同的主机时，telefs 把旧的 `HOME` 路径**别名**到新主机的 home（这两个路径都能访问），`.claude*` 仍然是本地的。建议各主机使用相同的用户名。
+- `~/.claude/projects` 另外按主机隔离，见 6.2。
 
 ### 4.4 命名空间构建
 
 1. `tele claude` 用 `CLONE_NEWUSER|CLONE_NEWNS` 重新 exec 自己，uid/gid 映射为自身，并带 ambient `CAP_SYS_ADMIN` → **会话主进程**。它保留**原始本地视图**，用于提供本地 exec 代理，并为 telefs 读取本地文件。
-2. 会话主进程在 `/.tele/<sid>/root` 用 `DirectMountStrict` 挂载 telefs，内容是活跃主机的 `/`。对本地集合中的每个路径，telefs 合成**挂载点占位节点**（空目录或空文件），因为远端未必存在这些路径。
+2. 会话主进程在 `/.tele/<sid>/root` 用 `DirectMountStrict` 挂载 telefs，内容是目标主机的 `/`。对本地集合中的每个路径，telefs 合成**挂载点占位节点**（空目录或空文件），因为远端未必存在这些路径。
 3. fork 出 claude 子进程，再做一次 `CLONE_NEWNS`（仍在同一个 userns 内）：把本地集合 bind 挂载到占位节点上；rbind `/proc`、`/sys`、`/dev`；`pivot_root` 到 telefs；`stat /`（刷新根 inode 的属主，见 4.5）；清除 ambient capability；设置 `PATH`、`HOME` 和环境变量；exec Claude（它的二进制和库都在本地集合中）。
 4. shim 通过**抽象 unix socket** 与会话主进程通信（不依赖文件路径，因此不受 pivot_root 影响）。
 
@@ -218,7 +216,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 ### 4.6 telefs 设计
 
-- **本地**：go-fuse v2（BSD 许可）。inode 表**以路径为键**，并带 (dev, ino, generation) 校验，热切换后同一路径的节点 ID 保持不变（6.2）。本地集合的路径由占位节点覆盖。
+- **本地**：go-fuse v2（BSD 许可）。inode 表以 (dev, ino, generation) 标识远端文件，远端重启后可以按路径重新解析（5.4）。本地集合的路径由占位节点覆盖。
 - **协议**：FUSE 操作一一映射为 RPC：lookup、getattr、readdirplus、open、read、write、create、mkdir、unlink、rename、symlink、readlink、setattr、fsync、statfs、少量 xattr。每个请求带 request id，服务端维护**应答缓存**，保证非幂等操作恰好执行一次（5.3）。
 - **远端**：以目标用户身份访问。用户无权读取的文件（例如 `/etc/shadow`）返回 EACCES，与远端 Bash 的行为一致。`/proc`、`/sys`、`/dev` 不从远端代理，因为本地是真实挂载；远端的进程信息请用 Bash 查看。
 - **一致性**：
@@ -237,7 +235,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 - 库：[database64128/shadowsocks-go](https://github.com/database64128/shadowsocks-go) v1.15.0（AGPL-3.0，要求 Go ≥ 1.27），方法 `2022-blake3-aes-256-gcm`。
 - **实测**：`ss2022.StreamClientConfig{…}.NewStreamClient().DialStream` 与 `StreamServerConfig{…}.NewStreamServer().HandleStream` 在回环上完成加密往返；初始 payload 和双向数据都正确。目标地址固定为内部名称（`tele.internal:1`），不做通用代理。
-- SS2022 自带时间戳和 salt 重放过滤 → **两端时钟误差必须 ≤ 30 秒**，install 时检查 NTP，`status` 报告时钟偏差。
+- SS2022 自带时间戳和 salt 重放过滤 → **两端时钟误差必须 ≤ 30 秒**，install 时检查 NTP，`tele host ls` / `tele doctor` 报告时钟偏差。
 - 未认证的连接按 RejectPolicy 处理（默认读到超时后关闭，不回任何字节，抵抗主动探测）。
 - 风险：「全随机字节流」在部分审查环境中会被识别（USENIX Security 2023）。shadowsocks-go 支持 `UnsafeRequestStreamPrefix` 前缀伪装，作为可选缓解。
 
@@ -265,52 +263,54 @@ exec / telefs / 失效推送 / MCP 代理 / 端口转发
 | Bash / hooks | 远端进程**继续运行**，输出缓冲在服务端（有界，超出部分落盘）；shim 阻塞等待 | 补发输出和退出码 | 远端进程组先 SIGTERM 后 SIGKILL；shim 返回错误 |
 | shim 被 SIGKILL（Claude 的超时或中断） | 会话主进程检测到 shim 的 unix 连接关闭，**通过会话**通知远端结束进程组 | — | — |
 | stdio MCP | 进程存活，消息排队 | 续传 | 进程结束，Claude 显示该 MCP 断开 |
-| telefs | 请求阻塞（类似 NFS `hard`）；`tele-agent status` 显示「重连中」 | 续传，应答缓存保证恰好一次 | 返回 `EIO` |
+| telefs | 请求阻塞（类似 NFS `hard`）；终端状态栏或日志显示「重连中」 | 续传，应答缓存保证恰好一次 | 返回 `EIO` |
 | 失效推送 | 服务端排队 | 续传，溢出时 epoch 全量失效 | 全量失效 |
 
 ### 5.4 覆盖不到的情况
 
-- **tele-server 进程重启或远端重启**：会话丢失。telefs 通过持久句柄和全量失效恢复；正在运行的命令失败；MCP server 被重新拉起（6.3 的重放机制同样适用）。
+- **tele-server 进程重启或远端重启**：会话丢失。telefs 通过持久句柄和全量失效恢复；正在运行的命令失败；stdio MCP server 进程随之结束，Claude 显示该 MCP 断开。
 - **本地会话主进程崩溃**：claude 一起退出；远端进程在租约到期后被清理；用 `tele claude --resume` 恢复对话。
 
 ---
 
-## 6. `tele-agent` MCP 与热切换
+## 6. 命令行与启动流程
 
-### 6.1 工具
-
-| 工具 | 说明 |
-|---|---|
-| `list` | 列出所有主机（包括 `local`）：名称、是否活跃、会话状态、RTT、时钟偏差、OS 信息、当前工作目录在该主机上是否存在 |
-| `status(host?)` | 详细状态：会话层、各条连接、重连历史、未完成的命令和后台任务、telefs epoch |
-| `switch(host)` | **热切换**活跃主机（6.2） |
-| `install_guide(host?)` | 返回远端安装步骤（6.4） |
-
-在 Claude 里显示为 `mcp__tele-agent__list` 等。运行环境的说明只放在系统提示词里（6.6），MCP 的 `instructions` 不重复这些内容，只描述工具本身。
-
-### 6.2 热切换流程
-
-1. **前置检查**：目标主机的会话已建立（未建立则先连接）；Claude 当前的工作目录在目标主机的**同一路径**存在（D6：不做路径映射，不存在就拒绝，并返回原因和同步建议）；时钟偏差符合要求。
-2. **静默**：短暂阻塞新的 telefs 请求，等待正在处理的请求完成（带超时）。
-3. **切换 telefs 后端**：切换后端指针，epoch 加 1，对所有已知 inode 和 dentry 发送失效通知。因为 inode 以路径为键，**claude 进程的 cwd 和已缓存的路径依旧有效**，下次访问时会从新主机重新 getattr。在旧后端上打开的文件句柄标记为失效，后续读写返回 `ESTALE`（Claude 的文件操作都是短时打开，影响很小）。
-4. **切换执行目标**：之后的 shim 调用发往新主机。**已经在运行的命令和后台任务继续在旧主机上执行直到结束**，输出照常回传（后台输出写的是本地 fd，3.4 已核实）。`status` 会标注它们所在的主机。
-5. **shell 快照**：在新主机上重放已记录的快照生成脚本，得到新主机自己的 PATH 和函数；本地副本的路径不变。
-6. **stdio MCP 迁移**：`tele-exec` 对 MCP 是一个长连接代理，它缓存了 `initialize` 请求以及 `initialized` 通知。切换时，代理在新主机上启动同一条命令，重放握手（吞掉重复的响应），然后接回数据流。如果工具列表有变化，就向 Claude 发送 `notifications/tools/list_changed`。进行中的请求在旧进程上完成后，再关闭旧进程。MCP server 内部的状态会丢失；可以用 `pin_host` 配置某个 server 不随切换迁移。
-7. **hooks**：每次调用都会自动走新主机。
-8. **返回结果**：新主机的信息；与切换前相比，`CLAUDE.md` 和 `.claude/settings*.json` 是否有差异（Claude 在启动时已加载配置，**不会热重载**，所以有差异时提示模型）；以及仍在旧主机上运行的任务列表。
-
-**`local` 也是一台主机**：telefs 后端改为会话主进程的原始本地视图（loopback），shim 通过本地 exec 代理在原始本地视图中执行。
-
-**边界情况**：切换过程中 Claude 可能并行调用工具，所以 switch 会串行化（第 2 步的静默）。旧主机随后断开时，只影响仍在它上面运行的任务，按 5.3 处理。
-
-### 6.3 注入方式
-
-`tele claude` 通过 `--mcp-config` 注入 `tele-agent`（本地 stdio）。`tele-exec` 靠环境标记识别出 `tele-agent` 自己，直接在本地执行，不做转发。
-
-### 6.4 安装与配对
+### 6.1 命令形式
 
 ```bash
-# 本地：生成配对串（包含 SS2022 PSK、端口、一次性 token）
+tele <主机别名> [-d <工作目录>] claude [claude 的参数...]
+```
+
+- `<主机别名>`：由 `tele host add` 登记的远端主机。
+- `-d <工作目录>`：远端上的目录，作为 Claude 的工作目录（即 cwd，也是 Claude 识别项目的依据）。**默认是远端用户的家目录**。可以写绝对路径，相对路径则相对于远端家目录解析；末尾的 `/` 会被规范化掉。目录不存在时直接报错退出，不会自动创建。
+- `claude` 之后的所有参数原样传给 Claude Code，例如 `tele myhost -d proj claude --resume`、`tele myhost claude -p "…"`。
+- **一个 tele 进程只对应一台主机，运行期间不切换**。要换主机，就退出后用另一个别名重新启动。
+
+**其它命令**：
+
+| 命令 | 作用 |
+|---|---|
+| `tele host add <别名> …` / `tele host confirm` / `tele host ls` / `tele host rm` | 登记主机、配对、查看状态（连通性、RTT、时钟偏差、OS 信息） |
+| `tele doctor [别名]` | 本地检查（以及对指定主机的连通性检查），见 6.3 |
+| `tele server install/run/uninstall` | 远端服务端 |
+
+`host`、`doctor`、`server`、`help`、`version` 是保留字，不能用作主机别名。
+
+### 6.2 启动流程
+
+1. 读取别名配置，建立会话（SS2022 + 会话层）。连接不上时报错退出，并给出 `tele doctor <别名>` 的提示。
+2. 从服务端获取目标信息：hostname、OS/发行版、内核、架构、远端用户、`$HOME`、登录 shell；解析 `-d` 并确认目录存在。
+3. 按第 4 节构建命名空间：telefs 以远端的 `/` 为根，挂载本地集合，`HOME` 设为远端家目录。
+4. 生成系统提示词文件（6.4）和 shim 目录，设置好环境变量（附录 A）。
+5. 在 `-d` 指定的目录中 exec `claude`，参数原样透传。
+6. Claude 退出后，清理会话：远端进程按租约规则处理（5.3），卸载 FUSE。
+
+**会话历史按主机隔离**：Claude 用 cwd 路径作为 `~/.claude/projects/` 下的项目键。不同主机上的同一路径（例如都是 `/home/alice`）会被当成同一个项目，`--resume` 就会混在一起。`CLAUDE_CODE_PROJECT_DIR_NAME` 只在设置了 `CLAUDE_CONFIG_DIR` 时才生效（已核实），所以不采用。做法是：`~/.claude` 本来就在本地集合中，再把 `~/.claude/projects` 额外 bind 到 `~/.claude/projects.tele/<别名>/`。这样每台主机有独立的会话历史，`tele <别名> claude --resume` 只会看到这台主机上的会话。
+
+### 6.3 安装与配对
+
+```bash
+# 本地：生成配对串（包含 SS2022 PSK、端口、一次性 token），同时打印远端的安装步骤
 tele host add myhost --endpoint 203.0.113.5:8443
 # → 输出：tele server install --pair 'tele1:…'
 
@@ -326,7 +326,7 @@ tele host confirm myhost 'tele1r:…'
 
 本地有到远端的 SSH 时，可以用 `tele host add --ssh user@host` 一步完成。
 
-### 6.5 安装检查与修复策略
+### 6.4 安装检查与修复策略
 
 **结论：「全部检查 + 按类别处理」**，而不是一律报错或一律自动开启：
 
@@ -359,76 +359,43 @@ tele host confirm myhost 'tele1r:…'
 | 时钟同步（SS2022 要求误差 ≤ 30 秒） | 误差已超限为 ❌；NTP 未启用为 🔐 | 启用 `timedatectl set-ntp true` 需要同意；当前误差已超限时直接报错，因为连接会被拒绝 |
 | 内核版本、`/proc/sys/fs/inotify` 可用 | ❌ | 报错并说明最低要求 |
 
-**检查项分类（本地，`tele doctor`，`tele claude` 首次运行时自动执行）**：
+**检查项分类（本地，`tele doctor`，首次运行 `tele <别名> claude` 时自动执行）**：
 
 | 检查项 | 类别 | 处理 |
 |---|---|---|
 | `/dev/fuse` 存在且可读写 | 权限不足为 🔐；不存在为 ❌ | 发行版默认 0666；异常时给出 `modprobe fuse` 或 udev 规则的建议 |
 | 非特权 userns 可用（`max_user_namespaces`、Ubuntu 的 AppArmor 限制） | 🔐 同意 | 安装随包附带的 AppArmor profile（需要 sudo），而不是全局关闭限制；拒绝时报错 |
 | Claude Code 版本在兼容列表中 | ⚠️ | 未验证的版本给出警告，但仍允许运行（R1） |
-| 与各主机的时钟偏差 | ⚠️ / ❌ | 同上 |
+| 与目标主机的时钟偏差 | ⚠️ / ❌ | 同上 |
 
 **通用约定**：
 
-- **非交互**（没有 TTY，或由 Claude 通过 `tele-agent` 调用）时**绝不提权**：🔧 项照常执行，🔐 项全部视为未同意，返回需要手动执行的命令。`install_guide` 把这些命令原样交给用户。
+- **非交互**（没有 TTY，例如在 CI 中，或由 Claude 在 Bash 里调用）时**绝不提权**：🔧 项照常执行，🔐 项全部视为未同意，打印需要手动执行的命令。
 - `--yes` 用于显式同意所有 🔐 项，适合自动化部署；`--check` 只做预检；`--print-commands` 只打印命令、不执行。
 - 所有改动写入清单文件 `~/.config/tele/install-manifest.json`，`tele server uninstall` 据此逐项回滚。
 - 每一步都是幂等的，可以重复运行。
 
 ---
 
-### 6.6 附加系统提示词（运行环境说明）
+### 6.5 附加系统提示词：目标服务端信息
 
-**目的**：让模型知道，它的执行环境可能在远程主机上，与全局 `~/.claude/CLAUDE.md`（通常描述本地机器）以及系统提示中的 OS 和平台信息不一定一致；需要确认时，应通过 `tele-agent` MCP 查询。
+**注入方式**：启动时生成 `<sess>/system-prompt.md`，通过 `--append-system-prompt-file` 传入（`claude --help` 中已确认存在）。如果用户自己也传了 `--append-system-prompt[-file]`，两段内容**拼接**进同一个文件，不覆盖用户的内容。
 
-**注入方式**：`tele claude` 生成 `<sess>/system-prompt.md`，通过 `--append-system-prompt-file` 传入（`claude --help` 中已确认该参数存在）。如果用户自己也传了 `--append-system-prompt[-file]`，tele 把两段内容**拼接**进同一个文件，不覆盖用户的内容。
-
-**只写静态内容**：因为有热切换（D5），系统提示词在会话中途不会更新。所以其中**不写死**主机名、OS 等动态信息，只说明规则，动态信息一律让模型去查 MCP。启动时的活跃主机可以作为「初始值」写入，但要注明它可能已经变化。
-
-**提示词草案**（用英文编写，便于模型遵循；文案在 P0 中结合实际效果调整）：
+**内容**：**只写这台目标服务端的信息**。一个会话只对应一台主机，所以这些都是静态事实，整个会话中保持准确。取值来自 6.2 第 2 步从服务端获取的信息：
 
 ```text
-# Execution environment (tele)
+# Target host (tele)
 
-This Claude Code session is running under `tele`. Claude Code itself runs on the user's
-local machine, but tools may execute on a REMOTE host:
-
-- Bash commands, hooks, stdio MCP servers, Grep/Glob (ripgrep) and git run on the
-  currently ACTIVE host.
-- The whole filesystem you see through Read/Write/Edit/Glob is the ACTIVE host's
-  filesystem, at the same absolute paths as in Bash (including /etc, /tmp, /usr and
-  ~, where $HOME is the remote user's home). The only exceptions are the files Claude
-  Code itself needs to run, which stay LOCAL: {{local_set_summary}}
-  (e.g. ~/.claude, ~/.claude.json, /etc/claude-code, the Claude Code install dir,
-  the dynamic loader/libc, /etc/resolv.conf, /etc/hosts, CA certificates).
-  /proc, /sys and /dev are the LOCAL machine's; inspect remote processes and
-  devices with Bash.
-- The active host may be `local` or a remote machine, and it can change during the
-  session (hot switching). At session start it was: {{initial_host}}.
-
-Therefore the environment details in the system prompt (OS version, shell) were
-captured from the host that was active at session start, and the global
-~/.claude/CLAUDE.md (local) describes the user's LOCAL machine; either may NOT match
-the machine your commands currently run on. Project-level CLAUDE.md files come from
-the host that was active at session start.
-
-When the execution environment matters (OS/distro, installed tools, paths, hostname,
-architecture, available resources), check it instead of assuming:
-- call `mcp__tele-agent__status` or `mcp__tele-agent__list` for the active host and
-  its OS/arch details;
-- switch hosts only with `mcp__tele-agent__switch`, and only when the user asks for it
-  or clearly implies it.
-If a command fails in a way that suggests an environment mismatch, re-check the active
-host before retrying.
+This session operates on the remote host "{{alias}}" via tele.
+- Hostname: {{hostname}}
+- OS: {{os_pretty_name}} ({{kernel}}, {{arch}})
+- User: {{user}} (HOME={{home}}), login shell: {{shell}}
+- Working directory: {{workdir}}
 ```
 
-**配套**：
+**有意不写的内容**：tele 的实现细节、本地集合的例外路径（4.2）、网络断线等运行时状态。本地集合的例外由 `tele doctor` 和文档说明（R12）。
 
-- 这些说明**只写在系统提示词里**；`tele-agent` MCP 的 `instructions` 不重复。
-- `{{local_set_summary}}` 在启动时根据实际生效的本地集合生成（4.2）。
-- `list`、`status`、`switch` 的返回结果总是包含活跃主机的 hostname、OS/发行版、内核、架构、shell、远端 `$HOME`，作为「权威环境信息」。
-- 每次热切换后，switch 的返回结果开头再强调一次：「从现在起命令在 X 上执行」。
-- **兼容性测试**（纳入 R1 的 `claude -p` 测试集）：用「当前系统是什么发行版？」「帮我安装 xx」这类提示，验证模型会先调用 MCP 确认环境，而不是直接照搬系统提示或全局 CLAUDE.md 中的本地信息。
+**兼容性测试**（纳入 R1 的 `claude -p` 测试集）：用「当前系统是什么发行版？」「当前主机名是什么？」这类提示，检查模型的回答与目标服务端一致。
 
 ## 7. 风险与缓解
 
@@ -436,16 +403,16 @@ host before retrying.
 |---|---|---|---|
 | R1 | Claude Code 内部行为（cwd 文件、快照、scratch 路径、prefix 覆盖范围）没有文档，会随版本变化 | **高** | P0 原型；CI 中用 `claude -p` 驱动真实 Claude 跑兼容性测试；启动时检测版本并告警 |
 | R2 | exec 形式的 hooks 绕过 PREFIX | 中 | `--setting-sources` + `--settings` 注入改写后的 hooks；插件 hooks 同样处理 |
-| R3 | 热切换后 Claude 仍使用启动时加载的旧配置 | 中 | switch 结果中报告差异；必要时提示用户 `/resume` |
+| R3 | 不同主机上的同一路径共用 Claude 的项目键，导致会话历史混在一起 | 低 | 按主机 bind `~/.claude/projects`（6.2） |
 | R4 | 非特权 userns 被 AppArmor 或 sysctl 限制 | 中 | 随包附带 AppArmor profile；安装时检测并给出指引 |
 | R5 | telefs 与会话层都需要自研，POSIX 语义细节多 | 中 | pjdfstest / xfstests 子集，git/npm/cargo 真实负载回归；故障注入（`tc netem`、toxiproxy、netns 切换 IP） |
-| R6 | SS2022 的时钟同步要求 | 低 | install 检查 NTP，status 报告时钟偏差 |
+| R6 | SS2022 的时钟同步要求 | 低 | install 检查 NTP，`tele host ls` / `tele doctor` 报告时钟偏差 |
 | R7 | 全加密流量被审查识别 | 视环境 | 可选前缀伪装；需要时再套一层 TLS 伪装 |
 | R8 | exec 服务等于远程代码执行入口 | 高（安全） | SS2022 PSK 认证 + 会话 token；服务以目标用户身份运行；PSK 文件权限 0600 |
 | R9 | AGPL-3.0 义务 | 低 | 开源并附带源码；依赖的 BSD、Apache-2.0、MPL-2.0 许可均与之兼容 |
 | R10 | Claude 自带的 bubblewrap 沙箱与 shim 冲突 | 低 | tele 模式下提示关闭沙箱 |
 | R11 | 本地集合不完整：Claude 访问了未列入的本地路径，拿到远端文件（例如动态加载的库版本不匹配而崩溃，或 exec 了 PATH 之外的绝对路径程序） | **高** | 每个 Claude Code 版本都用 strace/fanotify 实测并生成本地集合；未知版本启动时告警；telefs 记录 Claude 进程对「疑似运行时文件」（`*.so*`、`/etc/ssl`、`/etc/claude-code` 等）的远端访问，供排查 |
-| R12 | 本地集合遮住远端的同名路径（例如 Read `/etc/hosts`、`/etc/resolv.conf` 看到的是本地内容） | 中 | 集合保持最小（可选的 CONNECT 代理可以去掉网络配置文件）；在系统提示词中列出；需要远端内容时用 Bash |
+| R12 | 本地集合遮住远端的同名路径（例如 Read `/etc/hosts`、`/etc/resolv.conf` 看到的是本地内容） | 中 | 集合保持最小（可选的 CONNECT 代理可以去掉网络配置文件）；由 `tele doctor` 和文档列出；需要远端内容时用 Bash |
 
 ---
 
@@ -453,12 +420,12 @@ host before retrying.
 
 | 阶段 | 内容 | 预计 |
 |---|---|---|
-| **P0 验证** | 本地模拟远端（同机两个进程 + unix socket）：pivot_root 到 FUSE 根 + 嵌套 mountns 的 bind 挂载、本地集合的实测与自动生成、本地 exec 代理、HOME 映射；Bash（cd 持久化、后台任务、超时、Ctrl-C）、快照、scratch 改写与回传、两种形式的 hooks、stdio MCP、`rg`/`git` shim、userns + telefs 回环后端、热切换（两个本地目录模拟两台主机）；建立 `claude -p` 兼容性测试 | 1–1.5 周 |
-| **P1 MVP** | 单二进制；SS2022 + 会话层（续传、心跳）；exec 服务；telefs（exec 屏障 + 推送）；`tele-agent`（list/status/switch/install_guide）；配对安装 | 5–6 周 |
-| **P2 加固** | MCP 迁移重放；先建后断与 netlink 主动重拨；故障注入测试矩阵；telefs 性能（readdirplus、小文件预取）；exec 形式 hooks 的改写 | 3 周 |
+| **P0 验证** | 本地模拟远端（同机两个进程 + unix socket）：pivot_root 到 FUSE 根 + 嵌套 mountns 的 bind 挂载、本地集合的实测与自动生成、本地 exec 代理、HOME 映射、按主机隔离会话历史；Bash（cd 持久化、后台任务、超时、Ctrl-C）、快照、scratch 改写与回传、两种形式的 hooks、stdio MCP、`rg`/`git` shim、userns + telefs 回环后端；建立 `claude -p` 兼容性测试 | 1–1.5 周 |
+| **P1 MVP** | 单二进制；SS2022 + 会话层（续传、心跳）；exec 服务；telefs（exec 屏障 + 推送）；`tele <别名> [-d] claude` 命令行与 `tele host`/`tele doctor`；系统提示词生成；配对安装 | 5–6 周 |
+| **P2 加固** | 先建后断与 netlink 主动重拨；故障注入测试矩阵；telefs 性能（readdirplus、小文件预取）；exec 形式 hooks 的改写 | 3 周 |
 | **P3 发布** | AppArmor profile、systemd --user 单元、发布流程（静态二进制、校验和）、文档 | 1–2 周 |
 
-**主要依赖**：`github.com/database64128/shadowsocks-go`（AGPL-3.0）、`github.com/hanwen/go-fuse/v2`（BSD）、`golang.org/x/sys/unix`、`github.com/modelcontextprotocol/go-sdk`（MCP server）、多路复用用 `github.com/hashicorp/yamux`（MPL-2.0）或自研帧。
+**主要依赖**：`github.com/database64128/shadowsocks-go`（AGPL-3.0）、`github.com/hanwen/go-fuse/v2`（BSD）、`golang.org/x/sys/unix`、多路复用用 `github.com/hashicorp/yamux`（MPL-2.0）或自研帧。
 
 ---
 
@@ -471,14 +438,14 @@ CLAUDE_CODE_SHELL_PREFIX=<sess>/bin/tele-exec      # hooks + stdio MCP
 CLAUDE_CODE_TMPDIR=<sess>/tmp                      # 本地 scratch；远端路径由 shim 改写（/tmp 本身是远端的）
 USE_BUILTIN_RIPGREP=0
 PATH=<sess>/bin                                    # 只有 shim：bash/rg/git/uname 转发远端，其余为本地 exec 代理（4.2）
-HOME=<活跃主机上的远端 home>                       # ~/.claude* 在本地集合中挂到这里（4.3）
+HOME=<目标主机上的远端 home>                       # ~/.claude* 在本地集合中挂到这里（4.3）
 TELE_SOCK=@tele-<sid>                              # 抽象 unix socket：shim → 会话主进程
-# 参数：--mcp-config <含 tele-agent>；--append-system-prompt-file <sess>/system-prompt.md（6.6，与用户自带的内容拼接）；
+# 参数：--append-system-prompt-file <sess>/system-prompt.md（6.5，只含目标服务端信息，与用户自带的内容拼接）；
 #       必要时 --setting-sources/--settings（改写后的 hooks）
 ```
 
 ## 附录 B：已确认的次要决策
 
-1. 切换主机后，本地的 shell 快照副本同步更新为新主机的版本。
-2. `git` shim 默认开启（Claude 内部的 git 调用在远端执行）。
-3. 远端服务默认以 `systemd --user` 运行；linger 等系统级设置按 6.5 的「检查 → 自动 / 征得同意 / 报错」策略处理。
+1. `git` shim 默认开启（Claude 内部的 git 调用在远端执行）。
+2. 远端服务默认以 `systemd --user` 运行；linger 等系统级设置按 6.4 的「检查 → 自动 / 征得同意 / 报错」策略处理。
+3. 放弃本地 MCP 和主机切换；一个 `tele` 会话对应一台主机（D5、D6）。
