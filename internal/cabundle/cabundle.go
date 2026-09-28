@@ -24,10 +24,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// systemFiles and systemDirs mirror where crypto/x509 looks for system
+// systemFiles and systemDirs are the places crypto/x509 looks for system
 // roots on Linux (certFiles and certDirectories in
-// src/crypto/x509/root_linux.go), so tele trusts what Go programs on the
-// same host trust.
+// src/crypto/x509/root_linux.go). Build does not trust exactly what Go
+// does: Go reads every file in the directories in addition to the first
+// file, and SSL_CERT_FILE and SSL_CERT_DIR replace its lists, whereas Build
+// reads the directories only when no file is readable (see Build).
 var (
 	systemFiles = []string{
 		"/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Gentoo, Arch
@@ -51,40 +53,52 @@ const maxFileSize = 16 << 20
 var ErrNoCertificates = errors.New("cabundle: no CA certificates found; " +
 	"install the system CA package (ca-certificates) or set SSL_CERT_FILE to a PEM bundle")
 
+// Extra is a CA file or directory the user configured.
+type Extra struct {
+	// Var names the environment variable that set Path, such as
+	// NODE_EXTRA_CA_CERTS, so that errors can tell the user what to fix.
+	Var string
+	// Path is a PEM file (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS) or a
+	// directory (an SSL_CERT_DIR entry); empty means unset.
+	Path string
+}
+
 // Build returns a PEM bundle of the local system roots and the certificates
 // in extra, deduplicated, in the order found.
 //
 // The system roots come from the first readable file in the list
 // crypto/x509 uses; the per-certificate directories are read only when no
 // such file exists, since on common distributions they duplicate the file.
+// Certificates present only in a directory are therefore missed on hosts
+// that also have a bundle file.
 //
-// Each entry of extra is a PEM file (the user's SSL_CERT_FILE or
-// NODE_EXTRA_CA_CERTS) or a directory (an SSL_CERT_DIR entry), from which
-// files named *.pem, *.crt or OpenSSL's <hash>.<n> are read and unreadable
-// entries skipped. Empty entries are ignored so that unset variables can be
-// passed as they are; any other entry that cannot be read is an error,
-// because silently dropping a CA the user configured would surface later as
-// an opaque TLS failure.
+// From a directory in extra, files named *.pem, *.crt or OpenSSL's
+// <hash>.<n> are read and unreadable entries skipped. Entries with an empty
+// Path are ignored so that unset variables can be passed as they are; any
+// other entry that cannot be read is an error naming its variable, because
+// silently dropping a CA the user configured would surface later as an
+// opaque TLS failure.
 //
 // Only CERTIFICATE blocks that parse as X.509 are kept; anything else in
 // the input is ignored.
-func Build(extra []string) ([]byte, error) {
+func Build(extra []Extra) ([]byte, error) {
 	return build(systemFiles, systemDirs, extra)
 }
 
-func build(sysFiles, sysDirs, extra []string) ([]byte, error) {
+func build(sysFiles, sysDirs []string, extra []Extra) ([]byte, error) {
 	b := bundle{seen: make(map[string]struct{})}
 	if !b.addFirstFile(sysFiles) {
 		for _, d := range sysDirs {
 			_ = b.addDir(d) // best effort, like crypto/x509
 		}
 	}
-	for _, p := range extra {
-		if p == "" {
+	for _, e := range extra {
+		if e.Path == "" {
 			continue
 		}
-		if err := b.addPath(p); err != nil {
-			return nil, err
+		if err := b.addPath(e.Path); err != nil {
+			return nil, fmt.Errorf("cabundle: read CA certificates named by %s: %w; fix or unset %s",
+				e.Var, err, e.Var)
 		}
 	}
 	if b.out.Len() == 0 {
@@ -112,17 +126,15 @@ func (b *bundle) addFirstFile(paths []string) bool {
 	return false
 }
 
-// addPath adds a file, or the certificate files in a directory.
+// addPath adds a file, or the certificate files in a directory. Errors name
+// the path.
 func (b *bundle) addPath(p string) error {
 	data, isDir, err := readFile(p)
 	if err != nil {
-		return fmt.Errorf("cabundle: read CA certificates: %w", err)
+		return err
 	}
 	if isDir {
-		if err := b.addDir(p); err != nil {
-			return fmt.Errorf("cabundle: read CA certificates: %w", err)
-		}
-		return nil
+		return b.addDir(p)
 	}
 	b.addPEM(data)
 	return nil

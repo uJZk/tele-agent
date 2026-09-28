@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -379,6 +381,9 @@ func TestPlainHTTP(t *testing.T) {
 	if hdr.Get("X-Keep") != "1" {
 		t.Errorf("origin lost X-Keep: %v", hdr)
 	}
+	if v := hdr.Values("Via"); len(v) != 1 || !strings.HasPrefix(v[0], "1.1 tele-") {
+		t.Errorf("origin saw Via %q, want this proxy's entry", v)
+	}
 
 	// The connection stays usable for another request.
 	again := c.roundTrip(t, "GET http://plain.test/again HTTP/1.1\r\nHost: plain.test\r\n"+
@@ -537,7 +542,7 @@ func TestPendingBytes(t *testing.T) {
 				return url.Parse("http://us%65r:p%40ss@" + up)
 			}})
 			c := dialRaw(t, addr)
-			resp := c.roundTrip(t, "CONNECT far.test:22 HTTP/1.1\r\nHost: far.test:22\r\nUser-Agent: claude-cli/1\r\n\r\n")
+			resp := c.roundTrip(t, "CONNECT far.test:22 HTTP/1.1\r\nHost: far.test:22\r\nUser-Agent: claude-cli/1\r\nVia: 1.0 corp\r\n\r\n")
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status %s", resp.Status)
 			}
@@ -554,6 +559,9 @@ func TestPendingBytes(t *testing.T) {
 			}
 			if got := req.Header.Get("User-Agent"); got != "claude-cli/1" {
 				t.Errorf("upstream User-Agent %q", got)
+			}
+			if v := req.Header.Values("Via"); len(v) != 2 || v[0] != "1.0 corp" || !strings.HasPrefix(v[1], "1.1 tele-") {
+				t.Errorf("upstream Via %q, want the client's entry, then this proxy's", v)
 			}
 		})
 	}
@@ -792,7 +800,10 @@ func TestHeaderTimeout(t *testing.T) {
 	if _, err := io.WriteString(stalled.Conn, "GET http://x/ HTTP/1.1\r\n"); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := stalled.Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, context.DeadlineExceeded) {
+	// Far beyond the header timeout, yet short enough that a proxy without
+	// one fails the test quickly; the client's own timeout is a failure.
+	_ = stalled.SetReadDeadline(time.Now().Add(40 * s.headerTimeout))
+	if n, err := stalled.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) && !isReset(err) {
 		t.Fatalf("stalled request: read %d, %v; want the proxy to hang up", n, err)
 	}
 
@@ -808,6 +819,43 @@ func TestHeaderTimeout(t *testing.T) {
 	}
 }
 
+// holdLog is a slog.Handler that stops a goroutine logging one of the hold
+// messages until release is closed. Proxy handlers log as they end, so it
+// keeps a handler running for as long as a test needs.
+type holdLog struct {
+	hold    map[string]bool // read-only
+	held    chan string     // receives each held message; buffered
+	release chan struct{}   // closed by the test
+}
+
+func (h *holdLog) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *holdLog) Handle(_ context.Context, r slog.Record) error {
+	if h.hold[r.Message] {
+		h.held <- r.Message
+		<-h.release
+	}
+	return nil
+}
+
+func (h *holdLog) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *holdLog) WithGroup(string) slog.Handler      { return h }
+
+// trackedConn records whether it has been closed.
+type trackedConn struct {
+	*net.TCPConn
+	closed atomic.Bool
+}
+
+func (c *trackedConn) Close() error {
+	c.closed.Store(true)
+	return c.TCPConn.Close()
+}
+
+// holdWindow is how long Serve must keep waiting for a held handler. A
+// Serve that does not wait returns within microseconds of the cancel.
+const holdWindow = 100 * time.Millisecond
+
 func TestShutdown(t *testing.T) {
 	ignore := goleak.IgnoreCurrent()
 	t.Run("scenario", func(t *testing.T) {
@@ -819,12 +867,42 @@ func TestShutdown(t *testing.T) {
 		}))
 		t.Cleanup(origin.Close)
 
+		hold := &holdLog{
+			hold:    map[string]bool{"proxy tunnel closed": true, "proxy http request failed": true},
+			held:    make(chan string, 2),
+			release: make(chan struct{}),
+		}
+		release := sync.OnceFunc(func() { close(hold.release) })
+		defer release()
+		var mu sync.Mutex
+		var targetConns []*trackedConn // guarded by mu
+		s := &Server{
+			Logger: slog.New(hold),
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				c, err := d.DialContext(ctx, network, addr)
+				if err != nil || addr != target {
+					return c, err
+				}
+				tcp, ok := c.(*net.TCPConn)
+				if !ok {
+					_ = c.Close()
+					return nil, fmt.Errorf("dialed a %T", c)
+				}
+				tc := &trackedConn{TCPConn: tcp}
+				mu.Lock()
+				targetConns = append(targetConns, tc)
+				mu.Unlock()
+				return tc, nil
+			},
+		}
+
 		ln := listen(t)
 		addr := ln.Addr().String()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- (&Server{}).Serve(ctx, ln) }()
+		go func() { done <- s.Serve(ctx, ln) }()
 
 		idle := dialRaw(t, addr)
 		tun := tunnel(t, addr, target, "")
@@ -841,6 +919,21 @@ func TestShutdown(t *testing.T) {
 		<-started
 
 		cancel()
+		// The tunnel and the in-flight request are torn down, and both
+		// handlers are held as they end: Serve must wait for them.
+		for range 2 {
+			select {
+			case <-hold.held:
+			case <-time.After(ioTimeout):
+				t.Fatal("handlers did not end after cancel")
+			}
+		}
+		select {
+		case <-done:
+			t.Fatal("Serve returned while handlers were still running")
+		case <-time.After(holdWindow):
+		}
+		release()
 		select {
 		case err := <-done:
 			if err != nil {
@@ -849,6 +942,11 @@ func TestShutdown(t *testing.T) {
 		case <-time.After(ioTimeout):
 			t.Fatal("Serve did not return after cancel")
 		}
+		mu.Lock()
+		if len(targetConns) != 1 || !targetConns[0].closed.Load() {
+			t.Error("tunnel target connection still open when Serve returned")
+		}
+		mu.Unlock()
 		for name, c := range map[string]*rawConn{"idle": idle, "tunnel": tun, "in-flight": inflight} {
 			if _, err := io.ReadAll(c); err != nil && !errors.Is(err, net.ErrClosed) && !isReset(err) {
 				t.Errorf("%s connection: %v, want it closed", name, err)
@@ -918,4 +1016,28 @@ func TestUpstreamMisbehaves(t *testing.T) {
 			t.Fatal("Serve blocked on an upstream that does not answer")
 		}
 	})
+}
+
+// TestUpstreamLoop covers an upstream setting that names the proxy itself,
+// as a stale HTTPS_PROXY inherited from a tele session would.
+func TestUpstreamLoop(t *testing.T) {
+	ln := listen(t)
+	var lookups atomic.Int32
+	serveOn(t, &Server{Upstream: func(*url.URL) (*url.URL, error) {
+		lookups.Add(1)
+		return &url.URL{Scheme: "http", Host: ln.Addr().String()}, nil
+	}}, ln)
+	c := dialRaw(t, ln.Addr().String())
+
+	resp := c.roundTrip(t, connectReq("api.example.com:443", ""))
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(resp.Body, loopAdvice) {
+		t.Errorf("CONNECT: %s %q, want 502 explaining the loop", resp.Status, resp.Body)
+	}
+	resp = c.roundTrip(t, "GET http://api.example.com/ HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+	if resp.StatusCode != http.StatusLoopDetected || !strings.Contains(resp.Body, loopAdvice) {
+		t.Errorf("GET: %s %q, want 508 explaining the loop", resp.Status, resp.Body)
+	}
+	if n := lookups.Load(); n != 2 {
+		t.Errorf("Upstream consulted %d times, want once per request", n)
+	}
 }

@@ -12,10 +12,17 @@
 // Targets on the loopback interface are always reached directly: through an
 // upstream proxy they would land on the proxy's host (docs/exec.md
 // section 7).
+//
+// Every forwarded request carries a Via entry whose pseudonym is unique to
+// one Serve call. A request that arrives with it has looped back, typically
+// because the upstream proxy setting names this proxy; it is refused with
+// 508, since forwarding it again would recurse until the process runs out
+// of file descriptors.
 package connectproxy
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
@@ -89,12 +96,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	tr := s.transport()
 	defer tr.CloseIdleConnections()
 
-	h := &handler{srv: s, log: log}
+	h := &handler{srv: s, log: log, pseudonym: "tele-" + rand.Text()}
 	h.rp = &httputil.ReverseProxy{
 		// The absolute-form URL and the Host header are forwarded as
 		// received; ReverseProxy strips hop-by-hop headers, including
 		// Proxy-Authorization, and never adds X-Forwarded-* with Rewrite.
-		Rewrite:   func(*httputil.ProxyRequest) {},
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.Header.Add("Via", h.viaEntry(pr.In))
+		},
 		Transport: tr,
 		// Forward bytes as they arrive: streamed responses must not stall.
 		FlushInterval:  -1,
@@ -196,11 +205,18 @@ func basicPassword(h string) (string, bool) {
 }
 
 type handler struct {
-	srv    *Server
-	log    *slog.Logger
-	rp     *httputil.ReverseProxy
-	active handlerGroup
+	srv *Server
+	log *slog.Logger
+	rp  *httputil.ReverseProxy
+	// pseudonym identifies this proxy in Via; random, so that chained tele
+	// proxies do not mistake each other for a loop.
+	pseudonym string
+	active    handlerGroup
 }
+
+// loopAdvice explains a request loop to the user.
+const loopAdvice = "the upstream proxy setting (HTTPS_PROXY, HTTP_PROXY) leads back to this proxy; " +
+	"point it at the real upstream proxy or unset it"
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.active.enter() {
@@ -209,6 +225,13 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer h.active.leave()
 
+	// Before authentication: a looped request carries the credentials of
+	// the upstream setting, which need not match Token.
+	if h.looped(r) {
+		h.log.Warn("proxy request loop refused")
+		http.Error(w, "tele proxy: request loop: "+loopAdvice, http.StatusLoopDetected)
+		return
+	}
 	if !h.srv.authorized(r) {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="tele"`)
 		http.Error(w, "tele proxy: proxy authentication required", http.StatusProxyAuthRequired)
@@ -224,6 +247,24 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tele proxy: only CONNECT and absolute-form http:// requests are proxied",
 			http.StatusBadRequest)
 	}
+}
+
+// viaEntry is the Via entry this proxy adds when forwarding r (RFC 9110
+// section 7.6.3).
+func (h *handler) viaEntry(r *http.Request) string {
+	return fmt.Sprintf("%d.%d %s", r.ProtoMajor, r.ProtoMinor, h.pseudonym)
+}
+
+// looped reports whether r has already passed through this proxy. The
+// pseudonym is matched anywhere in Via because intermediaries may rewrite
+// the protocol part or merge entries.
+func (h *handler) looped(r *http.Request) bool {
+	for _, v := range r.Header.Values("Via") {
+		if strings.Contains(v, h.pseudonym) {
+			return true
+		}
+	}
+	return false
 }
 
 // rejectProxyAuth turns a 407 into an error. The client has passed this

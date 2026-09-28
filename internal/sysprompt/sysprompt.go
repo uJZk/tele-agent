@@ -89,9 +89,10 @@ const (
 // from Claude's arguments and returns the remaining arguments in their
 // original order, the prompt texts, and the file paths as given.
 //
-// Matching follows commander.js, which parses Claude's command line: a flag
-// with a required value takes the next argument even if it starts with '-',
-// a missing value is an error, and nothing after "--" is an option.
+// Matching follows commander.js, which parses Claude's command line
+// (docs/claude-code.md section 7): a flag with a required value takes the
+// next argument even if it starts with '-', a missing value is an error, and
+// nothing after "--" is an option.
 //
 // Limitation: Claude's other options are not modeled, so an argument that
 // is exactly one of these flags is taken as the flag even where Claude would

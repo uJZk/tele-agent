@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -26,7 +27,13 @@ func (h *handler) connect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "tele proxy: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	target, fromTarget, err := h.srv.dialTunnel(r.Context(), addr, r.Header.Get("User-Agent"))
+	hdr := http.Header{
+		// Proxy policies may match the client's User-Agent. An empty value
+		// suppresses Go's default.
+		"User-Agent": {r.Header.Get("User-Agent")},
+		"Via":        append(slices.Clone(r.Header.Values("Via")), h.viaEntry(r)),
+	}
+	target, fromTarget, err := h.srv.dialTunnel(r.Context(), addr, hdr)
 	if err != nil {
 		h.log.Debug("proxy tunnel failed", "target", addr, "err", err)
 		http.Error(w, "tele proxy: "+err.Error(), http.StatusBadGateway)
@@ -66,11 +73,11 @@ func checkTunnelAddr(addr string) error {
 	return nil
 }
 
-// dialTunnel connects to addr directly or through the upstream proxy. The
-// returned bytes arrived from the target together with the upstream
-// proxy's response and must be delivered before anything read from the
-// connection.
-func (s *Server) dialTunnel(ctx context.Context, addr, userAgent string) (net.Conn, []byte, error) {
+// dialTunnel connects to addr directly or through the upstream proxy, to
+// which it sends hdr with the CONNECT request. The returned bytes arrived
+// from the target together with the upstream proxy's response and must be
+// delivered before anything read from the connection.
+func (s *Server) dialTunnel(ctx context.Context, addr string, hdr http.Header) (net.Conn, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	// CONNECT carries TLS in practice, so the https proxy setting applies.
@@ -82,7 +89,7 @@ func (s *Server) dialTunnel(ctx context.Context, addr, userAgent string) (net.Co
 		c, err := s.dial(ctx, "tcp", addr)
 		return c, nil, err
 	}
-	c, pending, err := s.connectVia(ctx, proxy, addr, userAgent)
+	c, pending, err := s.connectVia(ctx, proxy, addr, hdr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("upstream proxy %s: %w", describe(proxy), err)
 	}
@@ -90,7 +97,7 @@ func (s *Server) dialTunnel(ctx context.Context, addr, userAgent string) (net.Co
 }
 
 // connectVia opens a tunnel to addr through an upstream proxy.
-func (s *Server) connectVia(ctx context.Context, proxy *url.URL, addr, userAgent string) (net.Conn, []byte, error) {
+func (s *Server) connectVia(ctx context.Context, proxy *url.URL, addr string, hdr http.Header) (net.Conn, []byte, error) {
 	conn, err := s.dialUpstream(ctx, proxy)
 	if err != nil {
 		return nil, nil, err
@@ -99,7 +106,7 @@ func (s *Server) connectVia(ctx context.Context, proxy *url.URL, addr, userAgent
 	// deadline interrupts it when ctx ends, and conn is then discarded, so
 	// the deadline never needs clearing.
 	stop := afterFuncSync(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
-	pending, err := upstreamConnect(conn, proxy, addr, userAgent)
+	pending, err := upstreamConnect(conn, proxy, addr, hdr)
 	if !stop() && err == nil {
 		err = ctx.Err()
 	}
@@ -132,15 +139,13 @@ func (s *Server) dialUpstream(ctx context.Context, proxy *url.URL) (net.Conn, er
 	return tc, nil
 }
 
-// upstreamConnect sends CONNECT addr on conn and reads the reply.
-func upstreamConnect(conn net.Conn, proxy *url.URL, addr, userAgent string) ([]byte, error) {
+// upstreamConnect sends CONNECT addr with hdr on conn and reads the reply.
+func upstreamConnect(conn net.Conn, proxy *url.URL, addr string, hdr http.Header) ([]byte, error) {
 	req := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Opaque: addr},
 		Host:   addr,
-		// Pass the client's User-Agent on: proxy policies may match it.
-		// An empty value suppresses Go's default.
-		Header: http.Header{"User-Agent": {userAgent}},
+		Header: hdr.Clone(),
 	}
 	if u := proxy.User; u != nil {
 		pass, _ := u.Password()
@@ -164,7 +169,10 @@ func upstreamConnect(conn net.Conn, proxy *url.URL, addr, userAgent string) ([]b
 		}
 		return nil, fmt.Errorf("read CONNECT response: %w", err)
 	}
-	if resp.StatusCode/100 != 2 {
+	switch {
+	case resp.StatusCode == http.StatusLoopDetected:
+		return nil, fmt.Errorf("CONNECT %s refused: %s; %s", addr, resp.Status, loopAdvice)
+	case resp.StatusCode/100 != 2:
 		return nil, fmt.Errorf("CONNECT %s refused: %s", addr, resp.Status)
 	}
 	return buffered(br), nil

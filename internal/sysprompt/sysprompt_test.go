@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/ujzk/tele-agent/internal/proto"
@@ -63,6 +64,39 @@ func TestRenderKeepsOneLinePerValue(t *testing.T) {
 	if !utf8.ValidString(got) {
 		t.Error("Render output is not valid UTF-8")
 	}
+}
+
+func FuzzRender(f *testing.F) {
+	f.Add("dev", "box", "Ubuntu", "Linux 6.8", "x86_64", "bob", "/home/bob", "/bin/bash", "/w")
+	f.Add(`d"v`, "a\nb", "\u2028\u2029", "\r\x85", "\u0085", "\xff\xfe", "", "\x1b[2J", strings.Repeat("é", maxValueLen))
+	const v = "VALUE"
+	template := strings.Split(Render(v, proto.TargetInfo{
+		Hostname: v, OSPrettyName: v, Kernel: v, Arch: v, User: v, Home: v, Shell: v,
+	}, v), "\n")
+	f.Fuzz(func(t *testing.T, alias, hostname, osName, kernel, arch, user, home, shell, workdir string) {
+		got := Render(alias, proto.TargetInfo{
+			Hostname: hostname, OSPrettyName: osName, Kernel: kernel, Arch: arch,
+			User: user, Home: home, Shell: shell,
+		}, workdir)
+		if !utf8.ValidString(got) {
+			t.Fatalf("output is not valid UTF-8: %q", got)
+		}
+		lines := strings.Split(got, "\n")
+		if len(lines) != len(template) {
+			t.Fatalf("output has %d lines, want %d: %q", len(lines), len(template), got)
+		}
+		// Each line keeps the template's text up to its first value.
+		for i, want := range template {
+			if prefix, _, _ := strings.Cut(want, v); !strings.HasPrefix(lines[i], prefix) {
+				t.Fatalf("line %d is %q, want the prefix %q", i, lines[i], prefix)
+			}
+		}
+		for _, r := range got {
+			if r != '\n' && (unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp)) {
+				t.Fatalf("output holds a raw %U: %q", r, got)
+			}
+		}
+	})
 }
 
 func TestValueTruncation(t *testing.T) {

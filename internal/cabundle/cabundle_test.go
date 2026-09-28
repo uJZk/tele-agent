@@ -62,6 +62,15 @@ func write(t *testing.T, path string, data []byte) string {
 	return path
 }
 
+// extras names each path as set by SSL_CERT_FILE.
+func extras(paths ...string) []Extra {
+	out := make([]Extra, len(paths))
+	for i, p := range paths {
+		out[i] = Extra{Var: "SSL_CERT_FILE", Path: p}
+	}
+	return out
+}
+
 // names parses a bundle and returns the common names in order, failing on
 // anything that is not a parseable CERTIFICATE block.
 func names(t *testing.T, bundle []byte) []string {
@@ -127,7 +136,7 @@ func TestBuild(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := build(tt.sysFiles, tt.sysDirs, tt.extra)
+			got, err := build(tt.sysFiles, tt.sysDirs, extras(tt.extra...))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -150,7 +159,7 @@ func TestBuildGarbage(t *testing.T) {
 	in.WriteString("-----BEGIN CERTIFICATE-----\ntruncated")
 	f := write(t, filepath.Join(dir, "mixed.pem"), in.Bytes())
 
-	got, err := build(nil, nil, []string{f})
+	got, err := build(nil, nil, extras(f))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +168,7 @@ func TestBuildGarbage(t *testing.T) {
 	}
 
 	junk := write(t, filepath.Join(dir, "junk.pem"), []byte("\x00\xff no pem here"))
-	if _, err := build([]string{junk}, nil, []string{junk}); !errors.Is(err, ErrNoCertificates) {
+	if _, err := build([]string{junk}, nil, extras(junk)); !errors.Is(err, ErrNoCertificates) {
 		t.Fatalf("build of garbage = %v, want ErrNoCertificates", err)
 	}
 	if _, err := build(nil, nil, nil); !errors.Is(err, ErrNoCertificates) {
@@ -176,14 +185,23 @@ func TestBuildExtraErrors(t *testing.T) {
 	}
 	big := write(t, filepath.Join(dir, "big.pem"), bytes.Repeat([]byte{'x'}, maxFileSize+1))
 
-	for _, p := range []string{filepath.Join(dir, "missing.pem"), fifo, big} {
-		_, err := build([]string{sys}, nil, []string{p})
+	missingDir := filepath.Join(dir, "missing-dir")
+	for _, e := range []Extra{
+		{Var: "NODE_EXTRA_CA_CERTS", Path: filepath.Join(dir, "missing.pem")},
+		{Var: "SSL_CERT_FILE", Path: fifo},
+		{Var: "SSL_CERT_FILE", Path: big},
+		{Var: "SSL_CERT_DIR", Path: missingDir},
+	} {
+		_, err := build([]string{sys}, nil, []Extra{e})
 		if err == nil {
-			t.Errorf("build with extra %s succeeded", filepath.Base(p))
+			t.Errorf("build with %s=%s succeeded", e.Var, filepath.Base(e.Path))
 			continue
 		}
-		if !strings.Contains(err.Error(), p) {
-			t.Errorf("error %q does not name %s", err, p)
+		// The user must learn which setting to fix.
+		for _, want := range []string{e.Path, e.Var, "unset " + e.Var} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not name %q", err, want)
+			}
 		}
 	}
 	// A FIFO or oversized file among the system candidates is skipped.
