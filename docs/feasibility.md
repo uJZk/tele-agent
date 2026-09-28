@@ -188,7 +188,6 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 - Claude 进程的 `HOME` 设为**目标主机上远端用户的 home 路径**（例如 `/home/bob`）。这样模型写 `~` 时，与远端 Bash 的 `~` 一致。
 - 本地的 `~/.claude` 和 `~/.claude.json` 作为本地集合，**挂在 `$HOME` 下的对应位置**（`/home/bob/.claude` → 本地 `/home/alice/.claude`）。Claude 通过 `HOME` 找到自己的配置和凭证，不受影响。
-- `~/.claude/projects` 另外按主机隔离，见 6.2。
 
 ### 4.4 命名空间构建
 
@@ -305,7 +304,7 @@ tele <主机别名> [-d <工作目录>] claude [claude 的参数...]
 5. 在 `-d` 指定的目录中 exec `claude`，参数原样透传。
 6. Claude 退出后，清理会话：远端进程按租约规则处理（5.3），卸载 FUSE。
 
-**会话历史按主机隔离**：Claude 用 cwd 路径作为 `~/.claude/projects/` 下的项目键。不同主机上的同一路径（例如都是 `/home/alice`）会被当成同一个项目，`--resume` 就会混在一起。`CLAUDE_CODE_PROJECT_DIR_NAME` 只在设置了 `CLAUDE_CONFIG_DIR` 时才生效（已核实），所以不采用。做法是：`~/.claude` 本来就在本地集合中，再把 `~/.claude/projects` 额外 bind 到 `~/.claude/projects.tele/<别名>/`。这样每台主机有独立的会话历史，`tele <别名> claude --resume` 只会看到这台主机上的会话。
+**会话历史不按主机隔离（已接受）**：Claude 以 cwd 路径作为 `~/.claude/projects/` 下的项目键，不同主机上的同一路径会共用会话历史，`--resume` 时会一起列出。这种情况可以接受，tele 不做额外处理。
 
 ### 6.3 安装与配对
 
@@ -403,7 +402,7 @@ This session operates on the remote host "{{alias}}" via tele.
 |---|---|---|---|
 | R1 | Claude Code 内部行为（cwd 文件、快照、scratch 路径、prefix 覆盖范围）没有文档，会随版本变化 | **高** | P0 原型；CI 中用 `claude -p` 驱动真实 Claude 跑兼容性测试；启动时检测版本并告警 |
 | R2 | exec 形式的 hooks 绕过 PREFIX | 中 | `--setting-sources` + `--settings` 注入改写后的 hooks；插件 hooks 同样处理 |
-| R3 | 不同主机上的同一路径共用 Claude 的项目键，导致会话历史混在一起 | 低 | 按主机 bind `~/.claude/projects`（6.2） |
+| R3 | 不同主机上的同一路径共用 Claude 的项目键，会话历史混在一起 | 低 | **已接受**，不处理（6.2） |
 | R4 | 非特权 userns 被 AppArmor 或 sysctl 限制 | 中 | 随包附带 AppArmor profile；安装时检测并给出指引 |
 | R5 | telefs 与会话层都需要自研，POSIX 语义细节多 | 中 | pjdfstest / xfstests 子集，git/npm/cargo 真实负载回归；故障注入（`tc netem`、toxiproxy、netns 切换 IP） |
 | R6 | SS2022 的时钟同步要求 | 低 | install 检查 NTP，`tele host ls` / `tele doctor` 报告时钟偏差 |
@@ -420,7 +419,7 @@ This session operates on the remote host "{{alias}}" via tele.
 
 | 阶段 | 内容 | 预计 |
 |---|---|---|
-| **P0 验证** | 本地模拟远端（同机两个进程 + unix socket）：pivot_root 到 FUSE 根 + 嵌套 mountns 的 bind 挂载、本地集合的实测与自动生成、本地 exec 代理、HOME 映射、按主机隔离会话历史；Bash（cd 持久化、后台任务、超时、Ctrl-C）、快照、scratch 改写与回传、两种形式的 hooks、stdio MCP、`rg`/`git` shim、userns + telefs 回环后端；建立 `claude -p` 兼容性测试 | 1–1.5 周 |
+| **P0 验证** | 本地模拟远端（同机两个进程 + unix socket）：pivot_root 到 FUSE 根 + 嵌套 mountns 的 bind 挂载、本地集合的实测与自动生成、本地 exec 代理、HOME 映射；Bash（cd 持久化、后台任务、超时、Ctrl-C）、快照、scratch 改写与回传、两种形式的 hooks、stdio MCP、`rg`/`git` shim、userns + telefs 回环后端；建立 `claude -p` 兼容性测试 | 1–1.5 周 |
 | **P1 MVP** | 单二进制；SS2022 + 会话层（续传、心跳）；exec 服务；telefs（exec 屏障 + 推送）；`tele <别名> [-d] claude` 命令行与 `tele host`/`tele doctor`；系统提示词生成；配对安装 | 5–6 周 |
 | **P2 加固** | 先建后断与 netlink 主动重拨；故障注入测试矩阵；telefs 性能（readdirplus、小文件预取）；exec 形式 hooks 的改写 | 3 周 |
 | **P3 发布** | AppArmor profile、systemd --user 单元、发布流程（静态二进制、校验和）、文档 | 1–2 周 |
