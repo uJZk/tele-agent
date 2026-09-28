@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -13,10 +14,61 @@ import (
 	"github.com/ujzk/tele-agent/internal/proto"
 )
 
+// openHandles records the server handles open on each remote object, so
+// that operations on a node can use one (node.callNode). It is keyed by the
+// remote identity rather than by node, because go-fuse may replace the
+// node a request created by an existing one of the same identity.
+type openHandles struct {
+	mu sync.Mutex // guards m
+	m  map[proto.NodeID]map[uint64]struct{}
+}
+
+func (o *openHandles) add(node proto.NodeID, h uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.m == nil {
+		o.m = make(map[proto.NodeID]map[uint64]struct{})
+	}
+	if o.m[node] == nil {
+		o.m[node] = make(map[uint64]struct{})
+	}
+	o.m[node][h] = struct{}{}
+}
+
+func (o *openHandles) drop(node proto.NodeID, h uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.m[node], h)
+	if len(o.m[node]) == 0 {
+		delete(o.m, node)
+	}
+}
+
+// any returns one of the handles open on node, or 0.
+func (o *openHandles) any(node proto.NodeID) uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for h := range o.m[node] {
+		return h
+	}
+	return 0
+}
+
 // fileHandle is a file opened on the server.
 type fileHandle struct {
 	fsys *FS
+	node proto.NodeID
 	id   uint64
+	// dirty is set by a write and cleared by the flush that makes it
+	// durable.
+	dirty atomic.Bool
+}
+
+// newFileHandle returns the handle for server handle id of remote object
+// node, recording it as open.
+func (f *FS) newFileHandle(node proto.NodeID, id uint64) *fileHandle {
+	f.open.add(node, id)
+	return &fileHandle{fsys: f, node: node, id: id}
 }
 
 var (
@@ -54,6 +106,7 @@ func (h *fileHandle) Write(_ context.Context, data []byte, off int64) (uint32, s
 		if resp.Written == 0 || int(resp.Written) > len(chunk) {
 			break
 		}
+		h.dirty.Store(true)
 		written += resp.Written
 		off += int64(resp.Written)
 		data = data[resp.Written:]
@@ -67,14 +120,21 @@ func (h *fileHandle) Fsync(_ context.Context, flags uint32) syscall.Errno {
 	return errno
 }
 
-// Flush implements fs.FileFlusher. Writes are synchronous, so close(2) has
-// nothing left to push.
+// Flush implements fs.FileFlusher. The kernel flushes on every close(2).
+// Writes reach the remote file at once, but close also confirms that the
+// data written through this handle is on the remote disk, and reports a
+// failure to put it there (docs/telefs.md section 3), as NFS does.
 func (h *fileHandle) Flush(_ context.Context) syscall.Errno {
-	return 0
+	if !h.dirty.Swap(false) {
+		return 0
+	}
+	_, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSFsync, Handle: h.id, Flags: 1})
+	return errno
 }
 
 // Release implements fs.FileReleaser. The kernel ignores the result.
 func (h *fileHandle) Release(_ context.Context) syscall.Errno {
+	h.fsys.open.drop(h.node, h.id)
 	_, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSRelease, Handle: h.id})
 	return errno
 }
@@ -197,6 +257,10 @@ func (d *dirHandle) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		d.mu.Unlock()
 		return d.n.Lookup(ctx, name, out)
 	}
+	if e.TypeOnly {
+		d.mu.Unlock()
+		return nil, errTypeOnly
+	}
 	a, gen, unwatched := e.Attr, d.gen, d.unwatched
 	d.mu.Unlock()
 	ch := d.n.child(ctx, name, &a, unwatched)
@@ -204,8 +268,15 @@ func (d *dirHandle) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	return ch, 0
 }
 
+// errTypeOnly is what a READDIRPLUS lookup returns for an entry the server
+// could list but not examine (proto.DirEntry.TypeOnly). go-fuse then
+// replies without a node ID, which makes the kernel list the name without
+// caching attributes for it; a later access looks it up for real.
+const errTypeOnly = syscall.EACCES
+
 // Releasedir implements fs.FileReleasedirer.
 func (d *dirHandle) Releasedir(context.Context, uint32) {
+	d.n.fsys.open.drop(d.n.id(), d.id)
 	_, _ = d.n.fsys.call(&proto.FSRequest{Op: proto.FSReleasedir, Handle: d.id})
 }
 
@@ -222,6 +293,9 @@ type mergedEntry struct {
 	ino   uint64
 	synth *node      // synthetic child, or nil
 	attr  proto.Attr // remote child
+	// typeOnly marks a remote child the server could not examine
+	// (proto.DirEntry.TypeOnly).
+	typeOnly bool
 }
 
 // mergedDir lists a synthetic directory: ".", "..", its synthetic children,
@@ -306,10 +380,11 @@ func (m *mergedDir) loadRemote() bool {
 				continue
 			}
 			m.entries = append(m.entries, mergedEntry{
-				name: e.Name,
-				mode: e.Attr.Mode & syscall.S_IFMT,
-				ino:  f.mapIno(e.Attr.Dev, e.Attr.Ino),
-				attr: e.Attr,
+				name:     e.Name,
+				mode:     e.Attr.Mode & syscall.S_IFMT,
+				ino:      f.mapIno(e.Attr.Dev, e.Attr.Ino),
+				attr:     e.Attr,
+				typeOnly: e.TypeOnly,
 			})
 		}
 		if resp.EOF || len(resp.Entries) == 0 {
@@ -362,6 +437,8 @@ func (m *mergedDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	case e.synth != nil:
 		m.n.fsys.synthEntry(e.synth, out)
 		return &e.synth.Inode, 0
+	case e.typeOnly:
+		return nil, errTypeOnly
 	}
 	ch := m.n.child(ctx, name, &e.attr, unwatched)
 	m.n.fsys.fillEntry(out, ch, &e.attr, gen, unwatched)

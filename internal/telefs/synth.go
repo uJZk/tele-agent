@@ -144,11 +144,23 @@ func (f *FS) resolve(p string) string {
 // invalidate its dentry and detach the mounts below (docs/filesystem.md
 // section 6).
 func (f *FS) synthAttr(n *node) fuse.Attr {
+	var remote *proto.Attr
 	if n.kind == kindAncestor {
-		resp, errno := f.call(&proto.FSRequest{Op: proto.FSGetattr, Path: n.rpath})
-		if errno == 0 && resp.Attr.Mode&syscall.S_IFMT == syscall.S_IFDIR {
-			return f.fuseAttr(resp.Attr, n.synthIno)
+		if resp, errno := f.call(&proto.FSRequest{Op: proto.FSGetattr, Path: n.rpath}); errno == 0 {
+			remote = resp.Attr
 		}
+	}
+	return f.synthAttrFrom(n, remote)
+}
+
+// synthAttrFrom returns the attributes of synthetic node n given the remote
+// attributes a of an ancestor's directory (nil if unknown). Only a remote
+// directory lends its attributes: an ancestor is a directory whatever the
+// remote has at its path (for example a symlink after a usrmerge upgrade,
+// or anything if resolveAncestors failed).
+func (f *FS) synthAttrFrom(n *node, a *proto.Attr) fuse.Attr {
+	if n.kind == kindAncestor && a != nil && a.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+		return f.fuseAttr(a, n.synthIno)
 	}
 	mode, nlink := uint32(syscall.S_IFDIR|0o755), uint32(2)
 	if n.kind == kindPlaceholderFile {

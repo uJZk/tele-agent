@@ -1,6 +1,7 @@
 package telefs
 
 import (
+	"syscall"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -44,6 +45,28 @@ func TestRdevRoundTrip(t *testing.T) {
 	// The kernel's new_encode_dev of 8:17 is 0x811.
 	if got := fuseRdev(unix.Mkdev(8, 17)); got != 0x811 {
 		t.Errorf("fuseRdev(8:17) = %#x", got)
+	}
+}
+
+func TestKernelErrno(t *testing.T) {
+	cases := []struct {
+		remote uint32
+		want   syscall.Errno
+	}{
+		{uint32(unix.ENOENT), unix.ENOENT},
+		{uint32(unix.EHWPOISON), unix.EHWPOISON},
+		{maxErrno, maxErrno},
+		{512, unix.EIO}, // ERESTARTSYS
+		{enotsupp, unix.EOPNOTSUPP},
+		{521, unix.EIO}, // EBADHANDLE
+		{528, unix.EIO}, // EJUKEBOX
+		{1 << 31, unix.EIO},
+		{^uint32(0), unix.EIO},
+	}
+	for _, tc := range cases {
+		if got := kernelErrno(tc.remote); got != tc.want {
+			t.Errorf("kernelErrno(%d) = %d, want %d", tc.remote, got, tc.want)
+		}
 	}
 }
 

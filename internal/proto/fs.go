@@ -9,10 +9,11 @@ const (
 	// FSLookup: Name in directory Path → Attr.
 	FSLookup FSOp = 1
 	// FSGetattr: Path → Attr. When Handle is set, the attributes of that
-	// open file instead, which still works after it was renamed or
-	// unlinked.
+	// open file or directory instead, which still works after it was
+	// renamed or unlinked.
 	FSGetattr FSOp = 2
-	// FSSetattr: Path (and Handle if set) with SetAttr → Attr.
+	// FSSetattr: Path, or the open file or directory Handle if set, with
+	// SetAttr → Attr.
 	FSSetattr FSOp = 3
 	// FSOpendir: Path → Handle.
 	FSOpendir FSOp = 4
@@ -52,14 +53,17 @@ const (
 	FSStatfs FSOp = 21
 	// FSAccess: Path with Mask (access(2) mode) checked as the target user.
 	FSAccess FSOp = 22
-	// FSGetxattr: attribute Name2 of Path; Size 0 asks for the size only
-	// → Data or Size.
+	// FSGetxattr: attribute Name2 of Path, or of the open file or
+	// directory Handle if set; Size 0 asks for the size only → Data or
+	// Size.
 	FSGetxattr FSOp = 23
-	// FSListxattr: Path; Size 0 asks for the size only → Data or Size.
+	// FSListxattr: Path, or Handle if set; Size 0 asks for the size only
+	// → Data or Size.
 	FSListxattr FSOp = 24
-	// FSSetxattr: attribute Name2 of Path to Data with Flags.
+	// FSSetxattr: attribute Name2 of Path, or of Handle if set, to Data
+	// with Flags.
 	FSSetxattr FSOp = 25
-	// FSRemovexattr: attribute Name2 of Path.
+	// FSRemovexattr: attribute Name2 of Path, or of Handle if set.
 	FSRemovexattr FSOp = 26
 	// FSForget: the client dropped directory Path from its cache; the
 	// server stops watching it. No response is expected; the server closes
@@ -90,11 +94,25 @@ type FSRequest struct {
 	SetAttr *SetAttr `cbor:"13,keyasint,omitempty"`
 	Target  string   `cbor:"14,keyasint,omitempty"`
 	Mask    uint32   `cbor:"15,keyasint,omitempty"`
+	// Node, on a request that acts on the object at Path itself
+	// (FSGetattr, FSSetattr, FSAccess, FSReadlink and the xattr
+	// requests), is the remote identity the client means. If Path names
+	// another object now, for example after a rename replaced it, the
+	// request fails with ESTALE instead of acting on that object; for a
+	// path-based system call the kernel then repeats the lookup and the
+	// call once (docs/telefs.md section 3).
+	Node *NodeID `cbor:"16,keyasint,omitempty"`
+}
+
+// NodeID identifies an object on the target host.
+type NodeID struct {
+	Dev uint64 `cbor:"1,keyasint"`
+	Ino uint64 `cbor:"2,keyasint"`
 }
 
 // FSResponse is the only server frame on an FS stream. Errno is the remote
-// errno, returned unchanged to the kernel (docs/coding-standards.md
-// section 4).
+// errno, returned unchanged to the kernel whenever the kernel can take it
+// (docs/coding-standards.md section 4).
 type FSResponse struct {
 	Errno   uint32     `cbor:"1,keyasint,omitempty"`
 	Attr    *Attr      `cbor:"2,keyasint,omitempty"`
@@ -164,6 +182,11 @@ type DirEntry struct {
 	Name   string `cbor:"1,keyasint"`
 	Attr   Attr   `cbor:"2,keyasint"`
 	Offset int64  `cbor:"3,keyasint"`
+	// TypeOnly reports that the entry could be listed but not examined
+	// (for example in a directory with read but no search permission):
+	// Attr carries only Dev, Ino and the file type of the directory
+	// entry, which must not be cached as the entry's attributes.
+	TypeOnly bool `cbor:"4,keyasint,omitempty"`
 }
 
 // Statfs is the result of statfs on the target host.

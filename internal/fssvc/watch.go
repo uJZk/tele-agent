@@ -44,7 +44,18 @@ const (
 	// stream. Beyond it they are replaced by a new epoch, which tells the
 	// client to invalidate everything instead.
 	maxOutboxBytes = 8 << 20
+	// maxOrphans bounds the events kept for descriptors that are not
+	// recorded yet (watchState.orphans). Beyond it they are dropped and a
+	// new epoch declares the loss.
+	maxOrphans = 4096
 )
+
+// inotifyEvent is one decoded inotify event.
+type inotifyEvent struct {
+	wd   int32
+	mask uint32
+	name string
+}
 
 // watchState holds the inotify watches and the published events. It is
 // guarded by Service.mu.
@@ -57,6 +68,15 @@ type watchState struct {
 	// the same inode, so events are reported under every path.
 	watches map[int32]map[string]struct{}
 	byPath  map[string]int32
+
+	// adding counts the inotify_add_watch calls in flight. They run
+	// without locks, so the reader can see events of a new descriptor
+	// before watch records it; while adding > 0, events of unknown
+	// descriptors are kept in orphans, and watch replays those of its
+	// descriptor after recording it. Once no add is in flight, the
+	// remaining orphans belong to removed watches and are dropped.
+	adding  int
+	orphans []inotifyEvent
 
 	pending      []proto.Change
 	pendingSet   map[proto.Change]struct{}
@@ -87,10 +107,19 @@ func (w *watchState) init(epoch uint64) {
 }
 
 // watch makes sure directory p is watched and reports whether it is.
+//
+// inotify_add_watch resolves p, which blocks for as long as the file
+// system below p does (a hung NFS server, an automount, a slow FUSE mount).
+// It therefore runs without any lock, so that it stalls only the request
+// that names p, not the reader, Sync (the exec barrier) or requests for
+// other directories.
 func (s *Service) watch(p string) bool {
 	s.mu.Lock()
 	_, ok := s.w.byPath[p]
 	closed := s.w.closed
+	if !ok && !closed {
+		s.w.adding++
+	}
 	s.mu.Unlock()
 	if ok {
 		return true
@@ -98,9 +127,13 @@ func (s *Service) watch(p string) bool {
 	if closed {
 		return false
 	}
+	wd, err := s.addWatch(p)
+	return s.recordWatch(p, wd, err)
+}
 
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
+// addWatch asks the kernel to watch real directory p. It holds no lock;
+// the caller counted it in watchState.adding.
+func (s *Service) addWatch(p string) (int32, error) {
 	var (
 		wd  int
 		err error
@@ -109,8 +142,29 @@ func (s *Service) watch(p string) bool {
 		wd, err = unix.InotifyAddWatch(int(fd), s.real(p), watchMask)
 	})
 	if cerr != nil {
-		return false
+		return 0, cerr
 	}
+	return int32(wd), err
+}
+
+// recordWatch finishes an addWatch of p that returned wd and err: it
+// records the watch, replays the events the reader kept for wd in the
+// meantime, and reports whether p is watched.
+func (s *Service) recordWatch(p string, wd int32, err error) bool {
+	var toRemove []int32
+	defer func() {
+		for _, wd := range toRemove {
+			s.rmWatch(wd)
+		}
+	}()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.w.adding--
+	defer func() {
+		if s.w.adding == 0 {
+			s.w.orphans = nil
+		}
+	}()
 	if err != nil {
 		// ENOENT and ENOTDIR fail the request itself. EACCES (a directory
 		// with search but no read permission) and ENOSPC (the watch
@@ -118,22 +172,39 @@ func (s *Service) watch(p string) bool {
 		s.logDebug("fssvc: inotify_add_watch", "path", p, "err", err)
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	paths := s.w.watches[int32(wd)]
+	if s.w.closed {
+		return false
+	}
+	paths := s.w.watches[wd]
 	if paths == nil {
 		paths = make(map[string]struct{})
-		s.w.watches[int32(wd)] = paths
+		s.w.watches[wd] = paths
 	}
 	paths[p] = struct{}{}
-	s.w.byPath[p] = int32(wd)
-	return true
+	s.w.byPath[p] = wd
+
+	// Replay in order. An event that ends the watch (IN_IGNORED after a
+	// concurrent unwatch of another path of the same directory removed
+	// the kernel's mark) drops p again, and the client hears about it.
+	var mine []inotifyEvent
+	kept := s.w.orphans[:0]
+	for _, ev := range s.w.orphans {
+		if ev.wd == wd {
+			mine = append(mine, ev)
+		} else {
+			kept = append(kept, ev)
+		}
+	}
+	s.w.orphans = kept
+	for _, ev := range mine {
+		toRemove = s.processEventLocked(ev, toRemove)
+	}
+	_, ok := s.w.byPath[p]
+	return ok
 }
 
 // unwatch stops watching directory p (FSForget).
 func (s *Service) unwatch(p string) {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
 	s.mu.Lock()
 	wd, last := s.forgetPathLocked(p)
 	s.mu.Unlock()
@@ -159,8 +230,11 @@ func (s *Service) forgetPathLocked(p string) (int32, bool) {
 	return wd, true
 }
 
-// rmWatch removes a watch from the kernel. The caller holds readMu, which
-// orders it with inotify_add_watch returning the same descriptor again.
+// rmWatch removes a watch from the kernel. A concurrent watch of another
+// path of the same directory may have been handed the same descriptor and
+// record it after the removal; the IN_IGNORED event that the removal queues
+// then drops that path again (processEventLocked), so the client learns
+// that it is not watched instead of waiting for events that never come.
 func (s *Service) rmWatch(wd int32) {
 	_ = s.rawIn.Control(func(fd uintptr) {
 		// EINVAL means the kernel already dropped the watch.
@@ -255,8 +329,7 @@ func (s *Service) drainLocked() {
 }
 
 // processEventsLocked turns a buffer of inotify events into pending changes
-// and returns the watches to remove from the kernel. The caller holds
-// readMu and mu.
+// and returns the watches to remove from the kernel. The caller holds mu.
 func (s *Service) processEventsLocked(buf []byte, toRemove []int32) []int32 {
 	for len(buf) >= unix.SizeofInotifyEvent {
 		wd := int32(binary.NativeEndian.Uint32(buf[0:4]))
@@ -270,20 +343,29 @@ func (s *Service) processEventsLocked(buf []byte, toRemove []int32) []int32 {
 		if i := bytes.IndexByte(name, 0); i >= 0 {
 			name = name[:i]
 		}
-		toRemove = s.processEventLocked(wd, mask, string(name), toRemove)
+		toRemove = s.processEventLocked(inotifyEvent{wd: wd, mask: mask, name: string(name)}, toRemove)
 		buf = buf[end:]
 	}
 	return toRemove
 }
 
-func (s *Service) processEventLocked(wd int32, mask uint32, name string, toRemove []int32) []int32 {
+func (s *Service) processEventLocked(ev inotifyEvent, toRemove []int32) []int32 {
+	wd, mask, name := ev.wd, ev.mask, ev.name
 	if mask&unix.IN_Q_OVERFLOW != 0 {
 		s.bumpEpochLocked()
 		return toRemove
 	}
 	paths, ok := s.w.watches[wd]
 	if !ok {
-		// An event of a watch that was removed in the meantime.
+		// Either a watch that was removed in the meantime, or one that
+		// an add in flight has not recorded yet.
+		if s.w.adding > 0 {
+			if len(s.w.orphans) >= maxOrphans {
+				s.w.orphans = nil
+				s.bumpEpochLocked()
+			}
+			s.w.orphans = append(s.w.orphans, ev)
+		}
 		return toRemove
 	}
 	if mask&(unix.IN_DELETE_SELF|unix.IN_MOVE_SELF|unix.IN_UNMOUNT|unix.IN_IGNORED) != 0 {

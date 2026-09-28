@@ -365,13 +365,107 @@ func TestOverflow(t *testing.T) {
 	}
 }
 
+// outboxChanges returns the changes of every published event not yet sent.
+func outboxChanges(s *Service) []proto.Change {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return changes(s.w.outbox)
+}
+
+// TestWatchEventsBeforeRecord interleaves an add by hand: the kernel
+// already watches the directory, and reports a change, before the service
+// recorded the descriptor. The change must not be lost.
+func TestWatchEventsBeforeRecord(t *testing.T) {
+	root := t.TempDir()
+	// No reader: Sync drains the queue at chosen points.
+	s, err := newService(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := os.Mkdir(filepath.Join(root, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.w.adding++
+	s.mu.Unlock()
+	wd, err := s.addWatch("/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "d/f"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.Sync()
+	want := proto.Change{Dir: "/d", Name: "f", Kind: proto.ChangeEntry}
+	if slices.Contains(outboxChanges(s), want) {
+		t.Fatal("change published before the watch was recorded")
+	}
+	if !s.recordWatch("/d", wd, nil) {
+		t.Fatal("watch not recorded")
+	}
+	s.Sync()
+	if got := outboxChanges(s); !slices.Contains(got, want) {
+		t.Fatalf("change read before the record was lost: %+v", got)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.w.orphans) != 0 || s.w.adding != 0 {
+		t.Fatalf("orphans %v adding %d", s.w.orphans, s.w.adding)
+	}
+}
+
+// TestWatchRemovedBeforeRecord interleaves an add of a second path of one
+// directory with the unwatch of its first path: the add is handed the
+// existing descriptor, whose kernel mark the unwatch then removes. The
+// second path must end up reported as not watched rather than silently
+// losing its events.
+func TestWatchRemovedBeforeRecord(t *testing.T) {
+	root := t.TempDir()
+	s, err := newService(Config{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := os.Mkdir(filepath.Join(root, "d"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("d", filepath.Join(root, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if !s.watch("/d") {
+		t.Fatal("watch failed")
+	}
+	s.mu.Lock()
+	s.w.adding++
+	first := s.w.byPath["/d"]
+	s.mu.Unlock()
+	wd, err := s.addWatch("/alias")
+	if err != nil || wd != first {
+		t.Fatalf("add of the second path: wd %d (first %d), %v", wd, first, err)
+	}
+	s.unwatch("/d")
+	s.Sync() // reads IN_IGNORED before the record
+	if s.recordWatch("/alias", wd, nil) {
+		t.Fatal("second path reported watched after its mark was removed")
+	}
+	s.Sync()
+	if got := outboxChanges(s); !slices.Contains(got, proto.Change{Dir: "/alias", Kind: proto.ChangeEntry}) {
+		t.Fatalf("client not told: %+v", got)
+	}
+	s.mu.Lock()
+	_, watched := s.w.byPath["/alias"]
+	s.mu.Unlock()
+	if watched {
+		t.Fatal("second path still recorded")
+	}
+}
+
 func FuzzProcessEvents(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(make([]byte, unix.SizeofInotifyEvent+4))
 	s, _ := newSvc(f)
 	f.Fuzz(func(_ *testing.T, b []byte) {
-		s.readMu.Lock()
-		defer s.readMu.Unlock()
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		_ = s.processEventsLocked(b, nil)

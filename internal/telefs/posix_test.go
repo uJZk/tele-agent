@@ -9,11 +9,14 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/ujzk/tele-agent/internal/proto"
 )
 
 func lstat(t *testing.T, p string) *unix.Stat_t {
@@ -401,5 +404,140 @@ func TestErrnoFidelity(t *testing.T) {
 				t.Fatalf("got %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestUnrepresentableErrno checks that remote errnos the kernel refuses in a
+// FUSE reply (512 and above, kernel-internal codes that NFS leaks) reach the
+// caller as a representable errno. Handed on unchanged, the kernel rejects
+// the reply and the caller waits uninterruptibly forever.
+func TestUnrepresentableErrno(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+	writeFile(t, h.b("xa"), "")
+	h.opener.setHook(func(req *proto.FSRequest, forward func() *proto.FSResponse) *proto.FSResponse {
+		switch {
+		case req.Op == proto.FSLookup && req.Name == "enotsupp":
+			return &proto.FSResponse{Errno: enotsupp}
+		case req.Op == proto.FSLookup && req.Name == "badhandle":
+			return &proto.FSResponse{Errno: 521}
+		case req.Op == proto.FSGetxattr:
+			return &proto.FSResponse{Errno: enotsupp}
+		}
+		return forward()
+	})
+	cases := []struct {
+		name string
+		op   func() error
+		want syscall.Errno
+	}{
+		{"lookup ENOTSUPP", func() error { _, err := os.Lstat(h.m("enotsupp")); return err }, unix.EOPNOTSUPP},
+		{"lookup EBADHANDLE", func() error { _, err := os.Lstat(h.m("badhandle")); return err }, unix.EIO},
+		{"getxattr ENOTSUPP", func() error { _, err := unix.Getxattr(h.m("xa"), "user.k", nil); return err }, unix.EOPNOTSUPP},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			h.returnsInTime(t, func() { err = tc.op() })
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// returnsInTime runs op, which must return promptly. If it does not, the
+// caller may be stuck in the kernel waiting for a reply that never comes,
+// which only aborting the FUSE connection ends: a forced unmount does that.
+func (h *harness) returnsInTime(t *testing.T, op func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		op()
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = unix.Unmount(h.mnt, unix.MNT_FORCE|unix.MNT_DETACH)
+		<-done
+		t.Fatal("system call on the mount did not return")
+	}
+}
+
+// TestReaddirTypeOnlyEntries checks that an entry the server could list but
+// not examine is listed, and that its stand-in attributes are not cached as
+// the entry's: a stat looks it up for real.
+func TestReaddirTypeOnlyEntries(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+	mkdirAll(t, h.b("d"))
+	writeFile(t, h.b("d/f"), "12345")
+	h.opener.setHook(func(req *proto.FSRequest, forward func() *proto.FSResponse) *proto.FSResponse {
+		resp := forward()
+		if req.Op != proto.FSReaddir {
+			return resp
+		}
+		for i := range resp.Entries {
+			if e := &resp.Entries[i]; e.Name == "f" {
+				e.Attr = proto.Attr{Dev: e.Attr.Dev, Ino: e.Attr.Ino, Mode: e.Attr.Mode & unix.S_IFMT}
+				e.TypeOnly = true
+			}
+		}
+		return resp
+	})
+	ents, err := os.ReadDir(h.m("d"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name() != "f" || !ents[0].Type().IsRegular() {
+		t.Fatalf("listing %v", ents)
+	}
+	if st := lstat(t, h.m("d/f")); st.Size != 5 || st.Mode != unix.S_IFREG|0o644 {
+		t.Fatalf("stat after listing: size %d mode %o", st.Size, st.Mode)
+	}
+}
+
+// TestCloseSyncsWrites checks that close(2) of a file written through the
+// mount confirms that the remote host has the data on disk (docs/telefs.md
+// section 3) and reports a failure to put it there, while a close without
+// writes costs no round trip.
+func TestCloseSyncsWrites(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+	var syncs atomic.Int32
+	var fail atomic.Bool
+	h.opener.setHook(func(req *proto.FSRequest, forward func() *proto.FSResponse) *proto.FSResponse {
+		if req.Op == proto.FSFsync {
+			syncs.Add(1)
+			if fail.Load() {
+				return &proto.FSResponse{Errno: uint32(unix.ENOSPC)}
+			}
+		}
+		return forward()
+	})
+	writeFile(t, h.m("w"), "data")
+	if n := syncs.Load(); n != 1 {
+		t.Fatalf("%d syncs for one written file", n)
+	}
+	_ = readFile(t, h.m("w"))
+	fh, err := os.OpenFile(h.m("w"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n := syncs.Load(); n != 1 {
+		t.Fatalf("%d syncs after closes without writes", n)
+	}
+
+	fail.Store(true)
+	fh, err = os.OpenFile(h.m("w"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fh.WriteString("more"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Close(); !errors.Is(err, unix.ENOSPC) {
+		t.Fatalf("close after a failed sync = %v, want ENOSPC", err)
 	}
 }

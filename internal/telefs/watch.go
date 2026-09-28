@@ -5,35 +5,38 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
 
-// Forget handling.
-const (
-	// forgetWorkers bounds concurrent FSForget round trips.
-	forgetWorkers = 4
-	// forgetTimeout bounds one FSForget round trip, and how long a
-	// request that watches the same path again waits for it.
-	forgetTimeout = 30 * time.Second
-)
+// forgetWorkers bounds concurrent FSForget round trips.
+const forgetWorkers = 4
 
 // registry records which nodes asked the server to watch which remote
 // directory paths (docs/telefs.md section 4). The server watches by path,
 // so a path is forgotten only when no live node needs it any more, and a
-// forget in flight is ordered before any later request that watches the
-// same path again: otherwise the server could process the new watch first
-// and then drop it.
+// forget that was sent is ordered before any later request that watches
+// the same path again: otherwise the server could process the new watch
+// first and then drop it. A forget still queued when the path is needed
+// again is cancelled instead: the server keeps the watch the new request
+// relies on.
+//
+// A forget is bounded by the transport like every request (docs/telefs.md
+// section 5), not by a timeout of its own: once sent, its outcome is
+// unknown until the server confirms it, and a request that watches the
+// path again must not overtake it.
 type registry struct {
-	mu         sync.Mutex // guards the fields below and node.watchPaths
-	byPath     map[string]map[*node]struct{}
-	forgetting map[string]chan struct{} // closed when the forget completed
-	queue      []string
+	mu     sync.Mutex // guards the fields below and node.watchPaths
+	byPath map[string]map[*node]struct{}
+	// forgetting holds the paths with a queued or sent forget; the
+	// channel is closed when the forget completed or was cancelled.
+	forgetting map[string]chan struct{}
+	queue      []string      // forgets not sent yet, in order
 	kick       chan struct{} // wakes a forget worker; capacity 1
 }
 
@@ -48,16 +51,26 @@ func (r *registry) init() {
 func (f *FS) watchDir(n *node, p string) {
 	r := &f.reg
 	r.mu.Lock()
-	if ch, busy := r.forgetting[p]; busy {
+	for {
+		ch, busy := r.forgetting[p]
+		if !busy {
+			break
+		}
+		if i := slices.Index(r.queue, p); i >= 0 {
+			r.queue = slices.Delete(r.queue, i, i+1)
+			delete(r.forgetting, p)
+			close(ch)
+			break
+		}
 		r.mu.Unlock()
-		t := time.NewTimer(forgetTimeout)
 		select {
 		case <-ch:
-		case <-t.C:
 		case <-f.done:
 		}
-		t.Stop()
 		r.mu.Lock()
+		if isDone(f.done) {
+			break
+		}
 	}
 	set := r.byPath[p]
 	if set == nil {
@@ -162,6 +175,7 @@ func (f *FS) forgetWorker(ctx context.Context) {
 		}
 		p := r.queue[0]
 		r.queue = r.queue[1:]
+		ch := r.forgetting[p]
 		more := len(r.queue) > 0
 		r.mu.Unlock()
 		if more {
@@ -172,34 +186,41 @@ func (f *FS) forgetWorker(ctx context.Context) {
 		}
 		f.sendForget(ctx, p)
 		r.mu.Lock()
-		ch := r.forgetting[p]
 		delete(r.forgetting, p)
 		r.mu.Unlock()
-		if ch != nil {
-			close(ch)
-		}
+		close(ch)
 	}
 }
 
 // sendForget tells the server to stop watching p and waits until it did:
-// the server closes the stream after removing the watch.
+// the server closes the stream after removing the watch. The wait ends
+// early only when the file system is unmounted (ctx).
 func (f *FS) sendForget(ctx context.Context, p string) {
 	c, err := f.cfg.Opener.Open(proto.StreamFS)
 	if err != nil {
+		// Not sent: the server keeps watching p, which costs a watch
+		// but loses no change.
 		f.log.Debug("telefs: open forget stream", "err", err)
 		return
 	}
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stop()
 	defer func() { _ = c.Close() }()
-	if err := c.SetDeadline(time.Now().Add(forgetTimeout)); err != nil {
-		return
-	}
 	if err := proto.WriteFrame(c, &proto.FSRequest{Op: proto.FSForget, Path: p}); err != nil {
 		f.log.Debug("telefs: send forget", "err", err)
 		return
 	}
 	_, _ = io.Copy(io.Discard, c)
+}
+
+// isDone reports whether ch is closed.
+func isDone(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // RunWatch applies the WatchEvents the server pushes on c until c fails or
@@ -337,6 +358,11 @@ func (f *FS) applyChange(ch proto.Change) {
 		switch {
 		case ch.Kind == proto.ChangeEntry:
 			f.invalEntry(d, ch.Name)
+			// The directory's own mtime, ctime, size and nlink changed
+			// too, but inotify reports only the entry, and the kernel
+			// refreshes the directory's attributes on an entry
+			// invalidation only if it had cached that name.
+			notifyContent(&d.Inode, -1)
 		case ch.Name == "":
 			notifyContent(&d.Inode, -1)
 		default:

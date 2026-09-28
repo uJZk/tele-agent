@@ -85,11 +85,11 @@ func (s *Service) do(req *proto.FSRequest) *proto.FSResponse {
 	case proto.FSLink:
 		return s.link(req)
 	case proto.FSReadlink:
-		return s.withPath(req, s.readlink)
+		return s.withPath(req, func(p string) *proto.FSResponse { return s.readlink(p, req.Node) })
 	case proto.FSStatfs:
 		return s.withPath(req, s.statfs)
 	case proto.FSAccess:
-		return s.withPath(req, func(p string) *proto.FSResponse { return s.access(p, req.Mask) })
+		return s.withPath(req, func(p string) *proto.FSResponse { return s.access(p, req.Mask, req.Node) })
 	case proto.FSGetxattr, proto.FSListxattr, proto.FSSetxattr, proto.FSRemovexattr:
 		return s.xattr(req)
 	case proto.FSForget:
@@ -177,7 +177,13 @@ func (s *Service) getattr(req *proto.FSRequest) *proto.FSResponse {
 	if req.Handle != 0 {
 		return s.withHandle(req.Handle, func(h *handle) *proto.FSResponse { return fstatResp(h.fd) })
 	}
-	return s.withPath(req, func(p string) *proto.FSResponse { return lstatResp(s.real(p)) })
+	return s.withPath(req, func(p string) *proto.FSResponse {
+		resp := lstatResp(s.real(p))
+		if want := req.Node; resp.Attr != nil && want != nil && (resp.Attr.Dev != want.Dev || resp.Attr.Ino != want.Ino) {
+			return errResp(uint32(unix.ESTALE))
+		}
+		return resp
+	})
 }
 
 func (s *Service) opendir(p string) *proto.FSResponse {
@@ -191,7 +197,12 @@ func (s *Service) opendir(p string) *proto.FSResponse {
 	if err != nil {
 		return &proto.FSResponse{Errno: errnoOf(err), Unwatched: unwatched}
 	}
-	id := s.handles.add(&handle{fd: fd, dir: true, path: p})
+	var st unix.Stat_t
+	if err := ignoringEINTR(func() error { return unix.Fstat(fd, &st) }); err != nil {
+		_ = unix.Close(fd)
+		return &proto.FSResponse{Errno: errnoOf(err), Unwatched: unwatched}
+	}
+	id := s.handles.add(&handle{fd: fd, dir: true, path: p, dev: st.Dev})
 	return &proto.FSResponse{Handle: id, Unwatched: unwatched}
 }
 
@@ -344,8 +355,7 @@ func (s *Service) mkdir(dir, name string, mode uint32) *proto.FSResponse {
 	if err := ignoringEINTR(func() error { return unix.Mkdir(p, perm) }); err != nil {
 		return &proto.FSResponse{Errno: errnoOf(err), Unwatched: unwatched}
 	}
-	s.fixMode(func(m uint32) error { return unix.Chmod(p, m) }, perm)
-	resp := lstatResp(p)
+	resp := s.created(p, unix.S_IFDIR, perm)
 	resp.Unwatched = unwatched
 	return resp
 }
@@ -362,10 +372,33 @@ func (s *Service) mknod(dir, name string, mode uint32, rdev uint64) *proto.FSRes
 	if err := ignoringEINTR(func() error { return unix.Mknod(p, mode, int(rdev)) }); err != nil {
 		return &proto.FSResponse{Errno: errnoOf(err), Unwatched: unwatched}
 	}
-	s.fixMode(func(m uint32) error { return unix.Chmod(p, m) }, perm)
-	resp := lstatResp(p)
+	resp := s.created(p, mode&unix.S_IFMT, perm)
 	resp.Unwatched = unwatched
 	return resp
+}
+
+// created returns the attributes of the node of type typ that mkdir or
+// mknod just created at real path p, after restoring the mode bits the
+// server's umask removed (fixMode). The node is pinned first: if another
+// user replaced the fresh entry in the meantime, for example with a symlink
+// to one of the target user's files, that object is left alone.
+func (s *Service) created(p string, typ, perm uint32) *proto.FSResponse {
+	n, errno := pin(p, nil)
+	if errno != 0 {
+		return errResp(errno)
+	}
+	defer n.close()
+	if n.st.Mode&unix.S_IFMT != typ {
+		return &proto.FSResponse{Attr: attrFromStat(&n.st)}
+	}
+	if typ == unix.S_IFDIR {
+		// A new directory inherits S_ISGID from a setgid parent, which
+		// the requested mode does not carry (the kernel strips it from
+		// mkdir modes) and an exact chmod would clear.
+		perm |= n.st.Mode & unix.S_ISGID
+	}
+	s.fixMode(n.chmod, perm)
+	return n.refresh()
 }
 
 func (s *Service) remove(dir, name string, flags int) *proto.FSResponse {
@@ -425,12 +458,21 @@ func (s *Service) link(req *proto.FSRequest) *proto.FSResponse {
 	return resp
 }
 
-func (s *Service) readlink(p string) *proto.FSResponse {
+func (s *Service) readlink(p string, want *proto.NodeID) *proto.FSResponse {
+	node, errno := pin(s.real(p), want)
+	if errno != 0 {
+		return errResp(errno)
+	}
+	defer node.close()
+	if !node.isSymlink() {
+		// readlinkat with an empty path says ENOENT here.
+		return errResp(einval)
+	}
 	buf := make([]byte, maxLinkLen+1)
 	var n int
 	err := ignoringEINTR(func() error {
 		var err error
-		n, err = unix.Readlink(s.real(p), buf)
+		n, err = unix.Readlinkat(node.fd, "", buf)
 		return err
 	})
 	if err != nil {
@@ -456,14 +498,16 @@ func (s *Service) statfs(p string) *proto.FSResponse {
 	}}
 }
 
-func (s *Service) access(p string, mask uint32) *proto.FSResponse {
+func (s *Service) access(p string, mask uint32, want *proto.NodeID) *proto.FSResponse {
 	if mask&^uint32(unix.R_OK|unix.W_OK|unix.X_OK) != 0 {
 		return errResp(einval)
 	}
-	err := ignoringEINTR(func() error {
-		return unix.Faccessat(unix.AT_FDCWD, s.real(p), mask, unix.AT_SYMLINK_NOFOLLOW)
-	})
-	return errResp(errnoOfOrZero(err))
+	n, errno := pin(s.real(p), want)
+	if errno != 0 {
+		return errResp(errno)
+	}
+	defer n.close()
+	return errResp(errnoOfOrZero(n.access(mask)))
 }
 
 // checkXattrName validates an extended attribute name from the peer.
@@ -472,21 +516,59 @@ func checkXattrName(name string) bool {
 }
 
 func (s *Service) xattr(req *proto.FSRequest) *proto.FSResponse {
-	if proto.CheckPath(req.Path) != nil {
-		return errResp(einval)
-	}
-	p := s.real(req.Path)
 	if req.Op != proto.FSListxattr && !checkXattrName(req.Name2) {
 		return errResp(einval)
 	}
+	if req.Op == proto.FSSetxattr && len(req.Data) > maxXattrSize {
+		return errResp(uint32(unix.E2BIG))
+	}
+	if req.Handle != 0 {
+		return s.withHandle(req.Handle, func(h *handle) *proto.FSResponse { return xattrOp(req, fdXattr(h.fd)) })
+	}
+	return s.withPath(req, func(p string) *proto.FSResponse {
+		n, errno := pin(s.real(p), req.Node)
+		if errno != 0 {
+			return errResp(errno)
+		}
+		defer n.close()
+		// The *xattr calls without the l prefix follow the magic link to
+		// the pinned object, which is never followed further even when
+		// it is a symlink; fgetxattr and friends refuse O_PATH
+		// descriptors.
+		return xattrOp(req, pathXattr(n.proc()))
+	})
+}
+
+// xattrCalls are the extended attribute system calls on one object.
+type xattrCalls struct {
+	get    func(name string, dest []byte) (int, error)
+	list   func(dest []byte) (int, error)
+	set    func(name string, data []byte, flags int) error
+	remove func(name string) error
+}
+
+func fdXattr(fd int) xattrCalls {
+	return xattrCalls{
+		get:    func(name string, dest []byte) (int, error) { return unix.Fgetxattr(fd, name, dest) },
+		list:   func(dest []byte) (int, error) { return unix.Flistxattr(fd, dest) },
+		set:    func(name string, data []byte, flags int) error { return unix.Fsetxattr(fd, name, data, flags) },
+		remove: func(name string) error { return unix.Fremovexattr(fd, name) },
+	}
+}
+
+func pathXattr(p string) xattrCalls {
+	return xattrCalls{
+		get:    func(name string, dest []byte) (int, error) { return unix.Getxattr(p, name, dest) },
+		list:   func(dest []byte) (int, error) { return unix.Listxattr(p, dest) },
+		set:    func(name string, data []byte, flags int) error { return unix.Setxattr(p, name, data, flags) },
+		remove: func(name string) error { return unix.Removexattr(p, name) },
+	}
+}
+
+// xattrOp runs the extended attribute request req with calls x.
+func xattrOp(req *proto.FSRequest, x xattrCalls) *proto.FSResponse {
 	switch req.Op {
 	case proto.FSGetxattr, proto.FSListxattr:
-		get := func(dest []byte) (int, error) {
-			if req.Op == proto.FSGetxattr {
-				return unix.Lgetxattr(p, req.Name2, dest)
-			}
-			return unix.Llistxattr(p, dest)
-		}
 		var dest []byte
 		if req.Size > 0 {
 			dest = make([]byte, min(int(req.Size), maxXattrSize))
@@ -494,7 +576,11 @@ func (s *Service) xattr(req *proto.FSRequest) *proto.FSResponse {
 		var n int
 		err := ignoringEINTR(func() error {
 			var err error
-			n, err = get(dest)
+			if req.Op == proto.FSGetxattr {
+				n, err = x.get(req.Name2, dest)
+			} else {
+				n, err = x.list(dest)
+			}
 			return err
 		})
 		if err != nil {
@@ -505,13 +591,10 @@ func (s *Service) xattr(req *proto.FSRequest) *proto.FSResponse {
 		}
 		return &proto.FSResponse{Data: dest[:n]}
 	case proto.FSSetxattr:
-		if len(req.Data) > maxXattrSize {
-			return errResp(uint32(unix.E2BIG))
-		}
-		err := ignoringEINTR(func() error { return unix.Lsetxattr(p, req.Name2, req.Data, int(req.Flags)) })
+		err := ignoringEINTR(func() error { return x.set(req.Name2, req.Data, int(req.Flags)) })
 		return errResp(errnoOfOrZero(err))
 	default: // proto.FSRemovexattr
-		err := ignoringEINTR(func() error { return unix.Lremovexattr(p, req.Name2) })
+		err := ignoringEINTR(func() error { return x.remove(req.Name2) })
 		return errResp(errnoOfOrZero(err))
 	}
 }
@@ -531,10 +614,15 @@ func (s *Service) setattr(req *proto.FSRequest) *proto.FSResponse {
 	}
 	return s.withPath(req, func(vp string) *proto.FSResponse {
 		p := s.real(vp)
-		if errno := s.setattrPath(p, sa); errno != 0 {
+		n, errno := pin(p, req.Node)
+		if errno != 0 {
 			return errResp(errno)
 		}
-		return lstatResp(p)
+		defer n.close()
+		if errno := s.setattrPinned(p, n, sa); errno != 0 {
+			return errResp(errno)
+		}
+		return n.refresh()
 	})
 }
 
@@ -566,57 +654,55 @@ func (s *Service) setattrFD(fd int, sa *proto.SetAttr) uint32 {
 	return 0
 }
 
-func (s *Service) setattrPath(p string, sa *proto.SetAttr) uint32 {
+// setattrPinned applies sa to pinned node n found at real path p.
+func (s *Service) setattrPinned(p string, n *pinned, sa *proto.SetAttr) uint32 {
 	if sa.Valid&proto.SetMode != 0 {
-		if err := lchmod(p, sa.Mode&07777); err != nil {
+		if err := n.chmod(sa.Mode & 07777); err != nil {
 			return errnoOf(err)
 		}
 	}
 	if sa.Valid&(proto.SetUID|proto.SetGID) != 0 {
-		uid, gid := owners(sa)
-		if err := ignoringEINTR(func() error { return unix.Lchown(p, uid, gid) }); err != nil {
+		if err := n.chown(owners(sa)); err != nil {
 			return errnoOf(err)
 		}
 	}
 	if sa.Valid&proto.SetSize != 0 {
-		// truncate(2) follows symlinks; open the node itself instead.
-		err := ignoringEINTR(func() error {
-			fd, err := unix.Open(p, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOCTTY, 0)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = unix.Close(fd) }()
-			return unix.Ftruncate(fd, sa.Size)
-		})
-		if err != nil {
-			return errnoOf(err)
+		if errno := truncatePinned(p, n, sa.Size); errno != 0 {
+			return errno
 		}
 	}
 	if ts, ok := times(sa); ok {
-		if err := ignoringEINTR(func() error { return unix.UtimesNanoAt(unix.AT_FDCWD, p, ts[:], unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+		if err := n.utimes(&ts); err != nil {
 			return errnoOf(err)
 		}
 	}
 	return 0
 }
 
-// lchmod changes the mode of p without following a final symlink. Linux has
-// no lchmod; fchmodat2 (6.6+) implements AT_SYMLINK_NOFOLLOW, and older
-// kernels fall back to checking the type first (symlink modes cannot be
-// changed on Linux anyway).
-func lchmod(p string, mode uint32) error {
-	err := ignoringEINTR(func() error { return unix.Fchmodat(unix.AT_FDCWD, p, mode, unix.AT_SYMLINK_NOFOLLOW) })
-	if !errors.Is(err, unix.EOPNOTSUPP) {
+// truncatePinned truncates pinned node n, found at real path p, to size.
+// truncate(2) follows symlinks and an O_PATH descriptor cannot be
+// truncated, so the node is opened for writing without following a final
+// symlink (ELOOP, as for a client truncate of a symlink) and must turn out
+// to be the pinned object.
+func truncatePinned(p string, n *pinned, size int64) uint32 {
+	var fd int
+	err := ignoringEINTR(func() error {
+		var err error
+		fd, err = unix.Open(p, unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOCTTY, 0)
 		return err
+	})
+	if err != nil {
+		return errnoOf(err)
 	}
+	defer func() { _ = unix.Close(fd) }()
 	var st unix.Stat_t
-	if err := ignoringEINTR(func() error { return unix.Lstat(p, &st) }); err != nil {
-		return err
+	if err := ignoringEINTR(func() error { return unix.Fstat(fd, &st) }); err != nil {
+		return errnoOf(err)
 	}
-	if st.Mode&unix.S_IFMT == unix.S_IFLNK {
-		return unix.EOPNOTSUPP
+	if !n.is(&proto.NodeID{Dev: st.Dev, Ino: st.Ino}) {
+		return uint32(unix.ESTALE)
 	}
-	return ignoringEINTR(func() error { return unix.Fchmodat(unix.AT_FDCWD, p, mode, 0) })
+	return errnoOfOrZero(ignoringEINTR(func() error { return unix.Ftruncate(fd, size) }))
 }
 
 // owners returns the chown arguments of sa; -1 leaves an ID unchanged.

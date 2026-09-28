@@ -58,6 +58,45 @@ type node struct {
 	watchPaths map[string]struct{}
 }
 
+// id returns the remote identity of remote node n.
+func (n *node) id() proto.NodeID {
+	return proto.NodeID{Dev: n.dev, Ino: n.ino}
+}
+
+// callNode sends req, which acts on n itself.
+//
+// The kernel passes a file handle only for truncation, so fchmod, futimens
+// or fsetxattr on an open descriptor arrive like their path-based
+// counterparts. With byHandle, req therefore names n by one of its open
+// handles when it has one: the handle reaches n's object even after a
+// remote rename replaced it at n's path, or after n was unlinked, as the
+// descriptor does locally. Otherwise req names n by path and remote
+// identity, and the server fails with ESTALE if the path names another
+// object now; a path-based system call then repeats its lookup once.
+func (n *node) callNode(req *proto.FSRequest, byHandle bool) (*proto.FSResponse, syscall.Errno) {
+	if byHandle && n.kind == kindRemote {
+		if h := n.fsys.open.any(n.id()); h != 0 {
+			req.Handle = h
+			resp, errno := n.fsys.call(req)
+			if errno != syscall.EBADF {
+				return resp, errno
+			}
+			// Released in the meantime.
+			req.Handle = 0
+		}
+	}
+	p, errno := n.opPath()
+	if errno != 0 {
+		return nil, errno
+	}
+	req.Path = p
+	if n.kind == kindRemote {
+		id := n.id()
+		req.Node = &id
+	}
+	return n.fsys.call(req)
+}
+
 // Interfaces implemented by node.
 var (
 	_ fs.NodeLookuper       = (*node)(nil)
@@ -129,7 +168,7 @@ func (n *node) dirPath() (string, syscall.Errno) {
 
 // opPath returns the remote path of n for operations on n itself.
 func (n *node) opPath() (string, syscall.Errno) {
-	if n.kind == kindPlaceholderDir || n.kind == kindPlaceholderFile {
+	if n.isPlaceholder() {
 		return "", syscall.EPERM
 	}
 	p, ok := n.remotePath()
@@ -215,23 +254,24 @@ func (n *node) Getattr(_ context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 	}
 	gen := f.invalGen.Load()
 	req := &proto.FSRequest{Op: proto.FSGetattr}
+	var (
+		resp  *proto.FSResponse
+		errno syscall.Errno
+	)
 	if h, ok := fh.(*fileHandle); ok {
 		req.Handle = h.id
+		resp, errno = f.call(req)
 	} else {
-		p, ok := n.remotePath()
-		if !ok {
-			return syscall.ESTALE
-		}
-		req.Path = p
+		// fstat(2) passes no file handle either.
+		resp, errno = n.callNode(req, true)
 	}
-	resp, errno := f.call(req)
 	if errno != 0 {
 		return errno
 	}
 	if req.Handle == 0 && (resp.Attr.Dev != n.dev || resp.Attr.Ino != n.ino) {
-		// The path names another object now. ESTALE makes the VFS
-		// repeat the lookup with revalidation, which replaces the stale
-		// dentry.
+		// The path names another object now (the server checks this
+		// too). ESTALE makes the VFS repeat the lookup with
+		// revalidation, which replaces the stale dentry.
 		return syscall.ESTALE
 	}
 	_, attr := f.ttls(gen, n.shortTTL.Load())
@@ -245,7 +285,7 @@ func (n *node) Getattr(_ context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 // accepted, as a no-op.
 func (n *node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	f := n.fsys
-	if n.kind == kindPlaceholderDir || n.kind == kindPlaceholderFile {
+	if n.isPlaceholder() {
 		return syscall.EPERM
 	}
 	if uid, ok := in.GetUID(); ok && uid != f.cfg.UID {
@@ -254,6 +294,43 @@ func (n *node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	if gid, ok := in.GetGID(); ok && gid != f.cfg.GID {
 		return syscall.EPERM
 	}
+	sa := setAttrOf(in)
+	if sa.Valid == 0 {
+		return n.Getattr(ctx, fh, out)
+	}
+	gen := f.invalGen.Load()
+	req := &proto.FSRequest{Op: proto.FSSetattr, SetAttr: sa}
+	var (
+		resp  *proto.FSResponse
+		errno syscall.Errno
+	)
+	if h, ok := fh.(*fileHandle); ok {
+		req.Handle = h.id
+		resp, errno = f.call(req)
+	} else {
+		// A size change without a file handle is truncate(2) of a path,
+		// which an open handle of the node may not allow (read-only).
+		resp, errno = n.callNode(req, sa.Valid&proto.SetSize == 0)
+	}
+	if errno != 0 {
+		return errno
+	}
+	if n.kind == kindAncestor {
+		// Answer as GETATTR does: the remote object may not be a
+		// directory (synthAttrFrom).
+		out.Attr = f.synthAttrFrom(n, resp.Attr)
+		out.SetTimeout(shortTTL)
+		return 0
+	}
+	_, attr := f.ttls(gen, n.shortTTL.Load())
+	out.Attr = f.fuseAttr(resp.Attr, n.StableAttr().Ino)
+	out.SetTimeout(attr)
+	return 0
+}
+
+// setAttrOf converts the attribute changes of a SETATTR request, except
+// owners, which Setattr handles itself.
+func setAttrOf(in *fuse.SetAttrIn) *proto.SetAttr {
 	sa := &proto.SetAttr{}
 	if m, ok := in.GetMode(); ok {
 		sa.Valid |= proto.SetMode
@@ -279,42 +356,16 @@ func (n *node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		sa.Valid |= proto.SetMtime
 		sa.Mtime = int64(in.Mtime)*1e9 + int64(in.Mtimensec)
 	}
-	if sa.Valid == 0 {
-		return n.Getattr(ctx, fh, out)
-	}
-	gen := f.invalGen.Load()
-	req := &proto.FSRequest{Op: proto.FSSetattr, SetAttr: sa}
-	if h, ok := fh.(*fileHandle); ok {
-		req.Handle = h.id
-	} else {
-		p, errno := n.opPath()
-		if errno != 0 {
-			return errno
-		}
-		req.Path = p
-	}
-	resp, errno := f.call(req)
-	if errno != 0 {
-		return errno
-	}
-	ino := n.StableAttr().Ino
-	_, attr := f.ttls(gen, n.shortTTL.Load() || n.kind != kindRemote)
-	out.Attr = f.fuseAttr(resp.Attr, ino)
-	out.SetTimeout(attr)
-	return 0
+	return sa
 }
 
 // Access implements fs.NodeAccesser: permissions are the target user's on
 // the target host.
 func (n *node) Access(_ context.Context, mask uint32) syscall.Errno {
-	if n.kind == kindPlaceholderDir || n.kind == kindPlaceholderFile {
+	if n.isPlaceholder() {
 		return 0
 	}
-	p, errno := n.opPath()
-	if errno != 0 {
-		return errno
-	}
-	_, errno = n.fsys.call(&proto.FSRequest{Op: proto.FSAccess, Path: p, Mask: mask})
+	_, errno := n.callNode(&proto.FSRequest{Op: proto.FSAccess, Mask: mask}, false)
 	if errno == syscall.ENOENT && n.kind == kindAncestor {
 		// A synthesized ancestor may not exist remotely; it is still
 		// traversable.
@@ -328,11 +379,7 @@ func (n *node) Readlink(_ context.Context) ([]byte, syscall.Errno) {
 	if n.kind != kindRemote {
 		return nil, syscall.EINVAL
 	}
-	p, errno := n.opPath()
-	if errno != 0 {
-		return nil, errno
-	}
-	resp, errno := n.fsys.call(&proto.FSRequest{Op: proto.FSReadlink, Path: p})
+	resp, errno := n.callNode(&proto.FSRequest{Op: proto.FSReadlink}, false)
 	if errno != 0 {
 		return nil, errno
 	}
@@ -360,7 +407,7 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	return &fileHandle{fsys: n.fsys, id: resp.Handle}, 0, 0
+	return n.fsys.newFileHandle(n.id(), resp.Handle), 0, 0
 }
 
 // newEntry checks that name may be created in n and returns the remote
@@ -392,7 +439,8 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out 
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
-	return n.created(ctx, name, resp, gen, out), &fileHandle{fsys: f, id: resp.Handle}, 0, 0
+	fh := f.newFileHandle(proto.NodeID{Dev: resp.Attr.Dev, Ino: resp.Attr.Ino}, resp.Handle)
+	return n.created(ctx, name, resp, gen, out), fh, 0, 0
 }
 
 // mkentry sends a request that creates entry name in n.
@@ -515,6 +563,7 @@ func (n *node) OpendirHandle(_ context.Context, _ uint32) (fs.FileHandle, uint32
 	if errno != 0 {
 		return nil, 0, errno
 	}
+	f.open.add(n.id(), resp.Handle)
 	return &dirHandle{n: n, path: p, id: resp.Handle, last: -1}, 0, 0
 }
 
@@ -542,22 +591,18 @@ func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	return 0
 }
 
-// xattrPath returns the remote path for extended attribute operations;
-// placeholders have none.
-func (n *node) xattrPath() (string, syscall.Errno) {
-	if n.kind == kindPlaceholderDir || n.kind == kindPlaceholderFile {
-		return "", syscall.ENODATA
-	}
-	return n.opPath()
+// isPlaceholder reports whether n is a placeholder, which has no remote
+// object behind it (and so no extended attributes).
+func (n *node) isPlaceholder() bool {
+	return n.kind == kindPlaceholderDir || n.kind == kindPlaceholderFile
 }
 
 // Getxattr implements fs.NodeGetxattrer.
 func (n *node) Getxattr(_ context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
-	p, errno := n.xattrPath()
-	if errno != 0 {
-		return 0, errno
+	if n.isPlaceholder() {
+		return 0, syscall.ENODATA
 	}
-	resp, errno := n.fsys.call(&proto.FSRequest{Op: proto.FSGetxattr, Path: p, Name2: attr, Size: uint32(len(dest))})
+	resp, errno := n.callNode(&proto.FSRequest{Op: proto.FSGetxattr, Name2: attr, Size: uint32(len(dest))}, true)
 	if errno != 0 {
 		return 0, errno
 	}
@@ -569,14 +614,10 @@ func (n *node) Getxattr(_ context.Context, attr string, dest []byte) (uint32, sy
 
 // Listxattr implements fs.NodeListxattrer.
 func (n *node) Listxattr(_ context.Context, dest []byte) (uint32, syscall.Errno) {
-	p, errno := n.xattrPath()
-	if errno == syscall.ENODATA {
+	if n.isPlaceholder() {
 		return 0, 0
 	}
-	if errno != 0 {
-		return 0, errno
-	}
-	resp, errno := n.fsys.call(&proto.FSRequest{Op: proto.FSListxattr, Path: p, Size: uint32(len(dest))})
+	resp, errno := n.callNode(&proto.FSRequest{Op: proto.FSListxattr, Size: uint32(len(dest))}, true)
 	if errno != 0 {
 		return 0, errno
 	}
@@ -588,24 +629,19 @@ func (n *node) Listxattr(_ context.Context, dest []byte) (uint32, syscall.Errno)
 
 // Setxattr implements fs.NodeSetxattrer.
 func (n *node) Setxattr(_ context.Context, attr string, data []byte, flags uint32) syscall.Errno {
-	p, errno := n.xattrPath()
-	if errno == syscall.ENODATA {
+	if n.isPlaceholder() {
 		return syscall.EPERM
 	}
-	if errno != 0 {
-		return errno
-	}
-	_, errno = n.fsys.call(&proto.FSRequest{Op: proto.FSSetxattr, Path: p, Name2: attr, Data: data, Flags: flags})
+	_, errno := n.callNode(&proto.FSRequest{Op: proto.FSSetxattr, Name2: attr, Data: data, Flags: flags}, true)
 	return errno
 }
 
 // Removexattr implements fs.NodeRemovexattrer.
 func (n *node) Removexattr(_ context.Context, attr string) syscall.Errno {
-	p, errno := n.xattrPath()
-	if errno != 0 {
-		return errno
+	if n.isPlaceholder() {
+		return syscall.ENODATA
 	}
-	_, errno = n.fsys.call(&proto.FSRequest{Op: proto.FSRemovexattr, Path: p, Name2: attr})
+	_, errno := n.callNode(&proto.FSRequest{Op: proto.FSRemovexattr, Name2: attr}, true)
 	return errno
 }
 

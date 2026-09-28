@@ -44,31 +44,34 @@ func newSvc(t testing.TB) (*Service, string) {
 // stream whose header was read.
 func call(t testing.TB, s *Service, req *proto.FSRequest) *proto.FSResponse {
 	t.Helper()
+	resp, err := serve(s, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// serve is call for goroutines other than the test's.
+func serve(s *Service, req *proto.FSRequest) (*proto.FSResponse, error) {
 	a, b := net.Pipe()
 	done := make(chan error, 1)
 	go func() { done <- s.ServeRequest(context.Background(), b) }()
 	defer func() { _ = a.Close() }()
 	if err := proto.WriteFrame(a, req); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	if req.Op == proto.FSForget {
 		// No response: the server closes the stream when done.
 		if _, err := io.Copy(io.Discard, a); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-		return nil
+		return nil, <-done
 	}
 	var resp proto.FSResponse
 	if err := proto.ReadFrame(a, &resp, proto.MaxDataFrame); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	return &resp
+	return &resp, <-done
 }
 
 // ok runs req and fails the test unless it succeeds.
@@ -362,6 +365,181 @@ func TestCreateModeIgnoresServerUmask(t *testing.T) {
 	if st, _ := os.Lstat(filepath.Join(root, "f")); st.Mode().Perm() != 0o600 {
 		t.Errorf("existing file mode changed to %o", st.Mode().Perm())
 	}
+}
+
+// TestMkdirKeepsSetgid checks that restoring the mode of a new directory
+// keeps the S_ISGID it inherits from a setgid parent, as a native mkdir
+// does.
+func TestMkdirKeepsSetgid(t *testing.T) {
+	old := unix.Umask(0o022)
+	defer unix.Umask(old)
+	s, root := newSvc(t)
+	shared := filepath.Join(root, "shared")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Chmod(shared, 0o2775); err != nil {
+		t.Fatal(err)
+	}
+	// The client's umask 002 lets group write through; the server's 022
+	// would not.
+	a := ok(t, s, &proto.FSRequest{Op: proto.FSMkdir, Path: "/shared", Name: "d", Mode: 0o775}).Attr
+	if a.Mode&0o7777 != 0o2775 {
+		t.Fatalf("mkdir in a setgid directory: mode %o, want 2775", a.Mode&0o7777)
+	}
+	if st := lstatT(t, filepath.Join(shared, "d")); st.Mode&0o7777 != 0o2775 {
+		t.Fatalf("backing mode %o", st.Mode&0o7777)
+	}
+}
+
+func lstatT(t *testing.T, p string) *unix.Stat_t {
+	t.Helper()
+	var st unix.Stat_t
+	if err := unix.Lstat(p, &st); err != nil {
+		t.Fatal(err)
+	}
+	return &st
+}
+
+// nodeID returns the identity of real path p.
+func nodeID(t *testing.T, p string) *proto.NodeID {
+	t.Helper()
+	st := lstatT(t, p)
+	return &proto.NodeID{Dev: st.Dev, Ino: st.Ino}
+}
+
+// TestNodeIdentity checks that a request carrying the identity of the
+// object the client means fails with ESTALE, and changes nothing, once the
+// path names another object; and that requests on an open handle still
+// reach the replaced object.
+func TestNodeIdentity(t *testing.T) {
+	s, root := newSvc(t)
+	p := func(rel string) string { return filepath.Join(root, rel) }
+	if err := os.WriteFile(p("f"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(p("f"), "user.probe", []byte("1"), 0); errors.Is(err, unix.ENOTSUP) {
+		t.Skip("no user xattrs on the test file system")
+	}
+	if err := os.Symlink("a", p("l")); err != nil {
+		t.Fatal(err)
+	}
+	oldF, oldL := nodeID(t, p("f")), nodeID(t, p("l"))
+	h := ok(t, s, &proto.FSRequest{Op: proto.FSOpen, Path: "/f", Flags: unix.O_RDONLY}).Handle
+	// Replace both by rename.
+	if err := os.WriteFile(p("f.tmp"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(p("f"), p("f.old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(p("f.tmp"), p("f")); err != nil {
+		t.Fatal(err)
+	}
+	// The new symlink exists before the old one is freed, so that it
+	// cannot reuse its inode number.
+	if err := os.Symlink("b", p("l.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(p("l.tmp"), p("l")); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := []proto.FSRequest{
+		{Op: proto.FSGetattr, Path: "/f", Node: oldF},
+		{Op: proto.FSSetattr, Path: "/f", Node: oldF, SetAttr: &proto.SetAttr{Valid: proto.SetMode | proto.SetMtime, Mode: 0o600, Mtime: 1}},
+		{Op: proto.FSSetattr, Path: "/f", Node: oldF, SetAttr: &proto.SetAttr{Valid: proto.SetSize}},
+		{Op: proto.FSAccess, Path: "/f", Node: oldF, Mask: unix.R_OK},
+		{Op: proto.FSSetxattr, Path: "/f", Node: oldF, Name2: "user.k", Data: []byte("v")},
+		{Op: proto.FSGetxattr, Path: "/f", Node: oldF, Name2: "user.probe"},
+		{Op: proto.FSListxattr, Path: "/f", Node: oldF},
+		{Op: proto.FSRemovexattr, Path: "/f", Node: oldF, Name2: "user.probe"},
+		{Op: proto.FSReadlink, Path: "/l", Node: oldL},
+	}
+	for i := range stale {
+		if resp := call(t, s, &stale[i]); resp.Errno != uint32(unix.ESTALE) {
+			t.Errorf("op %d on a replaced node: errno %v, want ESTALE", stale[i].Op, unix.Errno(resp.Errno))
+		}
+	}
+	st := lstatT(t, p("f"))
+	if st.Mode&0o7777 != 0o644 || st.Size != 3 || st.Mtim.Nano() == 1 {
+		t.Fatalf("stale requests changed the new file: mode %o size %d", st.Mode&0o7777, st.Size)
+	}
+	if _, err := unix.Getxattr(p("f"), "user.k", nil); !errors.Is(err, unix.ENODATA) {
+		t.Fatalf("stale setxattr reached the new file: %v", err)
+	}
+
+	// The current identity works.
+	cur := nodeID(t, p("f"))
+	ok(t, s, &proto.FSRequest{Op: proto.FSSetattr, Path: "/f", Node: cur, SetAttr: &proto.SetAttr{Valid: proto.SetMode, Mode: 0o640}})
+	if rl := ok(t, s, &proto.FSRequest{Op: proto.FSReadlink, Path: "/l", Node: nodeID(t, p("l"))}); rl.Target != "b" {
+		t.Fatalf("readlink %q", rl.Target)
+	}
+
+	// A handle reaches the replaced file.
+	ok(t, s, &proto.FSRequest{Op: proto.FSSetattr, Handle: h, SetAttr: &proto.SetAttr{Valid: proto.SetMode, Mode: 0o600}})
+	ok(t, s, &proto.FSRequest{Op: proto.FSSetxattr, Handle: h, Name2: "user.k", Data: []byte("v")})
+	if r := ok(t, s, &proto.FSRequest{Op: proto.FSGetxattr, Handle: h, Name2: "user.k", Size: 16}); string(r.Data) != "v" {
+		t.Fatalf("getxattr by handle %q", r.Data)
+	}
+	if r := ok(t, s, &proto.FSRequest{Op: proto.FSListxattr, Handle: h, Size: 256}); !slices.Contains(strings.Split(string(r.Data), "\x00"), "user.k") {
+		t.Fatalf("listxattr by handle %q", r.Data)
+	}
+	ok(t, s, &proto.FSRequest{Op: proto.FSRemovexattr, Handle: h, Name2: "user.probe"})
+	if st := lstatT(t, p("f.old")); st.Mode&0o7777 != 0o600 {
+		t.Fatalf("replaced file mode %o", st.Mode&0o7777)
+	}
+	ok(t, s, &proto.FSRequest{Op: proto.FSRelease, Handle: h})
+}
+
+// TestAccessIsKernelAccurate checks FSAccess against answers that only the
+// kernel knows: a check emulated from the mode bits would get them wrong.
+func TestAccessIsKernelAccurate(t *testing.T) {
+	s, root := newSvc(t)
+	f := filepath.Join(root, "immutable")
+	if err := os.WriteFile(f, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("immutable", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink itself is accessible whatever its target.
+	ok(t, s, &proto.FSRequest{Op: proto.FSAccess, Path: "/link", Mask: unix.R_OK | unix.W_OK | unix.X_OK})
+	wantErrno(t, call(t, s, &proto.FSRequest{Op: proto.FSAccess, Path: "/immutable", Mask: unix.X_OK}), unix.EACCES)
+
+	if !setImmutable(t, f, true) {
+		t.Skip("cannot make files immutable here (chattr +i)")
+	}
+	defer setImmutable(t, f, false)
+	var want syscall.Errno
+	if !errors.As(unix.Access(f, unix.W_OK), &want) {
+		t.Fatal("access(W_OK) of an immutable file succeeds natively")
+	}
+	wantErrno(t, call(t, s, &proto.FSRequest{Op: proto.FSAccess, Path: "/immutable", Mask: unix.W_OK}), want)
+}
+
+// fsImmutableFL is FS_IMMUTABLE_FL of linux/fs.h, which x/sys lacks.
+const fsImmutableFL = 0x10
+
+// setImmutable sets or clears FS_IMMUTABLE_FL on p (chattr +i), reporting
+// whether the file system and the caller's privileges allow it.
+func setImmutable(t *testing.T, p string, on bool) bool {
+	t.Helper()
+	fd, err := unix.Open(p, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	flags, err := unix.IoctlGetUint32(fd, unix.FS_IOC_GETFLAGS)
+	if err != nil {
+		return false
+	}
+	if on {
+		flags |= fsImmutableFL
+	} else {
+		flags &^= fsImmutableFL
+	}
+	return unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, int(flags)) == nil
 }
 
 func TestReaddirPaging(t *testing.T) {

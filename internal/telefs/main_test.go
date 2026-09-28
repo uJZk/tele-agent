@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -67,17 +68,70 @@ func runInPrivateMountNS() (int, bool) {
 	}
 }
 
-// switchOpener is an Opener whose transport can be broken on demand.
+// switchOpener is an Opener whose transport can be broken on demand, and
+// whose FS requests a test can intercept.
 type switchOpener struct {
 	s      *mux.Session
 	broken atomic.Bool
+	hook   atomic.Pointer[fsHook]
+	wg     sync.WaitGroup // proxies
 }
+
+// fsHook sees an FS request and returns the response to deliver (nil for
+// none, as for FSForget). forward sends req to the server and returns its
+// response (nil for FSForget, once the server finished it).
+type fsHook func(req *proto.FSRequest, forward func() *proto.FSResponse) *proto.FSResponse
 
 func (o *switchOpener) Open(kind proto.StreamKind) (net.Conn, error) {
 	if o.broken.Load() {
 		return nil, errors.New("transport broken by test")
 	}
-	return o.s.Open(kind)
+	hook := o.hook.Load()
+	if kind != proto.StreamFS || hook == nil {
+		return o.s.Open(kind)
+	}
+	a, b := net.Pipe()
+	o.wg.Add(1)
+	go o.proxy(b, *hook)
+	return a, nil
+}
+
+// setHook intercepts FS requests from now on.
+func (o *switchOpener) setHook(h fsHook) {
+	o.hook.Store(&h)
+}
+
+// proxy serves one intercepted FS stream.
+func (o *switchOpener) proxy(c net.Conn, hook fsHook) {
+	defer o.wg.Done()
+	defer func() { _ = c.Close() }()
+	var req proto.FSRequest
+	if err := proto.ReadFrame(c, &req, proto.MaxDataFrame); err != nil {
+		return
+	}
+	forward := func() *proto.FSResponse {
+		eio := &proto.FSResponse{Errno: uint32(syscall.EIO)}
+		st, err := o.s.Open(proto.StreamFS)
+		if err != nil {
+			return eio
+		}
+		defer func() { _ = st.Close() }()
+		if err := proto.WriteFrame(st, &req); err != nil {
+			return eio
+		}
+		if req.Op == proto.FSForget {
+			_, _ = io.Copy(io.Discard, st)
+			return nil
+		}
+		var resp proto.FSResponse
+		if err := proto.ReadFrame(st, &resp, proto.MaxDataFrame); err != nil {
+			return eio
+		}
+		return &resp
+	}
+	if resp := hook(&req, forward); resp != nil {
+		_ = proto.WriteFrame(c, resp)
+	}
 }
 
 type harnessOpts struct {
@@ -275,6 +329,7 @@ func (h *harness) shutdownServer() {
 	_ = h.cli.Close()
 	_ = h.srv.Close()
 	h.wg.Wait()
+	h.opener.wg.Wait()
 	if err := h.svc.Close(); err != nil {
 		h.t.Error(err)
 	}

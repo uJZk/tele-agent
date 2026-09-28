@@ -16,6 +16,9 @@ type handle struct {
 	// path is the remote-view path the directory was opened under; the
 	// server keeps watching it while the client lists it.
 	path string
+	// dev is the device of the directory, for entries that cannot be
+	// examined (Service.direntAttr).
+	dev uint64
 
 	refs   int  // guarded by handleTable.mu
 	closed bool // guarded by handleTable.mu

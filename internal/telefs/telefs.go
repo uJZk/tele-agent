@@ -23,7 +23,7 @@
 //     the initial user namespace.
 //
 // Transport failures are reported to the kernel as EIO; remote failures as
-// the remote errno, unchanged.
+// the remote errno, unchanged unless the kernel cannot take it (kernelErrno).
 package telefs
 
 import (
@@ -110,7 +110,8 @@ type FS struct {
 	applied      uint64
 	appliedWake  chan struct{} // closed and replaced when the state changes
 
-	reg registry
+	reg  registry
+	open openHandles
 
 	done chan struct{} // closed by Unmount; stops the forget workers
 	wg   sync.WaitGroup
@@ -239,13 +240,43 @@ func (f *FS) call(req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
 		return nil, syscall.EIO
 	}
 	if resp.Errno != 0 {
-		return &resp, syscall.Errno(resp.Errno)
+		errno := kernelErrno(resp.Errno)
+		if errno != syscall.Errno(resp.Errno) {
+			f.log.Warn("telefs: remote errno not representable", "op", req.Op, "errno", resp.Errno, "as", errno)
+		}
+		return &resp, errno
 	}
 	if !validResponse(req, &resp) {
 		f.log.Warn("telefs: invalid fs response", "op", req.Op)
 		return nil, syscall.EIO
 	}
 	return &resp, 0
+}
+
+// maxErrno is the largest errno the kernel accepts in a FUSE reply: it
+// rejects a reply whose error is -ERESTARTSYS (-512) or lower with EINVAL,
+// and go-fuse ignores that failure, so the request is never answered and
+// the caller hangs in an uninterruptible wait that not even SIGKILL or the
+// exit of the FUSE server ends (fuse_dev_do_write, request_wait_answer).
+const maxErrno = 511
+
+// enotsupp is the kernel-internal ENOTSUPP, which NFS leaks to user space
+// from xattr and ACL operations; user space spells it EOPNOTSUPP.
+const enotsupp = 524
+
+// kernelErrno returns the errno to hand to the kernel for remote errno e.
+// Errnos the kernel cannot take in a reply are kernel-internal codes that
+// leaked out of a remote file system (or invalid): the local kernel cannot
+// represent them anyway, so the closest meaning is used, or EIO.
+func kernelErrno(e uint32) syscall.Errno {
+	switch {
+	case e >= 1 && e <= maxErrno:
+		return syscall.Errno(e)
+	case e == enotsupp:
+		return syscall.EOPNOTSUPP
+	default:
+		return syscall.EIO
+	}
 }
 
 // validResponse checks what the server returned for req before the kernel

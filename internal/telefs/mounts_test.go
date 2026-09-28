@@ -200,6 +200,48 @@ func TestPlaceholderMountsSurvive(t *testing.T) {
 	check("new epoch")
 }
 
+// TestAncestorSetattr checks that changing the attributes of a synthetic
+// ancestor answers with the ancestor's own attributes, as its GETATTR
+// does, even when the remote object is no directory (the ancestor became a
+// symlink after the mount, as /bin does on a usrmerge upgrade), and that
+// the mounts below it stay.
+func TestAncestorSetattr(t *testing.T) {
+	h := newHarness(t, harnessOpts{
+		placeholders: []Placeholder{{Path: "/p/q", Dir: true}},
+		prepare:      func(backing string) { mkdirAll(t, backing+"/p") },
+	})
+	src := t.TempDir()
+	writeFile(t, src+"/marker", "local")
+	bindMount(t, src, h.m("p/q"))
+	if err := os.Rename(h.b("p"), h.b("real")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", h.b("p")); err != nil {
+		t.Fatal(err)
+	}
+	h.sync()
+
+	ts := []unix.Timespec{unix.NsecToTimespec(1e18), unix.NsecToTimespec(1e18)}
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, h.m("p"), ts, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatalf("utimensat: %v", err)
+	}
+	if got := lstat(t, h.b("p")).Mtim.Nano(); got != 1e18 {
+		t.Fatalf("remote symlink mtime %d", got)
+	}
+	// The reply is cached: this stat shows what SETATTR answered.
+	if st := lstat(t, h.m("p")); st.Mode != unix.S_IFDIR|0o755 || st.Size != 0 {
+		t.Fatalf("ancestor after setattr: mode %o size %d, want a synthesized directory", st.Mode, st.Size)
+	}
+	for range 3 {
+		if got := readFile(t, h.m("p/q/marker")); got != "local" {
+			t.Fatalf("marker = %q", got)
+		}
+	}
+	if !mounted(t, h.m("p/q")) {
+		t.Fatal("mount below the ancestor detached")
+	}
+}
+
 // TestPlaceholderRevalidationWithoutServer checks that the kernel's
 // revalidation of placeholder paths never fails, even when the server is
 // unreachable: a failed LOOKUP invalidates the dentry and detaches the

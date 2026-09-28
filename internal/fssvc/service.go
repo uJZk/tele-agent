@@ -68,14 +68,10 @@ type Service struct {
 	inotify *os.File
 	rawIn   syscall.RawConn
 
-	// readMu serializes every operation on the inotify descriptor that
-	// must be ordered with event processing: draining and processing
-	// events, adding and removing watches. Holding it while adding a watch
-	// guarantees that no event of the new watch is processed before the
-	// watch is recorded, and holding it across a drain lets Sync publish
-	// every event read before it returns (docs/exec.md section 6). It is
-	// held across inotify_add_watch, which resolves a path and may touch
-	// the disk: the ordering guarantee needs the call inside the lock.
+	// readMu serializes reading the inotify descriptor: holding it across
+	// a drain lets Sync publish every event queued before it returns
+	// (docs/exec.md section 6). Nothing that resolves a path runs under
+	// it: see watch.
 	readMu sync.Mutex
 	evBuf  []byte // guarded by readMu
 

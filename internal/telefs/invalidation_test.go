@@ -3,9 +3,11 @@ package telefs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -117,6 +119,25 @@ func TestInvalidation(t *testing.T) {
 		}
 		if len(ents2) != len(ents)+1 {
 			t.Fatalf("listing has %d entries, want %d", len(ents2), len(ents)+1)
+		}
+
+		// The directory's own attributes follow its entries, including
+		// names the client never looked up.
+		mkdirAll(t, h.b("ed"))
+		h.sync()
+		if exists(h.m("ed/x")) {
+			t.Fatal("ed/x exists")
+		}
+		if st := lstat(t, h.m("ed")); st.Nlink != 2 {
+			t.Fatalf("ed nlink %d", st.Nlink)
+		}
+		mkdirAll(t, h.b("ed/newsub"))
+		writeFile(t, h.b("ed/newfile"), "")
+		h.sync()
+		got, want := lstat(t, h.m("ed")), lstat(t, h.b("ed"))
+		if got.Nlink != want.Nlink || got.Mtim != want.Mtim || got.Ctim != want.Ctim {
+			t.Fatalf("ed after remote entry changes: nlink %d mtime %v ctime %v, want %d %v %v",
+				got.Nlink, got.Mtim, got.Ctim, want.Nlink, want.Mtim, want.Ctim)
 		}
 	})
 
@@ -293,6 +314,149 @@ func TestForgetRemovesWatch(t *testing.T) {
 	if after := h.svc.Sync(); after == before {
 		t.Fatal("no event after the directory was looked up again")
 	}
+}
+
+// forgetGate holds every FSForget until it is freed.
+type forgetGate struct {
+	entered chan string // receives the path of each held forget
+	release chan struct{}
+	once    sync.Once
+
+	mu   sync.Mutex
+	sent []string // guarded by mu
+}
+
+func newForgetGate() *forgetGate {
+	return &forgetGate{entered: make(chan string, 64), release: make(chan struct{})}
+}
+
+func (g *forgetGate) hook(req *proto.FSRequest, forward func() *proto.FSResponse) *proto.FSResponse {
+	if req.Op == proto.FSForget {
+		g.mu.Lock()
+		g.sent = append(g.sent, req.Path)
+		g.mu.Unlock()
+		g.entered <- req.Path
+		<-g.release
+	}
+	return forward()
+}
+
+func (g *forgetGate) free() {
+	g.once.Do(func() { close(g.release) })
+}
+
+func (g *forgetGate) wasSent(p string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return slices.Contains(g.sent, p)
+}
+
+// held waits until n forgets are held and returns their paths.
+func (g *forgetGate) held(t *testing.T, n int) []string {
+	t.Helper()
+	var out []string
+	for range n {
+		select {
+		case p := <-g.entered:
+			out = append(out, p)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d of %d forgets were sent", len(out), n)
+		}
+	}
+	return out
+}
+
+// TestForgetOrdering checks the order between the forget of a directory
+// and a later request that makes the server watch it again: a forget still
+// queued is cancelled, so the request neither waits for it nor loses its
+// watch to it; a forget already sent is waited for, so that it cannot drop
+// the watch the request re-establishes.
+func TestForgetOrdering(t *testing.T) {
+	h := newHarness(t, harnessOpts{})
+	var busy []string
+	for i := range forgetWorkers {
+		busy = append(busy, fmt.Sprintf("busy%d", i))
+	}
+	for _, d := range append([]string{"q", "e"}, busy...) {
+		mkdirAll(t, h.b(d))
+	}
+	h.sync()
+	for _, d := range append([]string{"q", "e"}, busy...) {
+		if exists(h.m(d + "/x")) {
+			t.Fatalf("%s/x exists", d)
+		}
+	}
+	// forget makes the kernel forget directory name of the root.
+	forget := func(t *testing.T, name string) {
+		t.Helper()
+		if errno := h.node("").NotifyEntry(name); errno != 0 {
+			t.Fatal(errno)
+		}
+	}
+	inRegistry := func(fn func(r *registry) bool) func() bool {
+		return func() bool {
+			h.fs.reg.mu.Lock()
+			defer h.fs.reg.mu.Unlock()
+			return fn(&h.fs.reg)
+		}
+	}
+
+	t.Run("queued", func(t *testing.T) {
+		g := newForgetGate()
+		h.opener.setHook(g.hook)
+		t.Cleanup(g.free)
+		for _, d := range busy {
+			forget(t, d)
+		}
+		g.held(t, len(busy))
+		forget(t, "q")
+		eventually(t, "the forget of /q to be queued", inRegistry(func(r *registry) bool { return slices.Contains(r.queue, "/q") }))
+		// Needing /q again must not wait for the queued forget.
+		h.returnsInTime(t, func() {
+			if exists(h.m("q/y")) {
+				t.Error("q/y exists")
+			}
+		})
+		g.free()
+		eventually(t, "the forgets to finish", inRegistry(func(r *registry) bool { return len(r.forgetting) == 0 }))
+		if g.wasSent("/q") {
+			t.Fatal("the forget of /q was sent after /q was needed again")
+		}
+		// The server still watches /q: the cached negative entry goes.
+		writeFile(t, h.b("q/y"), "")
+		h.sync()
+		if !exists(h.m("q/y")) {
+			t.Fatal("q/y not visible: /q is no longer watched")
+		}
+	})
+
+	t.Run("in flight", func(t *testing.T) {
+		g := newForgetGate()
+		h.opener.setHook(g.hook)
+		t.Cleanup(g.free)
+		forget(t, "e")
+		if got := g.held(t, 1); got[0] != "/e" {
+			t.Fatalf("held forget of %s", got[0])
+		}
+		// The lookup names /e while its forget is on the way to the
+		// server; it may complete only after the forget did.
+		looked := make(chan bool, 1)
+		go func() { looked <- exists(h.m("e/y")) }()
+		g.free()
+		select {
+		case found := <-looked:
+			if found {
+				t.Fatal("e/y exists")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("lookup blocked")
+		}
+		writeFile(t, h.b("e/y"), "")
+		h.sync()
+		if !exists(h.m("e/y")) {
+			t.Fatal("e/y not visible: the forget dropped the watch of the later lookup")
+		}
+	})
 }
 
 // TestNegativeEntries checks that a failed lookup is cached and invalidated
