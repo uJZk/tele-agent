@@ -16,10 +16,10 @@
 | stdio MCP 远程执行 | ✅ 高 | `CLAUDE_CODE_SHELL_PREFIX`（已核实会包裹 stdio MCP） | 无 |
 | HTTP/SSE MCP | ⚠️ 中 | 改写 localhost URL 或经隧道端口转发 | 需要改写配置 |
 | Read/Write/Edit/Glob/Grep | ✅ 高 | NFS 同路径挂载；`USE_BUILTIN_RIPGREP=0` + 远程 `rg` shim | NFS 属性缓存导致读到旧数据 |
-| 本地 MCP `tele`（列出/切换主机、安装说明） | ✅ 高 | Go 写的 stdio MCP server，由启动器注入 | 热切换的边界情况 |
+| 本地 MCP `tele-agent`（列出/切换主机、安装说明） | ✅ 高 | Go 写的 stdio MCP server，由启动器注入 | 热切换的边界情况 |
 | WireGuard | ✅ 高 | 内核 WG + `wgctrl`（没有内核模块时退回 wireguard-go） | 需要 root |
 | swgp-go（可关） | ✅ 高 | **以子进程方式**运行（AGPL-3.0 许可证） | 许可证；`-2026` 模式需要时钟同步 |
-| Phantun（可关，自愈） | ✅ 中高 | 第一阶段托管上游二进制并加 supervisor，第二阶段可选 Go 原生重写 | 需要 root 和 iptables/nft；运维面较复杂 |
+| Phantun（可关，自愈） | ✅ 中高 | 可插拔 fake-TCP：托管上游 Phantun，或 Go 原生 raw-socket 模式（tcpraw 式，仅需 CAP_NET_RAW，无需 TUN/NAT） | 完全无特权不可行；上游模式需要 TUN + nft |
 | NFS 文件层 | ✅ 高 | 内核 nfsd + NFSv4.2，只导出给 WG 对端 IP | 性能、缓存一致性、uid 映射 |
 | Go 语言、仅 Linux | ✅ 高 | 整个生态都有成熟 Go 库 | — |
 
@@ -46,7 +46,7 @@
 ```
 ┌──────────────────────── 本地 (Linux) ─────────────────────────┐        ┌──────────────── 远端 (Linux) ────────────────┐
 │                                                               │        │                                               │
-│  tele claude ──► [userns+mountns]                             │        │  tele-agent (root, systemd)                   │
+│  tele claude ──► [userns+mountns]                             │        │  tele-server (root, systemd)                  │
 │                   │  /home/u/proj  ◄── bind ── NFS mount ◄────┼── NFS ─┼── nfsd  export /home/u/proj → 10.77.0.1 only  │
 │                   │  $CLAUDE_CODE_TMPDIR (共享 scratch)        │        │         export /var/lib/tele/s/<sid>          │
 │                   ▼                                           │        │                                               │
@@ -67,10 +67,10 @@
 
 | 二进制 | 运行位置 | 权限 | 作用 |
 |---|---|---|---|
-| `tele` | 本地 | 普通用户 | CLI：`tele claude`、`tele host add/ls/rm`、`tele status`；也作为 `tele mcp` 充当 MCP server |
+| `tele` | 本地 | 普通用户 | CLI：`tele claude`、`tele host add/ls/rm`、`tele status`；`tele mcp` 子命令即名为 `tele-agent` 的 MCP server |
 | `teled` | 本地 | root（systemd） | 管理 WG 接口、swgp/phantun 子进程、NFS 挂载、健康检查与自愈；通过 unix socket 接受 `tele` 的请求（用 SO_PEERCRED 鉴权） |
 | `tele-sh` / `tele-exec` / `rg` shim | 本地 | 普通用户 | 注入给 Claude Code 的执行垫片，把请求交给 `teled` 复用的多路连接 |
-| `tele-agent` | 远端 | root（systemd） | WG 服务端、swgp/phantun 服务端的托管、NFS 导出管理、exec 服务、安装与配对 |
+| `tele-server` | 远端 | root（systemd） | WG 服务端、swgp/phantun 服务端的托管、NFS 导出管理、exec 服务、安装与配对 |
 
 ---
 
@@ -127,7 +127,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 - `CLAUDE_CODE_TMPDIR`：可以重定向 Claude 的每 uid 临时目录（cwd 文件、后台任务输出等都在这里）。
 - `~/.claude/shell-snapshots/`：shell 快照；`~/.claude/session-env/`：`CLAUDE_ENV_FILE`，SessionStart hook 用它持久化环境变量。
 
-**方案**：`tele-agent` 为每个会话在远端创建 `/var/lib/tele/s/<sid>/{tmp,shell-snapshots,session-env}` 并通过 NFS 导出；本地在会话的挂载命名空间里把它们**绑定到同一路径**，并把 `~/.claude/shell-snapshots`、`~/.claude/session-env` bind 到对应子目录。远端执行时，exec 服务也在一个挂载命名空间里做镜像绑定，让 `$HOME/.claude/shell-snapshots` 这个本地路径在远端也能解析到。最简单的做法是让 exec 服务把**本地的 home 路径**映射成同一个 scratch 目录。
+**方案**：`tele-server` 为每个会话在远端创建 `/var/lib/tele/s/<sid>/{tmp,shell-snapshots,session-env}` 并通过 NFS 导出；本地在会话的挂载命名空间里把它们**绑定到同一路径**，并把 `~/.claude/shell-snapshots`、`~/.claude/session-env` bind 到对应子目录。远端执行时，exec 服务也在一个挂载命名空间里做镜像绑定，让 `$HOME/.claude/shell-snapshots` 这个本地路径在远端也能解析到。最简单的做法是让 exec 服务把**本地的 home 路径**映射成同一个 scratch 目录。
 
 快照由 shim 在**远端**生成（因为 `CLAUDE_CODE_SHELL` 也用于生成快照），里面记录的是**远端**的 PATH、别名和函数。这正是我们想要的。
 
@@ -140,7 +140,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 | WebFetch / WebSearch | 在本地或 Anthropic 侧执行，与主机无关（出网 IP 是本地的，需要写进文档） |
 | 超时与中断：先 SIGTERM，再 SIGKILL（tree-kill） | shim 转发可捕获的信号；**SIGKILL 无法捕获** → 远端以「连接断开 = 杀进程组」兜底（租约 + 心跳） |
 | 后台 Bash（run_in_background） | 同上，输出文件位于共享的 `CLAUDE_CODE_TMPDIR` |
-| 系统提示中的 OS 版本、平台 | 显示的是本地信息；由 `tele` MCP 的 instructions 注入「当前主机」的真实信息 |
+| 系统提示中的 OS 版本、平台 | 显示的是本地信息；由 `tele-agent` MCP 的 instructions 注入「当前主机」的真实信息 |
 | 会话存储 `~/.claude/projects/<cwd 编码>` | 路径同一性 → 与在远端直接运行时的项目键一致；切换主机后 `--resume` 仍然可用 |
 
 ---
@@ -154,7 +154,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 1. `teled`（root）在初始命名空间里把远端导出挂载到 `/run/tele/mnt/<host>/<export-id>`。NFS **不能**在非特权用户命名空间里挂载（没有 `FS_USERNS_MOUNT`），所以这一步必须由特权方完成。
 2. `tele claude`（普通用户）执行 `unshare(CLONE_NEWUSER|CLONE_NEWNS)`，把 uid/gid 映射为**自身**（`--map-current-user` 语义），因此 Claude 看到的仍是自己的 uid。在新 userns 中它拥有 CAP_SYS_ADMIN，可以把 `/run/tele/mnt/...` **bind** 到目标路径。bind 已有挂载在 userns 中是允许的。
 3. 目标路径在本地不存在、而且父目录不可写时（比如 `/srv/app`），在父目录挂一层 tmpfs 并重建目录骨架，再 bind。这种做法要在文档里写明，因为它会遮住本地同名目录。
-4. 完成后 exec `claude`，同时设好环境变量、`--mcp-config`（注入 `tele` MCP）等。
+4. 完成后 exec `claude`，同时设好环境变量、`--mcp-config`（注入 `tele-agent` MCP）等。
 
 **兼容性注意**：
 
@@ -169,7 +169,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 **选型**：远端用内核 nfsd，NFSv4.2（单端口 2049，便于在 WG 上跑；支持服务端 copy 和 sparse）；本地用内核 NFS 客户端。不推荐用户态的 go-nfs：它只支持 v3，性能和一致性也不如内核实现。
 
-**导出**：`tele-agent` 在 `/etc/exports.d/tele.exports` 中管理条目，并调用 `exportfs -ra`：
+**导出**：`tele-server` 在 `/etc/exports.d/tele.exports` 中管理条目，并调用 `exportfs -ra`：
 
 ```
 /home/alice/proj        10.77.0.1/32(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000,sec=sys)
@@ -209,9 +209,9 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 ### 6.3 swgp-go（可关）
 
 - v1.10.0，纯 Go，`service.Config` / `Manager` 是**导出的 API**，技术上可以直接嵌入。
-- ⚠️ **许可证是 AGPL-3.0**，而本仓库是 MIT。**不要**把它编译进 tele 的二进制。应当作为**独立子进程**分发和托管（聚合分发，不构成衍生作品），由 teled / tele-agent 生成 JSON 配置并监管进程。另一种选择是在安装时从上游 release 下载，并固定 sha256 校验。
+- ⚠️ **许可证是 AGPL-3.0**，而本仓库是 MIT。**不要**把它编译进 tele 的二进制。应当作为**独立子进程**分发和托管（聚合分发，不构成衍生作品），由 teled / tele-server 生成 JSON 配置并监管进程。另一种选择是在安装时从上游 release 下载，并固定 sha256 校验。
 - ⚠️ 上游要求 **go ≥ 1.26**（本环境是 1.24.7）。这只影响我们自己构建它的情况。
-- 模式：默认用 `zero-overhead-2026`，数据包零开销、**不影响 MTU**；可选 `paranoid-2026`（全包 AEAD 并填充到 MTU，会略微降低 MTU、增加带宽）。**`-2026` 模式带重放保护，要求两端时钟同步**，所以 tele-agent 安装时要检查 NTP，teled 健康检查要报告时钟偏差；时钟不可控时回退到旧版 `zero-overhead`。
+- 模式：默认用 `zero-overhead-2026`，数据包零开销、**不影响 MTU**；可选 `paranoid-2026`（全包 AEAD 并填充到 MTU，会略微降低 MTU、增加带宽）。**`-2026` 模式带重放保护，要求两端时钟同步**，所以 tele-server 安装时要检查 NTP，teled 健康检查要报告时钟偏差；时钟不可控时回退到旧版 `zero-overhead`。
 
 ### 6.4 Phantun（可关，需要自愈）
 
@@ -223,62 +223,96 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 |---|---|---|
 | A. 托管上游二进制（推荐第一阶段） | 立刻可用，协议与上游完全兼容 | 引入非 Go 二进制；自愈只能靠外部监控和重启 |
 | B. Go 原生重写 fake-TCP（第二阶段可选） | 单一语言；可以在进程内做精细自愈（换源端口、重握手） | 约 1.5–2.5k 行代码，要自己测抓包兼容性；TUN 用 `wireguard/tun` 或原始套接字 |
+| C. Go 原生 raw-socket 模式（tcpraw 式，见 6.4.1） | 不需要 TUN 和 NAT 规则，只要 `CAP_NET_RAW`；可以作为库嵌入（MIT） | 线协议与 Phantun 不兼容（两端都由我们控制，这点无所谓） |
+
+#### 6.4.1 能不能做成纯用户态？
+
+先区分两个概念：
+
+- **「完全无特权」（普通用户、不给任何 capability）：在 Linux 上做不到。** 伪装 TCP 的本质是自己构造 TCP 报文段、绕开内核 TCP 栈，这必须用 raw socket、AF_PACKET 或 TUN，分别需要 `CAP_NET_RAW` 或 `CAP_NET_ADMIN`。能绕开这一点的路子都不成立：
+  - `TCP_REPAIR` 同样需要 `CAP_NET_ADMIN`。
+  - 非特权 user namespace 虽然给了 CAP_NET_ADMIN，但只作用于自己的 netns，那里没有物理网卡。经 slirp4netns/pasta 出网时，报文会被还原成**真实内核 TCP**，伪装就失去了意义，还会引入 TCP-over-TCP 的队头阻塞。
+  - eBPF 方案（如 mimic）和 AF_XDP 需要 root 加载程序。
+- **「用户态实现、最小特权」（不依赖内核模块、不跑 root、不改 iptables）：可以做到。** 其实 Phantun 本身就是用户态程序，真正麻烦的是它依赖 **TUN + NAT 规则**。有两条 Go 路线：
+
+| 路线 | 所需特权 | 是否需要防火墙规则 | 说明 |
+|---|---|---|---|
+| **C1. tcpraw 式**（[xtaci/tcpraw](https://github.com/xtaci/tcpraw)，MIT，kcptun 的 `--tcp` 模式在用） | 只需 `CAP_NET_RAW`（可以用 `setcap` 或 systemd `AmbientCapabilities` 授予） | 可选 | 已核实其实现：先用**真实内核 TCP** 完成三次握手（中间设备看到的是标准 Linux TCP 指纹），然后把内核 socket 的 **TTL 设为 1**，让内核自己发出的 ACK 和重传在第一跳就被丢弃；数据走 raw IP socket（`ip4:tcp`）加 BPF 过滤收发。iptables 规则只用来丢掉 TTL=1 的包、避免 ICMP Time Exceeded 噪声，是**可选**的。直接暴露 `net.PacketConn`，可以嵌入 teled 或 tele-server。 |
+| **C2. TUN 版 Phantun 协议的 Go 实现** | `CAP_NET_ADMIN`；可以由安装器预建持久化 TUN（`ip tuntap add mode tun user <u>`），运行时就不需要 root | 需要一次性的 NAT 规则（由安装器写入 nft，运行时只校验） | 与上游 Phantun 线协议兼容，可以和现成的 phantun-server 对接 |
+
+**建议**：把 fake-TCP 做成 teled/tele-server 内部的可插拔 `Transport` 接口，提供三个实现：`phantun-exec`（托管上游二进制，保证兼容）、`rawtcp`（C1，默认推荐）、`phantun-go`（C2，可选）。C1 带来的好处：
+
+- 不需要 TUN，不需要 NAT/DNAT 规则，因此与 docker/firewalld 的冲突风险（R7）大幅下降。
+- 在进程内完成自愈：直接重拨真实 TCP 握手、换源端口，不用重启子进程。
+- 链路上少一个进程，少一跳 localhost UDP。
+
+需要额外验证的点：握手阶段使用了真实内核 TCP，在对称丢包、NAT 超时后的重连行为；以及长时间运行后内核 socket 接收缓冲区的处理（需要持续 drain，或者设置很小的 `SO_RCVBUF`）。
+
+**顺带：整条链能否做到「本地免 root」？** 可以作为可选模式。
+
+- **WireGuard**：改用 wireguard-go + gVisor netstack，在进程内运行，不需要 TUN 也不需要 root。
+- **NFS**：内核 NFS 客户端用不了进程内的 netstack，所以要换成用户态 NFS 客户端 + FUSE。非特权 FUSE 挂载由 `fusermount3` 提供，但性能和一致性都不如内核 NFS。
+- **fake-TCP**：走 C1 路线，只需要给二进制一个 `CAP_NET_RAW`。
+
+代价主要在文件层，所以默认仍推荐「teled 以 root 运行 + 内核 WG/NFS」。
 
 **MTU**：Phantun 比 UDP 多 12 字节（TCP 头 20 − UDP 头 8）。上游建议 WG MTU：IPv4 为 1428，IPv6 为 1408。叠加 paranoid 模式时还要再减去 swgp 的开销。teled 根据启用的层**自动计算** MTU，不让用户手填。
 
-**自愈设计（在 teled 中实现，远端 tele-agent 对称实现服务端部分）**：
+**自愈设计（在 teled 中实现，远端 tele-server 对称实现服务端部分）**：
 
 1. **探测**（每 5 秒）
    - L1：WG `latest-handshake` 的年龄（> 135s 视为异常；正常情况下有流量时 ≤ 120s 会重新握手）。
-   - L2：隧道内对 `tele-agent` 健康端点的应用层 ping（带 RTT）。
+   - L2：隧道内对 `tele-server` 健康端点的应用层 ping（带 RTT）。
    - L3：子进程是否存活、TUN 接口和 iptables/nft 规则是否仍在（防止 firewalld 或 docker 重载时冲掉规则）。
 2. **分级动作**（带指数退避和抖动，并做 flap 检测）
    - 规则丢失 → 幂等地重新应用规则。
    - L2 连续 3 次失败、但子进程还活着 → **重启 phantun-client，并换一个本地 UDP 源端口**。这会让 Phantun 新建 fake-TCP 流，绕开中间设备里卡死的 NAT 或会话状态（这是 Phantun 最常见的故障模式）。
    - 重启之后仍然失败 → 重新解析 endpoint 的 DNS（应对动态 IP），然后重启整条链（swgp + phantun）。
-   - 服务端：tele-agent 定期清理 phantun-server 的空闲连接；隧道长时间没有有效握手时自行重启 phantun-server。服务端的自愈不依赖客户端能否连上。
+   - 服务端：tele-server 定期清理 phantun-server 的空闲连接；隧道长时间没有有效握手时自行重启 phantun-server。服务端的自愈不依赖客户端能否连上。
    - （可选、默认关闭）**降级**：用户允许时，Phantun 持续失败后临时退回纯 UDP 或 swgp。因为用户开 Phantun 往往就是因为 UDP 被封，所以必须显式开启。
-3. **可观测**：`tele status` 和 `tele` MCP 的 `list` 输出每层的状态、最近一次自愈动作和原因。
+3. **可观测**：`tele status` 和 `tele-agent` MCP 的 `list` 输出每层的状态、最近一次自愈动作和原因。
 
 ### 6.5 控制面 / exec 协议
 
-- 运行在 WG 内：`tele-agent` 只监听 WG 地址，比如 `10.77.n.2:7070`，并校验对端 IP。WG 本身就是双向公钥认证。可选再加一层会话 token，做纵深防御。
+- 运行在 WG 内：`tele-server` 只监听 WG 地址，比如 `10.77.n.2:7070`，并校验对端 IP。WG 本身就是双向公钥认证。可选再加一层会话 token，做纵深防御。
 - 协议：gRPC 双向流，或者「TCP + yamux + protobuf 帧」。**推荐 yamux + 自定义帧**：依赖更少，对 stdio 这种字节流更自然，延迟也更低。teled 与每台主机保持一条长连接，本地 shim 通过 unix socket 交给 teled 复用，这样每次命令不用新建 TCP 连接。
 - Exec RPC 的语义：argv 或 shell 字符串、cwd、env（**只转发增量**：启动时记录一份基线 env，只转发 Claude 新增或修改的变量，再加一份白名单；`SSH_AUTH_SOCK`、`DISPLAY` 等本地变量不转发）、stdin/stdout/stderr **分流**、退出码与信号、可选 pty、进程组管理、租约心跳（连接断开 → 对远端进程组先 SIGTERM，宽限后再 SIGKILL）。
 - 端口转发：HTTP/SSE 类的 MCP 如果 URL 是 `localhost:N`，要么由启动器改写成 WG 地址（服务需监听 0.0.0.0），要么由 teled 提供 `127.0.0.1:N` → 远端 `127.0.0.1:N` 的 TCP 转发（推荐后者，更透明）。
 
 ---
 
-## 7. 本地 MCP：`tele`
+## 7. 本地 MCP：`tele-agent`
 
-由 `tele claude` 通过 `--mcp-config` 注入（stdio，**本地**执行，**不**经过 PREFIX。注入时要对 `tele` 自身豁免：用内部标记让 `tele-exec` 识别并在本地直接执行）。
+由 `tele claude` 通过 `--mcp-config` 注入（stdio，**本地**执行，**不**经过 PREFIX。注入时要对 `tele-agent` 自身豁免：用内部标记让 `tele-exec` 识别并在本地直接执行）。在 Claude 中，下表的工具会显示为 `mcp__tele-agent__list`、`mcp__tele-agent__switch` 等。
+
+> 命名说明：MCP server 叫 `tele-agent`；为避免混淆，远端服务端守护进程命名为 `tele-server`。
 
 | 工具 | 说明 |
 |---|---|
-| `tele_list` | 列出所有主机，包括 `local`：名称、是否活跃、链路状态、RTT、OS 信息、已导出路径 |
-| `tele_switch(host)` | 切换执行和文件的目标主机 |
-| `tele_status(host?)` | 详细健康状态（WG 握手、swgp、phantun、NFS、自愈历史） |
-| `tele_install_guide(host?)` | 返回在远端安装服务端的步骤和一键命令（见下文） |
-| `tele_exec_local(cmd)`（可选） | 在远端模式下，显式在本地执行一次命令 |
+| `list` | 列出所有主机，包括 `local`：名称、是否活跃、链路状态、RTT、OS 信息、已导出路径 |
+| `switch(host)` | 切换执行和文件的目标主机 |
+| `status(host?)` | 详细健康状态（WG 握手、swgp、phantun、NFS、自愈历史） |
+| `install_guide(host?)` | 返回在远端安装服务端的步骤和一键命令（见下文） |
+| `exec_local(cmd)`（可选） | 在远端模式下，显式在本地执行一次命令 |
 
 MCP server 的 `instructions` 字段告诉模型：当前活跃主机是哪台；Bash 和文件都在该主机上；系统提示里的 OS 信息是本地的，以这里的为准。
 
 **切换语义（需要取舍）**：
 
 - **热切换**：teled 更新会话的「活跃主机」→ shim 下一次调用就发往新主机；再用 `setns` 进入会话的 mount ns（同一用户拥有该 userns，所以有权限），卸载旧 bind、绑定新主机的导出。风险：Claude 主进程自身的 cwd 仍指向旧挂载（lazy umount 之后变成 detached）；已打开的 fd 也还在旧挂载上。只有当新主机上**同样存在**该项目路径时才允许热切换。
-- **冷切换**（兜底，最稳）：启动器负责监管 `claude` 进程。`tele_switch` 返回「将在本轮结束后切换」，随后启动器在新命名空间里执行 `claude --resume <session-id>`。由于路径同一，会话键不变，对话历史完整保留。
+- **冷切换**（兜底，最稳）：启动器负责监管 `claude` 进程。`switch` 返回「将在本轮结束后切换」，随后启动器在新命名空间里执行 `claude --resume <session-id>`。由于路径同一，会话键不变，对话历史完整保留。
 - 建议：MVP 先做**冷切换** + 「`local` ↔ 远端」切换；热切换放到第二阶段。
 
-**安装指引内容**（`tele_install_guide` 返回，也可以用 `tele host add` 交互完成）：
+**安装指引内容**（`install_guide` 返回，也可以用 `tele host add` 交互完成）：
 
 ```bash
 # 本地：生成配对串（包含本地 WG 公钥、选定的传输层参数、一次性 token）
 tele host add myhost --endpoint 203.0.113.5 --phantun --swgp zero-overhead-2026
-# → 输出: tele-agent install --pair 'tele1:....'
+# → 输出: tele-server install --pair 'tele1:....'
 
 # 远端（root）：
 curl -fsSL https://github.com/ujzk/tele-agent/releases/latest/download/install.sh | sh
-sudo tele-agent install --pair 'tele1:....' --export /home/alice/proj --as alice
+sudo tele-server install --pair 'tele1:....' --export /home/alice/proj --as alice
 # → 安装 systemd unit，配置 wg/swgp/phantun/nfsd/exports，检查 NTP 与防火墙，
 #   输出回执串 'tele1r:....'
 
@@ -286,7 +320,7 @@ sudo tele-agent install --pair 'tele1:....' --export /home/alice/proj --as alice
 tele host confirm myhost 'tele1r:....'
 ```
 
-如果本地有到远端的 SSH，可以提供 `tele host add --ssh user@host` 一步完成（通过 SSH 上传二进制并执行 install）。这样 Claude 在 `local` 模式下也能借助 `tele_install_guide` 的指引自己完成安装。
+如果本地有到远端的 SSH，可以提供 `tele host add --ssh user@host` 一步完成（通过 SSH 上传二进制并执行 install）。这样 Claude 在 `local` 模式下也能借助 `install_guide` 的指引自己完成安装。
 
 ---
 
@@ -297,10 +331,10 @@ tele host confirm myhost 'tele1r:....'
 | R1 | Claude Code 内部行为（cwd 文件、快照、tmp 路径、prefix 覆盖范围）没有文档，可能随版本变化 | **高** | P0 原型；CI 中用 `claude -p` 驱动真实 Claude 跑兼容性测试（在远端执行 `hostname`、写文件后 Read、调用 hook 和 MCP、后台任务、超时中断）；启动时检测版本并告警 |
 | R2 | exec 形式的 hooks 可能绕过 `CLAUDE_CODE_SHELL_PREFIX` | 中 | 启动器用 `--setting-sources` + `--settings` 注入改写后的 hooks；插件 hooks 同样处理 |
 | R3 | NFS 属性缓存造成读到旧数据或 mtime 误判 | 中 | `actimeo=1`、`lookupcache=positive`、命令结束后定向失效；提供 `noac` 严格模式 |
-| R4 | 需要 root（WG、TUN、iptables、NFS 挂载） | 中 | 特权集中在 `teled` / `tele-agent` 两个 systemd 服务；日常使用的 `tele` 不需要 root |
+| R4 | 需要 root（WG、TUN、iptables、NFS 挂载） | 中 | 特权集中在 `teled` / `tele-server` 两个 systemd 服务；日常使用的 `tele` 不需要 root |
 | R5 | 非特权 userns 被 AppArmor 或 sysctl 限制 | 中 | 随包提供 AppArmor profile；退化为 teled 代理 pty 模式 |
 | R6 | swgp-go 是 AGPL-3.0 | 中 | 子进程方式分发、不链接；或让用户自行安装 |
-| R7 | Phantun 与 docker、firewalld、nftables 规则冲突；中间设备导致流卡死 | 中 | 专用 nft table 和链、周期性校验；换源端口 + 重启的自愈 |
+| R7 | Phantun 与 docker、firewalld、nftables 规则冲突；中间设备导致流卡死 | 中 | 默认用 raw-socket 模式（不需要 NAT 规则）；上游模式使用专用 nft table 并定期校验；自愈时换源端口并重新握手 |
 | R8 | exec 服务本质上是远程代码执行入口 | 高（安全） | 只监听 WG 地址并校验对端 IP；WG 私钥 0600 保存；可选 token；systemd 加固（以目标用户身份执行，不以 root 执行命令） |
 | R9 | Claude Code 的 bubblewrap 沙箱会在本地包一层，与 shim 冲突 | 低 | tele 模式下提示关闭沙箱；以后可在远端复现沙箱 |
 | R10 | swgp `-2026` 模式要求时钟同步 | 低 | 安装时检查 NTP；teled 报告时钟偏差；可回退旧模式 |
@@ -326,7 +360,7 @@ tele host confirm myhost 'tele1r:....'
 2. 逐项验证：Bash（含 cd 持久化、后台任务、超时、Ctrl-C 中断）、shell 快照在「远端」生成、shell 形式与 exec 形式的 hooks、stdio MCP、Grep/Glob 走 shim、Read/Write/Edit、`--resume` 冷切换。
 3. 产出：一份 Claude Code 行为清单，加上自动化兼容性测试（`claude -p`，可以用 `--max-turns` 和固定提示词驱动）。
 
-**P1 MVP（约 3–4 周）**：`tele-agent` exec 服务 + 纯 WG（内核）+ NFSv4.2 + `teled` + `tele claude` + `tele` MCP（list/status/install_guide/冷切换）+ 配对安装。
+**P1 MVP（约 3–4 周）**：`tele-server` exec 服务 + 纯 WG（内核）+ NFSv4.2 + `teled` + `tele claude` + `tele-agent` MCP（list/status/install_guide/冷切换）+ 配对安装。
 
 **P2 传输增强**：swgp-go 子进程托管、Phantun 托管与自愈、MTU 自动计算、四种组合的测试矩阵（可以用 netns + `tc netem` 模拟丢包和 NAT 超时）。
 
@@ -345,12 +379,12 @@ CLAUDE_CODE_TMPDIR=/var/lib/tele/s/<sid>/tmp         # 两端同路径（NFS）
 USE_BUILTIN_RIPGREP=0                                # 使用 PATH 中的 rg shim
 PATH=/usr/lib/tele/shim:$PATH                        # rg（可选 git）
 TELE_SESSION=<sid>                                   # shim 用它找到 teled 中的会话
-# 另加：claude --mcp-config <含 tele 的配置> [--settings <改写后的 hooks>]
+# 另加：claude --mcp-config <含 tele-agent 的配置> [--settings <改写后的 hooks>]
 ```
 
 ## 附录 B：未决问题（需要用户决定）
 
 1. 热切换和冷切换哪个优先？（建议先做冷切换）
-2. Phantun 是托管上游 Rust 二进制，还是直接用 Go 重写？（建议先托管）
+2. fake-TCP 默认用哪种：Go 原生 raw-socket 模式（建议，只需 CAP_NET_RAW，线协议不兼容上游），还是与上游 Phantun 线协议兼容（托管二进制或 Go 版 TUN 实现）？
 3. swgp-go 是否接受以独立子进程方式分发（AGPL 合规）？
 4. 一个会话是否需要同时挂载多台主机的不同路径（例如 A 的 `/srv/a` 和 B 的 `/srv/b` 同时可见），还是永远只有一台活跃主机？
