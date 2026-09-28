@@ -25,9 +25,14 @@ import (
 	"github.com/ujzk/tele-agent/internal/proto"
 )
 
-// TokenFile is the name, inside the session directory, of the file that
-// holds the session token: exactly Server.Token, mode 0600.
-const TokenFile = "token"
+// Files in the session directory.
+const (
+	// TokenFile holds the session token: exactly Server.Token, mode 0600.
+	TokenFile = "token"
+	// LogFile is session main's log, where Server.Logger records why a
+	// shim was rejected.
+	LogFile = "log"
+)
 
 // SocketName returns the abstract socket address of a session, in Go's
 // notation (a leading '@' for the abstract namespace).
@@ -124,12 +129,15 @@ func (s *Server) Serve(ctx context.Context, ln *net.UnixListener) error {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	// Deferred calls run in reverse: the listener is closed before waiting
+	// for the connections, so that no new shim queues up in the backlog of
+	// a server that no longer accepts.
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stop()
 	defer func() { _ = ln.Close() }() // error irrelevant: stops accepting either way
 
-	var wg sync.WaitGroup
-	defer wg.Wait()
 	backoff := time.Duration(0)
 	for {
 		conn, err := ln.AcceptUnix()
@@ -165,22 +173,37 @@ func isTemporary(err error) bool {
 	return false
 }
 
-// errTokenRejected is the handshake error the shim is told about; every
-// other handshake failure just closes the connection.
-var errTokenRejected = errors.New("session token rejected")
+var errTokenRejected = errors.New("session token rejected: the token file in TELE_SESSION does not belong to the running session")
 
 func (s *Server) serveConn(ctx context.Context, conn *net.UnixConn, log *slog.Logger) {
 	defer func() { _ = conn.Close() }() // nothing left to flush
 	req, err := s.handshake(ctx, conn)
 	if err != nil {
 		log.Warn("shim rejected", "err", err)
-		if errors.Is(err, errTokenRejected) {
-			sendExit(conn, proto.ShimStatus{Code: exitFailure, Msg: err.Error()}, log)
+		if msg, ok := refusalMessage(ctx, err); ok {
+			sendExit(conn, proto.ShimStatus{Code: exitFailure, Msg: msg}, log)
 		}
 		return
 	}
 	log.Debug("shim accepted", "name", req.Name, "argv", req.Argv, "dir", req.Dir, "pid", req.PeerPID)
 	s.run(ctx, conn, req, log)
+}
+
+// refusalMessage returns what a rejected shim is told, and false for a
+// peer of a foreign uid, which only sees the connection close. The session's
+// user learns the reason instead of guessing it from a closed connection.
+func refusalMessage(ctx context.Context, err error) (string, bool) {
+	var r *refusal
+	switch {
+	case !errors.As(err, &r):
+		return "", false
+	case ctx.Err() != nil:
+		return "tele session ended before the command started", true
+	case errors.Is(err, errTokenRejected):
+		return err.Error(), true
+	default:
+		return "tele session refused the command: " + err.Error(), true
+	}
 }
 
 // exitFailure is the shim's infrastructure failure exit code

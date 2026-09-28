@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -24,16 +26,28 @@ const maxRecvFDs = 16
 
 // handshake authenticates a new connection and reads its request: the
 // peer's uid, the marker byte carrying the stdio fds, the ShimRequest and
-// its token, in protocol order. On error every received fd is closed.
+// its token, in protocol order. On error every received fd is closed. A
+// peer that passed the uid check is the session's user; its failures are
+// *refusal errors, whose reason the shim is told.
 func (s *Server) handshake(ctx context.Context, conn *net.UnixConn) (*Request, error) {
-	cred, err := peerCred(conn)
+	cred, err := PeerCred(conn)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkPeer(cred, s.UID); err != nil {
 		return nil, err
 	}
+	req, err := s.readRequest(ctx, conn)
+	if err != nil {
+		return nil, &refusal{err}
+	}
+	req.PeerPID = int(cred.Pid)
+	return req, nil
+}
 
+// readRequest reads the stdio fds and the ShimRequest of a peer of the
+// right uid, checks its token and validates it.
+func (s *Server) readRequest(ctx context.Context, conn *net.UnixConn) (*Request, error) {
 	if err := conn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
 		return nil, err
 	}
@@ -45,7 +59,7 @@ func (s *Server) handshake(ctx context.Context, conn *net.UnixConn) (*Request, e
 		return nil, err
 	}
 	var sr proto.ShimRequest
-	if err := proto.ReadFrame(conn, &sr, proto.MaxControlFrame); err != nil {
+	if err := proto.ReadFrame(conn, &sr, proto.MaxShimRequest); err != nil {
 		closeFDs(fds)
 		return nil, fmt.Errorf("read shim request: %w", err)
 	}
@@ -55,9 +69,9 @@ func (s *Server) handshake(ctx context.Context, conn *net.UnixConn) (*Request, e
 		closeFDs(fds)
 		return nil, errTokenRejected
 	}
-	if sr.Name == "" || len(sr.Argv) == 0 {
+	if err := checkRequest(&sr); err != nil {
 		closeFDs(fds)
-		return nil, errors.New("shim request without name or argv")
+		return nil, err
 	}
 	if !stop() {
 		closeFDs(fds)
@@ -68,18 +82,47 @@ func (s *Server) handshake(ctx context.Context, conn *net.UnixConn) (*Request, e
 		return nil, err
 	}
 	return &Request{
-		Name:    sr.Name,
-		Argv:    sr.Argv,
-		Dir:     sr.Dir,
-		Env:     sr.Env,
-		Stdin:   os.NewFile(uintptr(fds[0]), "shim-stdin"),
-		Stdout:  os.NewFile(uintptr(fds[1]), "shim-stdout"),
-		Stderr:  os.NewFile(uintptr(fds[2]), "shim-stderr"),
-		PeerPID: int(cred.Pid),
+		Name:   sr.Name,
+		Argv:   sr.Argv,
+		Dir:    sr.Dir,
+		Env:    sr.Env,
+		Stdin:  os.NewFile(uintptr(fds[0]), "shim-stdin"),
+		Stdout: os.NewFile(uintptr(fds[1]), "shim-stdout"),
+		Stderr: os.NewFile(uintptr(fds[2]), "shim-stderr"),
 	}, nil
 }
 
-func peerCred(conn *net.UnixConn) (*unix.Ucred, error) {
+// checkRequest validates what a handler relies on in an authenticated
+// request (docs/coding-standards.md "协议"). A real shim cannot fail it:
+// argv and environment come from execve(2), which cannot pass NUL, and the
+// directory from getcwd(2).
+func checkRequest(sr *proto.ShimRequest) error {
+	if err := proto.CheckName(sr.Name); err != nil {
+		return fmt.Errorf("shim name: %w", err)
+	}
+	if len(sr.Argv) == 0 {
+		return errors.New("shim request without argv")
+	}
+	if err := proto.CheckPath(sr.Dir); err != nil {
+		return fmt.Errorf("shim working directory: %w", err)
+	}
+	hasNUL := func(s string) bool { return strings.IndexByte(s, 0) >= 0 }
+	if slices.ContainsFunc(sr.Argv, hasNUL) || slices.ContainsFunc(sr.Env, hasNUL) {
+		return errors.New("shim argv or environment contains NUL")
+	}
+	return nil
+}
+
+// refusal is a handshake failure of a peer of the session's uid.
+type refusal struct{ err error }
+
+func (r *refusal) Error() string { return r.err.Error() }
+func (r *refusal) Unwrap() error { return r.err }
+
+// PeerCred returns the credentials of conn's peer, translated into the
+// caller's namespaces: for an accepted connection those of the connecting
+// process, for a dialed one those of the process that called listen(2).
+func PeerCred(conn *net.UnixConn) (*unix.Ucred, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
 		return nil, err

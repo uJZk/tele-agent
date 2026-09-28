@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"path"
 	"slices"
+	"strings"
 )
 
 // Shim names with special handling.
@@ -82,9 +83,10 @@ func Classify(name string, argv []string, sessDir string, localProgs map[string]
 }
 
 // teleExecAction runs tele-exec's arguments: the first is a shell command,
-// the rest become its $0, $1, ...
+// the rest become its $0, $1, ... The "--" keeps a command that starts
+// with '-' or '+' from being parsed as shell options.
 func teleExecAction(args []string) Action {
-	return Action{Argv: slices.Concat([]string{nameSh, "-c"}, args)}
+	return Action{Argv: slices.Concat([]string{nameSh, "-c", "--"}, args)}
 }
 
 // teleExecPath is the tele-exec shim as Claude names it in
@@ -103,14 +105,21 @@ func teleExecPath(sessDir string) string {
 // "CLAUDE_CODE_SHELL_PREFIX"). That path does not exist on the target host,
 // so the wrapper must go; <command> needs bash, so it stays with bash.
 func unwrapBash(args []string, teleExec string) []string {
-	out := slices.Clone(args)
-	i := bashScriptIndex(args)
+	i, ended := bashScriptIndex(args)
 	if i < 0 {
-		return out
+		return slices.Clone(args)
 	}
-	if inner, ok := unwrapScript(args[i], teleExec); ok {
-		out[i] = inner
+	inner, ok := unwrapScript(args[i], teleExec)
+	if !ok {
+		return slices.Clone(args)
 	}
+	if !ended && (strings.HasPrefix(inner, "-") || strings.HasPrefix(inner, "+")) {
+		// The wrapper never looks like an option, but inner may; bash
+		// would then parse it as one unless "--" ends the options first.
+		return slices.Concat(args[:i], []string{"--", inner}, args[i+1:])
+	}
+	out := slices.Clone(args)
+	out[i] = inner
 	return out
 }
 

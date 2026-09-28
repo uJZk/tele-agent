@@ -54,6 +54,18 @@ func TestClassify(t *testing.T) {
 			want: Action{Argv: []string{"bash", "-c", "ls"}}},
 		{name: "bash", argv: []string{"bash", "-c", wrap("single", "")},
 			want: Action{Argv: []string{"bash", "-c", ""}}},
+		// An unwrapped script that looks like options gets "--" unless
+		// the options already ended.
+		{name: "bash", argv: []string{"bash", "-c", "-l", wrap("single", "-e echo")},
+			want: Action{Argv: []string{"bash", "-c", "-l", "--", "-e echo"}}},
+		{name: "bash", argv: []string{"bash", "-lc", wrap("double", "+x"), "a0"},
+			want: Action{Argv: []string{"bash", "-lc", "--", "+x", "a0"}}},
+		{name: "bash", argv: []string{"bash", "-co", "errexit", wrap("single", "-x")},
+			want: Action{Argv: []string{"bash", "-co", "errexit", "--", "-x"}}},
+		{name: "bash", argv: []string{"bash", "-c", "--", wrap("single", "-e echo")},
+			want: Action{Argv: []string{"bash", "-c", "--", "-e echo"}}},
+		{name: "bash", argv: []string{"bash", "-c", "-", wrap("single", "+x")},
+			want: Action{Argv: []string{"bash", "-c", "-", "+x"}}},
 		// Not the two-word form, or no -c script: forwarded unchanged.
 		{name: "bash", argv: []string{"bash", "-c", wrap("single", "ls") + "; rm -rf ~"},
 			want: Action{Argv: []string{"bash", "-c", wrap("single", "ls") + "; rm -rf ~"}}},
@@ -73,9 +85,11 @@ func TestClassify(t *testing.T) {
 
 		// sh: only [sh -c <wrapper> ...] is unwrapped, into tele-exec.
 		{name: "sh", argv: []string{"/bin/sh", "-c", wrap("single", bashCmd)},
-			want: Action{Argv: []string{"sh", "-c", bashCmd}}},
+			want: Action{Argv: []string{"sh", "-c", "--", bashCmd}}},
 		{name: "sh", argv: []string{"sh", "-c", wrap("double", "hook.sh --x"), "a0", "a1"},
-			want: Action{Argv: []string{"sh", "-c", "hook.sh --x"}}},
+			want: Action{Argv: []string{"sh", "-c", "--", "hook.sh --x"}}},
+		{name: "sh", argv: []string{"sh", "-c", wrap("single", "-e echo")},
+			want: Action{Argv: []string{"sh", "-c", "--", "-e echo"}}},
 		{name: "sh", argv: []string{"sh", "-c", "exec python3 -m server"},
 			want: Action{Argv: []string{"sh", "-c", "exec python3 -m server"}}},
 		{name: "sh", argv: []string{"sh", "-e", "-c", wrap("single", "ls")},
@@ -86,9 +100,14 @@ func TestClassify(t *testing.T) {
 
 		// tele-exec: one shell string for sh -c, extra arguments become $0...
 		{name: "tele-exec", argv: []string{testTeleExec, "npx -y @modelcontextprotocol/server-memory"},
-			want: Action{Argv: []string{"sh", "-c", "npx -y @modelcontextprotocol/server-memory"}}},
+			want: Action{Argv: []string{"sh", "-c", "--", "npx -y @modelcontextprotocol/server-memory"}}},
 		{name: "tele-exec", argv: []string{"tele-exec", "echo $0 $1", "a0", "a1"},
-			want: Action{Argv: []string{"sh", "-c", "echo $0 $1", "a0", "a1"}}},
+			want: Action{Argv: []string{"sh", "-c", "--", "echo $0 $1", "a0", "a1"}}},
+		// A command that looks like options still runs as a command.
+		{name: "tele-exec", argv: []string{"tele-exec", "-e echo"},
+			want: Action{Argv: []string{"sh", "-c", "--", "-e echo"}}},
+		{name: "tele-exec", argv: []string{"tele-exec", "+x"},
+			want: Action{Argv: []string{"sh", "-c", "--", "+x"}}},
 		{name: "tele-exec", argv: []string{"tele-exec"}, wantErr: ErrMissingCommand},
 
 		// Forwarded programs.
@@ -179,8 +198,23 @@ var bashScriptTests = []struct {
 
 func TestBashScriptIndex(t *testing.T) {
 	for _, tt := range bashScriptTests {
-		if got := bashScriptIndex(tt.args); got != tt.want {
+		if got, _ := bashScriptIndex(tt.args); got != tt.want {
 			t.Errorf("bashScriptIndex(%q) = %d, want %d", tt.args, got, tt.want)
+		}
+	}
+	for _, tt := range []struct {
+		args  []string
+		ended bool
+	}{
+		{[]string{"-c", "S"}, false},
+		{[]string{"-c", "--", "S"}, true},
+		{[]string{"-c", "-", "S"}, true},
+		{[]string{"-lc", "--", "S", "a0"}, true},
+		{[]string{"-c", "+", "S"}, false},   // "+" is an empty option cluster
+		{[]string{"-co", "--", "S"}, false}, // "--" is the argument of -o
+	} {
+		if i, ended := bashScriptIndex(tt.args); i < 0 || tt.args[i] != "S" || ended != tt.ended {
+			t.Errorf("bashScriptIndex(%q) = %d, %v; want the index of S, %v", tt.args, i, ended, tt.ended)
 		}
 	}
 }

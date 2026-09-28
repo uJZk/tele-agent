@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -35,12 +34,19 @@ const ExitFailure = 255
 const SessionEnv = "TELE_SESSION"
 
 const (
-	// dialTimeout bounds connecting to session main, whose listen backlog
-	// may be full when many shims start at once.
+	// dialTimeout bounds connecting to session main, including the retries
+	// while its listen backlog is full.
 	dialTimeout = 30 * time.Second
+	// The delay between those retries doubles from dialBackoffStart up to
+	// dialBackoffCap.
+	dialBackoffStart = time.Millisecond
+	dialBackoffCap   = 100 * time.Millisecond
 	// signalWriteTimeout bounds forwarding one signal to a session main
 	// that stopped reading.
 	signalWriteTimeout = 5 * time.Second
+	// refusalReadTimeout bounds looking for session main's reason after it
+	// hung up while the request was being sent.
+	refusalReadTimeout = 5 * time.Second
 	// maxTokenSize bounds the token file read, in case TELE_SESSION points
 	// somewhere unexpected.
 	maxTokenSize = 4096
@@ -75,12 +81,20 @@ func Main(name string, argv []string) int {
 	}
 	defer signal.Stop(sig)
 
-	conn, err := connect(name, argv)
+	sess, err := lookupSession()
+	if err != nil {
+		return fail(err)
+	}
+	frame, err := sess.request(name, argv)
+	if err != nil {
+		return fail(err)
+	}
+	conn, err := sess.dial()
 	if err != nil {
 		return fail(err)
 	}
 	defer func() { _ = conn.Close() }() // the process ends right after
-	st, err := wait(conn, sig)
+	st, err := sess.run(conn, frame, sig)
 	if err != nil {
 		return fail(err)
 	}
@@ -88,62 +102,48 @@ func Main(name string, argv []string) int {
 	return finish(st)
 }
 
-// connect sends the stdio fds and the request to session main.
-func connect(name string, argv []string) (*net.UnixConn, error) {
-	sessDir := os.Getenv(SessionEnv)
-	if sessDir == "" {
+// session is the tele session named by TELE_SESSION.
+type session struct {
+	dir string // the session directory as Claude sees it
+	id  string
+}
+
+func lookupSession() (*session, error) {
+	dir := os.Getenv(SessionEnv)
+	if dir == "" {
 		return nil, fmt.Errorf("%s is not set; shims only work inside a tele session", SessionEnv)
 	}
-	sid := filepath.Base(sessDir)
-	if err := proto.CheckSessionID(sid); err != nil {
-		return nil, fmt.Errorf("%s=%q is not a session directory", SessionEnv, sessDir)
+	id := filepath.Base(dir)
+	if err := proto.CheckSessionID(id); err != nil {
+		return nil, fmt.Errorf("%s=%q is not a session directory", SessionEnv, dir)
 	}
-	token, err := readToken(filepath.Join(sessDir, shimsrv.TokenFile))
+	return &session{dir: dir, id: id}, nil
+}
+
+// request returns the invocation as a ShimRequest frame. It is built before
+// connecting, so that a request session main would refuse is never sent.
+func (s *session) request(name string, argv []string) ([]byte, error) {
+	token, err := readToken(filepath.Join(s.dir, shimsrv.TokenFile))
 	if err != nil {
 		return nil, err
 	}
-	dir, err := os.Getwd()
+	// getcwd(2), not os.Getwd: that returns $PWD whenever it names the same
+	// directory, and $PWD need not be clean, which session main requires.
+	dir, err := unix.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("current directory: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	var d net.Dialer
-	c, err := d.DialContext(ctx, "unix", shimsrv.SocketName(sid))
-	if err != nil {
-		return nil, fmt.Errorf("cannot reach tele session %s (has it ended?): %w", sid, err)
+	frame, err := proto.EncodeShimRequest(&proto.ShimRequest{Token: token, Name: name, Argv: argv, Dir: dir, Env: os.Environ()})
+	if tooLarge := (*proto.FrameTooLargeError)(nil); errors.As(err, &tooLarge) {
+		return nil, fmt.Errorf("argument list and environment too long to forward: %d bytes encoded, limit %d; pass large data through a file", tooLarge.Size, tooLarge.Limit)
 	}
-	conn, ok := c.(*net.UnixConn)
-	if !ok {
-		_ = c.Close()
-		return nil, fmt.Errorf("unexpected connection type %T", c)
-	}
-	if err := send(conn, &proto.ShimRequest{Token: token, Name: name, Argv: argv, Dir: dir, Env: os.Environ()}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("send request to tele session %s: %w", sid, err)
-	}
-	return conn, nil
-}
-
-// send transfers fds 0, 1 and 2 on a marker byte, then the request
-// (internal/proto ShimRequest).
-func send(conn *net.UnixConn, req *proto.ShimRequest) error {
-	n, _, err := conn.WriteMsgUnix([]byte{0}, unix.UnixRights(0, 1, 2), nil)
-	if err != nil {
-		return err
-	}
-	if n != 1 {
-		return io.ErrShortWrite
-	}
-	return proto.WriteFrame(conn, req)
+	return frame, err
 }
 
 func readToken(path string) ([]byte, error) {
 	// The path comes from TELE_SESSION, set by tele for this very process;
 	// its contents only ever go to the session socket that it names.
-	f, err := os.Open(path) //nolint:gosec // G703: see above
-
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("session token: %w", err)
 	}
@@ -156,6 +156,122 @@ func readToken(path string) ([]byte, error) {
 		return nil, fmt.Errorf("session token %s: larger than %d bytes", path, maxTokenSize)
 	}
 	return token, nil
+}
+
+// dial connects to session main. An abstract socket name has no owner: once
+// session main is gone, any local user can bind it and would receive the
+// token and the stdio fds, and could answer with a forged exit status. So
+// the listener must belong to the shim's own uid, as session main checks
+// the shim's (docs/security.md "本地的会话主进程").
+func (s *session) dial() (*net.UnixConn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	conn, err := dialUnix(ctx, shimsrv.SocketName(s.id))
+	switch {
+	case errors.Is(err, unix.EAGAIN):
+		return nil, fmt.Errorf("tele session %s did not accept the command within %v; it may be overloaded: %w", s.id, dialTimeout, err)
+	case err != nil:
+		return nil, fmt.Errorf("cannot reach tele session %s (has it ended?): %w", s.id, err)
+	}
+	cred, err := shimsrv.PeerCred(conn)
+	if err == nil {
+		err = checkListener(cred, os.Getuid())
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("tele session %s: %w", s.id, err)
+	}
+	return conn, nil
+}
+
+// dialUnix connects to addr, retrying while its listen backlog is full: a
+// non-blocking connect(2) to a unix socket then fails with EAGAIN at once
+// instead of waiting, and Go's sockets are non-blocking. The backlog fills
+// when many shims start together while session main's accept loop is slow
+// or backing off.
+func dialUnix(ctx context.Context, addr string) (*net.UnixConn, error) {
+	var (
+		d    net.Dialer
+		full error // the last EAGAIN
+	)
+	delay := dialBackoffStart
+	for {
+		c, err := d.DialContext(ctx, "unix", addr)
+		switch {
+		case err == nil:
+			conn, ok := c.(*net.UnixConn)
+			if !ok {
+				_ = c.Close()
+				return nil, fmt.Errorf("unexpected connection type %T", c)
+			}
+			return conn, nil
+		case errors.Is(err, unix.EAGAIN):
+			full = err
+		case full != nil && ctx.Err() != nil:
+			return nil, full // the time ran out while the backlog stayed full
+		default:
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, full
+		case <-time.After(delay):
+		}
+		delay = min(2*delay, dialBackoffCap)
+	}
+}
+
+// checkListener accepts only a session socket created by uid.
+func checkListener(cred *unix.Ucred, uid int) error {
+	if int64(cred.Uid) != int64(uid) {
+		return fmt.Errorf("its socket belongs to uid %d, not %d, so the session has ended and another user took its address; nothing was sent", cred.Uid, uid)
+	}
+	return nil
+}
+
+// run hands the stdio fds and the request to session main and waits for
+// the exit status, forwarding caught signals meanwhile.
+func (s *session) run(conn *net.UnixConn, frame []byte, sig <-chan os.Signal) (*proto.ShimStatus, error) {
+	if err := send(conn, frame); err != nil {
+		// Session main may have refused the request, and said why, before
+		// hanging up in the middle of it.
+		_ = conn.SetReadDeadline(time.Now().Add(refusalReadTimeout)) // a failure shows in the read
+		if st, rerr := readExit(conn); rerr == nil {
+			return st, nil
+		}
+		return nil, s.connError("send the command", err)
+	}
+	st, err := wait(conn, sig)
+	if err != nil {
+		return nil, s.connError("read the exit status", err)
+	}
+	return st, nil
+}
+
+// connError describes a failed exchange with session main. A connection
+// that ends without an exit status is how session main refuses a peer it
+// does not talk to, and how its own death looks; either way the session
+// log has the reason.
+func (s *session) connError(op string, err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, unix.ECONNRESET) || errors.Is(err, unix.EPIPE) {
+		return fmt.Errorf("tele session %s closed the connection without an exit status: it ended, or refused the command; see %s",
+			s.id, filepath.Join(s.dir, shimsrv.LogFile))
+	}
+	return fmt.Errorf("%s from tele session %s: %w", op, s.id, err)
+}
+
+// send transfers fds 0, 1 and 2 on a marker byte, then the request frame
+// (internal/proto ShimRequest).
+func send(conn *net.UnixConn, frame []byte) error {
+	n, _, err := conn.WriteMsgUnix([]byte{0}, unix.UnixRights(0, 1, 2), nil)
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return io.ErrShortWrite
+	}
+	_, err = conn.Write(frame)
+	return err
 }
 
 // wait forwards caught signals until session main sends the exit status.
@@ -175,7 +291,7 @@ func wait(conn *net.UnixConn, sig <-chan os.Signal) (*proto.ShimStatus, error) {
 		case r := <-res:
 			return r.st, r.err
 		case s := <-sig:
-			n, ok := s.(syscall.Signal)
+			n, ok := s.(unix.Signal)
 			if !ok {
 				continue
 			}
@@ -188,13 +304,10 @@ func wait(conn *net.UnixConn, sig <-chan os.Signal) (*proto.ShimStatus, error) {
 func readExit(conn *net.UnixConn) (*proto.ShimStatus, error) {
 	var f proto.ShimFrame
 	if err := proto.ReadFrame(conn, &f, proto.MaxControlFrame); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, errors.New("tele session closed the connection before the command finished")
-		}
-		return nil, fmt.Errorf("read exit status from tele session: %w", err)
+		return nil, err
 	}
 	if f.Op != proto.ShimExit || f.Exit == nil {
-		return nil, fmt.Errorf("tele session sent unexpected frame %d", f.Op)
+		return nil, fmt.Errorf("unexpected frame %d", f.Op)
 	}
 	return f.Exit, nil
 }

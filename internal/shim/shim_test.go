@@ -29,6 +29,7 @@ import (
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/shimsrv"
 	"github.com/ujzk/tele-agent/internal/testutil/helperproc"
+	"github.com/ujzk/tele-agent/internal/testutil/privtest"
 )
 
 // closeFDsEnv makes the shim helper close the listed fds before Main runs,
@@ -37,6 +38,7 @@ const closeFDsEnv = "SHIM_TEST_CLOSE_FDS"
 
 func TestMain(m *testing.M) {
 	helperproc.Register("shim", shimHelper)
+	helperproc.Register("listen-as-nobody", listenAsNobody)
 	helperproc.Dispatch()
 	goleak.VerifyTestMain(m)
 }
@@ -112,6 +114,8 @@ func (h *fakeHandler) Serve(ctx context.Context, req *shimsrv.Request, sigs <-ch
 		if len(args) > 2 {
 			st.Msg = args[2]
 		}
+	case "count":
+		_, _ = fmt.Fprintf(req.Stdout, "%d", len(req.Argv))
 	case "cat":
 		n, _ := io.Copy(req.Stdout, req.Stdin)
 		_, _ = fmt.Fprintf(req.Stderr, "%d bytes", n)
@@ -141,8 +145,8 @@ func (h *fakeHandler) Serve(ctx context.Context, req *shimsrv.Request, sigs <-ch
 	return st
 }
 
-// session is a session directory with a shimsrv.Server behind it.
-type session struct {
+// fakeSession is a session directory with a shimsrv.Server behind it.
+type fakeSession struct {
 	dir   string
 	token []byte
 	h     *fakeHandler
@@ -160,10 +164,10 @@ func newSessionDir(t *testing.T) (dir, sid string) {
 	return dir, sid
 }
 
-func newSession(t *testing.T) *session {
+func newSession(t *testing.T) *fakeSession {
 	t.Helper()
 	dir, sid := newSessionDir(t)
-	s := &session{dir: dir, token: []byte("secret-token\n"), h: newFakeHandler()}
+	s := &fakeSession{dir: dir, token: []byte("secret-token\n"), h: newFakeHandler()}
 	if err := os.WriteFile(filepath.Join(dir, shimsrv.TokenFile), s.token, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +427,7 @@ func TestBadToken(t *testing.T) {
 	}
 	o := run(t, shimCmd(t, s.dir, "bash", "echo"))
 	wantExit(t, o, ExitFailure)
-	if o.stdout != "" || o.stderr != "tele: session token rejected\n" {
+	if o.stdout != "" || !strings.HasPrefix(o.stderr, "tele: session token rejected: ") || strings.Count(o.stderr, "\n") != 1 {
 		t.Errorf("stdout %q, stderr %q", o.stdout, o.stderr)
 	}
 	if n := s.h.calls.Load(); n != 0 {
@@ -477,8 +481,10 @@ func TestConnectionLostBeforeExit(t *testing.T) {
 
 	o := run(t, shimCmd(t, dir, "uname", "-a"))
 	wantExit(t, o, ExitFailure)
-	if o.stderr != "tele: tele session closed the connection before the command finished\n" {
-		t.Errorf("stderr %q", o.stderr)
+	want := fmt.Sprintf("tele: tele session %s closed the connection without an exit status: it ended, or refused the command; see %s\n",
+		sid, filepath.Join(dir, shimsrv.LogFile))
+	if o.stderr != want {
+		t.Errorf("stderr %q, want %q", o.stderr, want)
 	}
 	if err := <-served; err != nil {
 		t.Fatal(err)
@@ -486,17 +492,41 @@ func TestConnectionLostBeforeExit(t *testing.T) {
 }
 
 func acceptAndHangUp(ln *net.UnixListener) error {
-	conn, err := ln.AcceptUnix()
+	conn, err := acceptStdio(ln)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	oob := make([]byte, unix.CmsgSpace(3*4))
-	_, oobn, _, _, err := conn.ReadMsgUnix(make([]byte, 1), oob)
-	if err != nil {
+	var req proto.ShimRequest
+	if err := proto.ReadFrame(conn, &req, proto.MaxShimRequest); err != nil {
 		return err
 	}
-	msgs, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if req.Name != "uname" || string(req.Token) != "t" {
+		return fmt.Errorf("got request %+v", req)
+	}
+	return nil
+}
+
+// acceptStdio accepts a shim and takes the three fds it sends.
+func acceptStdio(ln *net.UnixListener) (*net.UnixConn, error) {
+	conn, err := ln.AcceptUnix()
+	if err != nil {
+		return nil, err
+	}
+	oob := make([]byte, unix.CmsgSpace(3*4))
+	_, oobn, _, _, err := conn.ReadMsgUnix(make([]byte, 1), oob)
+	if err == nil {
+		err = closeRights(oob[:oobn])
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func closeRights(oob []byte) error {
+	msgs, err := unix.ParseSocketControlMessage(oob)
 	if err != nil || len(msgs) != 1 {
 		return fmt.Errorf("control messages %v: %w", msgs, err)
 	}
@@ -507,14 +537,270 @@ func acceptAndHangUp(ln *net.UnixListener) error {
 	for _, fd := range fds {
 		_ = unix.Close(fd)
 	}
-	var req proto.ShimRequest
-	if err := proto.ReadFrame(conn, &req, proto.MaxControlFrame); err != nil {
-		return err
-	}
-	if len(fds) != 3 || req.Name != "uname" || string(req.Token) != "t" {
-		return fmt.Errorf("got %d fds and request %+v", len(fds), req)
+	if len(fds) != 3 {
+		return fmt.Errorf("got %d fds", len(fds))
 	}
 	return nil
+}
+
+// TestRefusalReason: a session main that refuses the request in the middle
+// of it, and hangs up, still gets its reason to the user. The request is
+// larger than the socket buffer, so the shim is still writing it.
+func TestRefusalReason(t *testing.T) {
+	dir, sid := newSessionDir(t)
+	if err := os.WriteFile(filepath.Join(dir, shimsrv.TokenFile), []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := shimsrv.Listen(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	served := make(chan error, 1)
+	go func() {
+		conn, err := acceptStdio(ln)
+		if err != nil {
+			served <- err
+			return
+		}
+		defer conn.Close() // with most of the request unread
+		var hdr [4]byte
+		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+			served <- err
+			return
+		}
+		served <- proto.WriteFrame(conn, &proto.ShimFrame{Op: proto.ShimExit, Exit: &proto.ShimStatus{Code: 255, Msg: "refused: too large"}})
+	}()
+
+	o := run(t, shimCmd(t, dir, "git", fillerArgs(1<<20)...))
+	wantExit(t, o, ExitFailure)
+	if o.stderr != "tele: refused: too large\n" {
+		t.Errorf("stderr %q", o.stderr)
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// fillerArgs returns arguments of about n bytes in total.
+func fillerArgs(n int) []string {
+	args := make([]string, n/100)
+	for i := range args {
+		args[i] = strings.Repeat("a", 99)
+	}
+	return args
+}
+
+// TestLargeInvocation: an argv larger than other control messages may be
+// reaches the handler.
+func TestLargeInvocation(t *testing.T) {
+	const size = proto.MaxControlFrame + 256<<10
+	var lim unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_STACK, &lim); err != nil {
+		t.Fatal(err)
+	}
+	// execve(2) takes at most a quarter of the stack limit for argv and env.
+	if lim.Cur != unix.RLIM_INFINITY && lim.Cur/4 < size+size/10+64<<10 {
+		t.Skipf("RLIMIT_STACK %d too small to exec %d bytes of arguments", lim.Cur, size)
+	}
+	s := newSession(t)
+	args := append([]string{"count"}, fillerArgs(size)...)
+	o := run(t, shimCmd(t, s.dir, "rg", args...))
+	wantExit(t, o, 0)
+	if want := strconv.Itoa(len(args) + 1); o.stdout != want {
+		t.Errorf("handler saw %s arguments, want %s", o.stdout, want)
+	}
+}
+
+// TestRequestTooLarge: a request session main would refuse is not sent.
+func TestRequestTooLarge(t *testing.T) {
+	dir, sid := newSessionDir(t)
+	if err := os.WriteFile(filepath.Join(dir, shimsrv.TokenFile), []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SHIM_TEST_HUGE", strings.Repeat("x", proto.MaxShimRequest))
+	_, err := (&session{dir: dir, id: sid}).request("bash", []string{"bash"})
+	if err == nil || !strings.Contains(err.Error(), "too long to forward") {
+		t.Errorf("request = %v, want too long", err)
+	}
+}
+
+// TestDirIsClean: the working directory sent is getcwd(2)'s, even when
+// $PWD names the same directory in an unclean form.
+func TestDirIsClean(t *testing.T) {
+	s := newSession(t)
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := shimCmd(t, s.dir, "bash", "echo")
+	cmd.Dir = dir
+	cmd.Env = append(cmd.Env, "PWD="+dir+"/./")
+	o := run(t, cmd)
+	wantExit(t, o, 0)
+	var got echoed
+	if err := json.Unmarshal([]byte(o.stdout), &got); err != nil || got.Dir != dir {
+		t.Errorf("handler saw dir %q (%v), want %q", got.Dir, err, dir)
+	}
+}
+
+// TestDialRetriesFullBacklog: a full listen backlog makes connect(2) fail
+// with EAGAIN at once; dialUnix keeps trying until its context ends.
+func TestDialRetriesFullBacklog(t *testing.T) {
+	_, sid := newSessionDir(t)
+	addr := shimsrv.SocketName(sid)
+	ln := listenBacklog0(t, addr)
+	var queued []*net.UnixConn
+	defer func() {
+		for _, c := range queued {
+			_ = c.Close()
+		}
+	}()
+	for {
+		c, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: addr, Net: "unix"})
+		if errors.Is(err, unix.EAGAIN) {
+			break
+		}
+		if err != nil || len(queued) > 64 {
+			t.Fatalf("filling the backlog: %v after %d connections", err, len(queued))
+		}
+		queued = append(queued, c)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, err := dialUnix(ctx, addr)
+	ended := ctx.Err()
+	cancel()
+	if !errors.Is(err, unix.EAGAIN) || ended == nil {
+		t.Fatalf("dialUnix = %v with the context %v; want EAGAIN after the context ended", err, ended)
+	}
+
+	// Once session main accepts again, a waiting dial gets through.
+	dialed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := dialUnix(ctx, addr)
+		if err == nil {
+			_ = c.Close()
+		}
+		dialed <- err
+	}()
+	for range queued {
+		c, err := ln.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = c.Close()
+	}
+	if err := <-dialed; err != nil {
+		t.Errorf("dialUnix after the backlog drained: %v", err)
+	}
+}
+
+// listenBacklog0 listens on the abstract address addr with the smallest
+// backlog, which net.Listen does not offer.
+func listenBacklog0(t *testing.T, addr string) *net.UnixListener {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := os.NewFile(uintptr(fd), "listener")
+	defer f.Close() // net.FileListener dups it
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: addr}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Listen(fd, 0); err != nil {
+		t.Fatal(err)
+	}
+	fl, err := net.FileListener(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fl.Close() })
+	ln, ok := fl.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type %T", fl)
+	}
+	return ln
+}
+
+func TestCheckListener(t *testing.T) {
+	if err := checkListener(&unix.Ucred{Pid: 1, Uid: 1000}, 1000); err != nil {
+		t.Errorf("same uid rejected: %v", err)
+	}
+	for _, uid := range []uint32{0, 999, 1001, 65534} {
+		if err := checkListener(&unix.Ucred{Pid: 1, Uid: uid}, 1000); err == nil {
+			t.Errorf("listener of uid %d accepted for 1000", uid)
+		}
+	}
+}
+
+// nobody is the uid the foreign listener runs as.
+const nobody = 65534
+
+// listenAsNobody listens on the abstract address args[0] as uid nobody,
+// reports "ready", then accepts one connection and reports how many bytes
+// arrived on it.
+func listenAsNobody(args []string) int {
+	if err := unix.Setresgid(nobody, nobody, nobody); err != nil {
+		return fail(err)
+	}
+	if err := unix.Setresuid(nobody, nobody, nobody); err != nil {
+		return fail(err)
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: args[0], Net: "unix"})
+	if err != nil {
+		return fail(err)
+	}
+	defer ln.Close()
+	fmt.Println("ready")
+	conn, err := ln.AcceptUnix()
+	if err != nil {
+		return fail(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	n, _ := io.Copy(io.Discard, conn)
+	fmt.Println(n)
+	return 0
+}
+
+// TestForeignListener: a socket another user bound at the session's
+// address gets neither the stdio fds nor the request.
+func TestForeignListener(t *testing.T) {
+	privtest.RequireRoot(t)
+	dir, sid := newSessionDir(t)
+	if err := os.WriteFile(filepath.Join(dir, shimsrv.TokenFile), []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listener := helperproc.Command(t, "listen-as-nobody", shimsrv.SocketName(sid))
+	listener.Env = append(listener.Env, "GORACE="+strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
+	out, err := listener.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Start(); err != nil {
+		t.Fatal(err)
+	}
+	rd := bufio.NewReader(out)
+	if line, err := rd.ReadString('\n'); line != "ready\n" {
+		t.Fatalf("listener: %q, %v", line, err)
+	}
+
+	o := run(t, shimCmd(t, dir, "bash", "echo"))
+	wantExit(t, o, ExitFailure)
+	if want := fmt.Sprintf("tele: tele session %s: its socket belongs to uid %d, not %d", sid, nobody, os.Getuid()); !strings.HasPrefix(o.stderr, want) {
+		t.Errorf("stderr %q, want it to start with %q", o.stderr, want)
+	}
+	received, _ := rd.ReadString('\n')
+	if err := listener.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if received != "0\n" {
+		t.Errorf("the foreign listener received %q bytes", strings.TrimSpace(received))
+	}
 }
 
 func TestConcurrentShims(t *testing.T) {

@@ -129,3 +129,38 @@ func TestBashScriptIndexMatchesBash(t *testing.T) {
 		}
 	}
 }
+
+// TestOptionLikeCommandRuns runs Classify's result for commands that start
+// with '-' or '+' through the shells and checks that they run as commands
+// rather than being parsed as shell options.
+func TestOptionLikeCommandRuns(t *testing.T) {
+	const mark = "SCRIPT-RAN"
+	var invocations [][]string
+	for _, lead := range []string{"-e", "+x", "--", "-"} {
+		// The first word fails as a command; the second proves the whole
+		// string ran as a script.
+		inner := lead + " 2>/dev/null; printf %s " + mark
+		invocations = append(invocations,
+			[]string{nameTeleExec, inner},
+			[]string{nameSh, "-c", wrap("single", inner), "a0"},
+			[]string{nameBash, "-c", wrap("single", inner)},
+			[]string{nameBash, "-lc", wrap("double", inner), "a0"},
+			[]string{nameBash, "-o", "pipefail", "-c", "--", wrap("backslash", inner)},
+		)
+	}
+	shells := map[string][]string{nameSh: {"/bin/dash", "/bin/bash"}, nameBash: {"/bin/bash"}}
+	for _, argv := range invocations {
+		act, err := Classify(argv[0], argv, testSess, testLocal)
+		if err != nil {
+			t.Fatalf("Classify(%q): %v", argv, err)
+		}
+		for _, sh := range shells[act.Argv[0]] {
+			if _, err := os.Stat(sh); err != nil {
+				continue // the other shells still check the argv
+			}
+			if out := runShell(t, append([]string{sh}, act.Argv[1:]...)...); !bytes.Contains(out, []byte(mark)) {
+				t.Errorf("%s %q (from %q) did not run the command", sh, act.Argv[1:], argv)
+			}
+		}
+	}
+}

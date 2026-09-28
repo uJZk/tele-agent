@@ -27,14 +27,15 @@ var bashLongOptions = map[string]bool{
 }
 
 // bashScriptIndex returns the index in args (bash's argv without argv[0])
-// of the -c command string, or -1 if bash would not run one. It mirrors
+// of the -c command string, or -1 if bash would not run one; ended reports
+// that "-" or "--" ended the options right before it. It mirrors
 // parse_long_options and parse_shell_options in bash's shell.c: word options
 // first, then clusters of single-letter options introduced by '-' or '+',
 // where each 'o' or 'O' consumes the next argument and "-" or "--" ends
 // the options. The command string is the first argument after the options.
 // Arguments bash would reject are skipped like valid ones: bash then exits
 // before running any script, so the index no longer matters.
-func bashScriptIndex(args []string) int {
+func bashScriptIndex(args []string) (index int, ended bool) {
 	i := 0
 	for i < len(args) && strings.HasPrefix(args[i], "-") {
 		name, long := strings.CutPrefix(args[i][1:], "-")
@@ -45,7 +46,7 @@ func bashScriptIndex(args []string) int {
 		takesArg, known := bashLongOptions[name]
 		if !known {
 			if long {
-				return -1 // bash: invalid option, exits
+				return -1, false // bash: invalid option, exits
 			}
 			break
 		}
@@ -60,7 +61,7 @@ func bashScriptIndex(args []string) int {
 		arg := args[i]
 		next := i + 1
 		if arg == "-" || arg == "--" {
-			i = next
+			i, ended = next, true
 			break
 		}
 		for _, c := range arg[1:] {
@@ -76,7 +77,7 @@ func bashScriptIndex(args []string) int {
 		i = next
 	}
 	if !wantCommand || i >= len(args) {
-		return -1
+		return -1, false
 	}
-	return i
+	return i, ended
 }

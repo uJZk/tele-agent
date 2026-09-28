@@ -231,15 +231,32 @@ func TestCheckPeer(t *testing.T) {
 	}
 }
 
-// rejected checks that the server hung up without an exit status, without
-// calling the handler, and without keeping any fd it received.
-func rejected(t *testing.T, h *handlerFunc, before int, conn *net.UnixConn) {
+// hungUp checks that the server closed the connection without an exit
+// status, without calling the handler, and without keeping any fd it
+// received.
+func hungUp(t *testing.T, h *handlerFunc, before int, conn *net.UnixConn) {
 	t.Helper()
 	// ECONNRESET: the server closed with unread data, which the kernel
 	// reports to the peer as a reset.
 	if st, err := readExit(conn); !errors.Is(err, io.EOF) && !errors.Is(err, unix.ECONNRESET) {
 		t.Errorf("got exit %+v, %v; want the connection closed", st, err)
 	}
+	closedCleanly(t, h, before, conn)
+}
+
+// refused checks that the server told the shim why it refused it, in a
+// message containing want, and then behaved like hungUp.
+func refused(t *testing.T, h *handlerFunc, before int, conn *net.UnixConn, want string) {
+	t.Helper()
+	st, err := readExit(conn)
+	if err != nil || st.Code != exitFailure || st.Signal != 0 || !strings.Contains(st.Msg, want) {
+		t.Errorf("got exit %+v, %v; want code %d with a message containing %q", st, err, exitFailure, want)
+	}
+	hungUp(t, h, before, conn)
+}
+
+func closedCleanly(t *testing.T, h *handlerFunc, before int, conn *net.UnixConn) {
+	t.Helper()
 	_ = conn.Close()
 	if n := h.calls.Load(); n != 0 {
 		t.Errorf("handler called %d times", n)
@@ -249,6 +266,8 @@ func rejected(t *testing.T, h *handlerFunc, before int, conn *net.UnixConn) {
 	}
 }
 
+// TestRejectsForeignUID: a peer of another uid learns nothing, not even
+// why it was refused.
 func TestRejectsForeignUID(t *testing.T) {
 	h := &handlerFunc{fn: func(context.Context, *Request, <-chan int) proto.ShimStatus { return proto.ShimStatus{} }}
 	sid, _ := serve(t, &Server{Token: testToken, UID: os.Getuid() + 1, Handler: h})
@@ -258,7 +277,7 @@ func TestRejectsForeignUID(t *testing.T) {
 	// Both writes may fail: the uid is checked before anything is read.
 	_, _, _ = conn.WriteMsgUnix([]byte{0}, unix.UnixRights(fds...), nil)
 	_ = proto.WriteFrame(conn, request("bash", testToken))
-	rejected(t, h, before, conn)
+	hungUp(t, h, before, conn)
 }
 
 func TestRejectsWrongFDCount(t *testing.T) {
@@ -270,7 +289,7 @@ func TestRejectsWrongFDCount(t *testing.T) {
 		conn := dial(t, sid)
 		sendFDs(t, conn, fds...)
 		_ = proto.WriteFrame(conn, request("bash", testToken))
-		rejected(t, h, before, conn)
+		refused(t, h, before, conn, "refused the command: read stdio fds")
 	}
 }
 
@@ -279,17 +298,34 @@ func TestRejectsBadRequest(t *testing.T) {
 	sid, _ := serve(t, &Server{Token: testToken, UID: os.Getuid(), Handler: h})
 	fds := devNulls(t, 3)
 
-	noName := request("", testToken)
-	noArgv := request("bash", testToken)
-	noArgv.Argv = nil
-	for _, req := range []*proto.ShimRequest{noName, noArgv} {
-		before := openNulls(t)
-		conn := dial(t, sid)
-		sendFDs(t, conn, fds...)
-		if err := proto.WriteFrame(conn, req); err != nil {
-			t.Fatal(err)
-		}
-		rejected(t, h, before, conn)
+	tests := []struct {
+		name   string
+		modify func(*proto.ShimRequest)
+		want   string
+	}{
+		{"no name", func(r *proto.ShimRequest) { r.Name = "" }, "shim name"},
+		{"name with slash", func(r *proto.ShimRequest) { r.Name = "bin/bash" }, "shim name"},
+		{"name dotdot", func(r *proto.ShimRequest) { r.Name = ".." }, "shim name"},
+		{"no argv", func(r *proto.ShimRequest) { r.Argv = nil }, "shim request without argv"},
+		{"no dir", func(r *proto.ShimRequest) { r.Dir = "" }, "shim working directory"},
+		{"relative dir", func(r *proto.ShimRequest) { r.Dir = "relative/x" }, "shim working directory"},
+		{"unclean dir", func(r *proto.ShimRequest) { r.Dir = "/work/../etc" }, "shim working directory"},
+		{"NUL in dir", func(r *proto.ShimRequest) { r.Dir = "/work\x00" }, "shim working directory"},
+		{"NUL in argv", func(r *proto.ShimRequest) { r.Argv[1] = "-c\x00x" }, "shim argv or environment contains NUL"},
+		{"NUL in env", func(r *proto.ShimRequest) { r.Env = []string{"A=1\x00B=2"} }, "shim argv or environment contains NUL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := request("bash", testToken)
+			tt.modify(req)
+			before := openNulls(t)
+			conn := dial(t, sid)
+			sendFDs(t, conn, fds...)
+			if err := proto.WriteFrame(conn, req); err != nil {
+				t.Fatal(err)
+			}
+			refused(t, h, before, conn, "refused the command: "+tt.want)
+		})
 	}
 
 	// A frame over the limit is refused before it is read.
@@ -297,11 +333,43 @@ func TestRejectsBadRequest(t *testing.T) {
 	conn := dial(t, sid)
 	sendFDs(t, conn, fds...)
 	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], proto.MaxControlFrame+1)
+	binary.BigEndian.PutUint32(hdr[:], proto.MaxShimRequest+1)
 	if _, err := conn.Write(hdr[:]); err != nil {
 		t.Fatal(err)
 	}
-	rejected(t, h, before, conn)
+	refused(t, h, before, conn, "refused the command: read shim request: proto: frame of")
+}
+
+// TestLargeRequest: a request as large as execve(2) allows with the default
+// stack limit is served; the frame limit of other control messages is far
+// smaller.
+func TestLargeRequest(t *testing.T) {
+	got := make(chan []string, 1)
+	h := &handlerFunc{fn: func(_ context.Context, req *Request, _ <-chan int) proto.ShimStatus {
+		closeReq(req)
+		got <- req.Argv
+		return proto.ShimStatus{}
+	}}
+	sid, _ := serve(t, &Server{Token: testToken, UID: os.Getuid(), Handler: h})
+	req := request("git", testToken)
+	for range 2 << 20 / 100 {
+		req.Argv = append(req.Argv, strings.Repeat("a", 90))
+	}
+	frame, err := proto.EncodeShimRequest(req)
+	if err != nil || len(frame) <= proto.MaxControlFrame {
+		t.Fatalf("request of %d bytes, %v: want more than %d", len(frame), err, proto.MaxControlFrame)
+	}
+	conn := dial(t, sid)
+	sendFDs(t, conn, devNulls(t, 3)...)
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := readExit(conn); err != nil || *st != (proto.ShimStatus{}) {
+		t.Fatalf("exit %+v, %v", st, err)
+	}
+	if argv := <-got; !slices.Equal(argv, req.Argv) {
+		t.Errorf("handler got %d arguments, want %d", len(argv), len(req.Argv))
+	}
 }
 
 func TestRejectsBadToken(t *testing.T) {
@@ -326,7 +394,7 @@ func TestRejectsBadToken(t *testing.T) {
 			t.Fatal(err)
 		}
 		st, err := readExit(conn)
-		if err != nil || *st != (proto.ShimStatus{Code: 255, Msg: "session token rejected"}) {
+		if err != nil || *st != (proto.ShimStatus{Code: 255, Msg: errTokenRejected.Error()}) {
 			t.Errorf("token %q: exit %+v, %v", tt.token, st, err)
 		}
 		if _, err := readExit(conn); !errors.Is(err, io.EOF) {
@@ -351,14 +419,12 @@ func TestHandshakeTimeout(t *testing.T) {
 	defer stop() // before handshakeTimeout is restored
 
 	idle := dial(t, sid)
-	if _, err := readExit(idle); !errors.Is(err, io.EOF) {
-		t.Errorf("idle connection: %v, want closed", err)
-	}
+	refused(t, h, openNulls(t), idle, "i/o timeout")
+	fds := devNulls(t, 3)
+	before := openNulls(t)
 	half := dial(t, sid)
-	sendFDs(t, half, devNulls(t, 3)...)
-	if _, err := readExit(half); !errors.Is(err, io.EOF) {
-		t.Errorf("connection without request: %v, want closed", err)
-	}
+	sendFDs(t, half, fds...)
+	refused(t, h, before, half, "i/o timeout")
 }
 
 func TestSignals(t *testing.T) {
@@ -478,6 +544,65 @@ func TestStopDeliversStatus(t *testing.T) {
 	if _, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: SocketName(sid), Net: "unix"}); err == nil {
 		t.Error("listener still accepting after Serve returned")
 	}
+}
+
+// TestAcceptErrorClosesListener: once accepting fails for good, Serve
+// stops listening at once, although it waits for running commands before
+// it returns. Otherwise new shims would queue up in the backlog meanwhile.
+func TestAcceptErrorClosesListener(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	h := &handlerFunc{fn: func(_ context.Context, req *Request, _ <-chan int) proto.ShimStatus {
+		closeReq(req)
+		close(started)
+		<-release
+		return proto.ShimStatus{Code: 7}
+	}}
+	sid := randomSID(t)
+	ln, err := Listen(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- (&Server{Token: testToken, UID: os.Getuid(), Handler: h}).Serve(context.Background(), ln)
+	}()
+	conn := dial(t, sid)
+	handshake(t, conn, request("bash", testToken))
+	<-started
+
+	// An expired deadline is an accept error that is not temporary.
+	if err := ln.SetDeadline(time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	closed := eventually(30*time.Second, func() bool {
+		c, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: SocketName(sid), Net: "unix"})
+		if err == nil {
+			_ = c.Close()
+		}
+		return errors.Is(err, unix.ECONNREFUSED)
+	})
+	close(release)
+	if !closed {
+		t.Error("listener still accepting connections while Serve waited for a command")
+	}
+	if err := <-done; !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("Serve = %v, want the accept error", err)
+	}
+	if st, err := readExit(conn); err != nil || st.Code != 7 {
+		t.Errorf("exit %+v, %v; the running command's status must still arrive", st, err)
+	}
+}
+
+// eventually polls cond until it holds or timeout passes.
+func eventually(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond) // polling interval, not synchronization
+	}
+	return true
 }
 
 func TestListen(t *testing.T) {
