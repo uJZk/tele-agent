@@ -8,6 +8,20 @@
 // to upload before a command, and applies the files the target reports as
 // changed afterwards.
 //
+// A command's local side goes like this: Hold its output files, take
+// Uploads with the budget of its ExecStart, start it with the Upload's
+// files, Commit the Upload once it started (Rollback if it did not),
+// Apply the files its exit status reports, and release the output files
+// once all output was written.
+//
+// The shell-snapshots and session-env directories are in Claude's config
+// directory, which every local Claude session shares. Of those, only this
+// session's files are uploaded: the ones its target produced (recorded by
+// Apply), and the entries its commands name (see Rewrite), such as its own
+// session-env/<Claude session id> directory. Anything else there belongs
+// to other sessions, possibly to other hosts, and may hold credentials a
+// SessionStart hook wrote.
+//
 // The target is not trusted (docs/security.md section 4): Apply writes only
 // below the local area directories, through os.Root, so neither ".."
 // components nor symbolic links can make it touch any other local file.
@@ -48,10 +62,20 @@ type Mapper struct {
 
 	mu sync.Mutex
 	// baseline is what the target is known to have for each local file:
-	// the state at the last Uploads or Apply that covered it.
+	// the state at the last committed Upload or Apply that covered it.
+	// For shared areas it also lists the files that are synced at all.
 	baseline map[fileKey]entry // guarded by mu
 	// applyGen counts Apply calls; see entry.gen.
 	applyGen uint64 // guarded by mu
+	// pending maps the files of every Upload not yet committed or rolled
+	// back to its id.
+	pending  map[fileKey]uint64 // guarded by mu
+	uploadID uint64             // guarded by mu; the last Upload id
+	// held counts Hold calls per file.
+	held map[fileID]int // guarded by mu
+	// claimed holds the entries of shared areas (their first path
+	// component) that Rewrite saw in this session's commands.
+	claimed map[fileKey]bool // guarded by mu
 }
 
 type fileKey struct {
@@ -64,21 +88,23 @@ type entry struct {
 	// gone records a deletion made by Apply until an Uploads confirms it.
 	gone bool
 	// gen is the applyGen of the Apply that recorded the entry, 0 for
-	// entries recorded by New or Uploads. Uploads ignores entries newer
+	// entries recorded by New or Commit. Uploads ignores entries newer
 	// than its own scan: that scan may predate the Apply's writes, and
 	// acting on it would upload a stale file or a spurious deletion.
 	gen uint64
 }
 
 // New returns a Mapper for areas. The files already present in the local
-// areas form the baseline and are never uploaded unless they change: the
-// snapshot and session-env directories are shared with other Claude
-// sessions.
+// per-session areas form the baseline and are never uploaded unless they
+// change.
 func New(areas []Area) (*Mapper, error) {
 	m := &Mapper{
 		areas:    append([]Area(nil), areas...),
 		byID:     make(map[proto.ScratchArea]Area, len(areas)),
 		baseline: make(map[fileKey]entry),
+		pending:  make(map[fileKey]uint64),
+		held:     make(map[fileID]int),
+		claimed:  make(map[fileKey]bool),
 	}
 	claude := make(map[string]bool, len(areas))
 	for _, a := range areas {
@@ -97,14 +123,20 @@ func New(areas []Area) (*Mapper, error) {
 	sort.SliceStable(m.areas, func(i, j int) bool {
 		return len(m.areas[i].ClaudePath) > len(m.areas[j].ClaudePath)
 	})
-	cur, err := m.scan()
-	if err != nil {
-		return nil, err
-	}
-	for k, st := range cur {
+	cur, roots := m.scan(nil, nil)
+	roots.close()
+	for k, st := range cur.files {
 		m.baseline[k] = entry{state: st}
 	}
 	return m, nil
+}
+
+// shared reports whether other local Claude sessions write the area's
+// directory too: shell-snapshots and session-env are in Claude's config
+// directory, while CLAUDE_CODE_TMPDIR is per session (docs/claude-code.md
+// section 6).
+func (a Area) shared() bool {
+	return a.ID != proto.ScratchTmp
 }
 
 func checkArea(a Area) error {
@@ -140,6 +172,11 @@ func (m *Mapper) logger() *slog.Logger {
 // rewritten, but "/.tele/abc/tmpx" and "/mnt/.tele/abc/tmp" are not.
 // Shell-level forms such as "-o/.tele/abc/tmp" are therefore left alone;
 // Claude never generates them for scratch files.
+//
+// In a shared area, the entry an occurrence names (the path component
+// after the prefix, such as the session id in
+// "<config>/session-env/<id>/hook-1.sh") becomes this session's: Uploads
+// considers it from then on.
 func (m *Mapper) Rewrite(s string) string {
 	var b strings.Builder
 	last := 0 // s[last:i] has not been copied to b yet
@@ -157,6 +194,9 @@ func (m *Mapper) Rewrite(s string) string {
 			b.WriteString(a.RemotePath)
 			last = end
 			i = end - 1
+			if a.shared() {
+				m.claim(a.ID, s[end:])
+			}
 			break
 		}
 	}
@@ -165,6 +205,25 @@ func (m *Mapper) Rewrite(s string) string {
 	}
 	b.WriteString(s[last:])
 	return b.String()
+}
+
+// claim records the entry that rest, the text after a shared area's
+// prefix, names.
+func (m *Mapper) claim(id proto.ScratchArea, rest string) {
+	if len(rest) < 2 || rest[0] != '/' {
+		return
+	}
+	n := 1
+	for n < len(rest) && isSegmentByte(rest[n]) {
+		n++
+	}
+	name := rest[1:n]
+	if name == "" || name == "." || name == ".." || strings.HasPrefix(name, tempPrefix) {
+		return
+	}
+	m.mu.Lock()
+	m.claimed[fileKey{id, name}] = true
+	m.mu.Unlock()
 }
 
 // isSegmentByte reports whether c can continue a path segment in the sense

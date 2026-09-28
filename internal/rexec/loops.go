@@ -1,6 +1,7 @@
 package rexec
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -15,10 +16,8 @@ import (
 // chunkSize bounds the data of one stdin frame.
 const chunkSize = 32 << 10
 
-// abandonTimeout bounds the SIGKILL frame sent by Abandon. The frame only
-// speeds things up: the server kills the process group anyway when the
-// stream ends before the exit status.
-const abandonTimeout = 5 * time.Second
+// errStreamEnded is returned by send when the stream ended first.
+var errStreamEnded = errors.New("rexec: exec stream ended")
 
 // sink is one local output file.
 type sink struct {
@@ -39,6 +38,10 @@ func (p *Process) readLoop() {
 		switch f.Op {
 		case proto.ExecStarted:
 			p.log.Debug("rexec: remote command started", "pid", f.PID)
+			if !p.sawStarted {
+				p.sawStarted = true
+				close(p.started)
+			}
 		case proto.ExecStdout:
 			p.write(&p.stdout, f.Data)
 		case proto.ExecStderr:
@@ -107,7 +110,7 @@ func (p *Process) stdinLoop() {
 			return
 		}
 		if n > 0 {
-			if p.conn.Send(&proto.ExecFrame{Op: proto.ExecStdin, Data: buf[:n]}) != nil {
+			if p.sendInput(&proto.ExecFrame{Op: proto.ExecStdin, Data: buf[:n]}) != nil {
 				return
 			}
 			continue
@@ -122,22 +125,77 @@ func (p *Process) stdinLoop() {
 }
 
 func (p *Process) sendStdinEOF() {
-	if err := p.conn.Send(&proto.ExecFrame{Op: proto.ExecStdinEOF}); err != nil {
+	if err := p.sendInput(&proto.ExecFrame{Op: proto.ExecStdinEOF}); err != nil {
 		p.log.Debug("rexec: send stdin EOF", "err", err)
 	}
 }
 
-// abandonLoop carries out Abandon: it asks the server to kill the process
-// group and ends the stream, which also ends readLoop.
+// sendInput sends a stdin frame once sendLoop has no control frame to
+// send. It waits as long as the frame takes, since stdinLoop reads no more
+// input meanwhile; the end of the stream or Abandon ends the wait.
+func (p *Process) sendInput(f *proto.ExecFrame) error {
+	return p.send(context.Background(), p.input, f)
+}
+
+// sendRequest asks sendLoop to write one frame.
+type sendRequest struct {
+	f    *proto.ExecFrame
+	done chan error // buffered; receives the result of the write
+}
+
+// send has sendLoop write f and waits for the result, until ctx is done
+// or the stream ends. A frame that sendLoop already took is written even
+// if send gave up.
+func (p *Process) send(ctx context.Context, ch chan<- sendRequest, f *proto.ExecFrame) error {
+	r := sendRequest{f: f, done: make(chan error, 1)}
+	select {
+	case ch <- r:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.readerDone:
+		return errStreamEnded
+	case <-p.abandon:
+		return ErrAbandoned
+	}
+	select {
+	case err := <-r.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// sendLoop writes the frames handed to send, control frames first, until
+// the stream ends or the command is abandoned. Both close the stream,
+// which also ends a write in progress.
+func (p *Process) sendLoop() {
+	for {
+		var r sendRequest
+		select {
+		case r = <-p.control:
+		default:
+			select {
+			case r = <-p.control:
+			case r = <-p.input:
+			case <-p.readerDone:
+				return
+			case <-p.abandon:
+				return
+			}
+		}
+		r.done <- p.conn.Send(r.f)
+	}
+}
+
+// abandonLoop carries out Abandon: it ends the stream, which also ends
+// readLoop. The server kills the process group when the stream ends
+// before the exit status (docs/exec.md section 2). The FIN is sent at
+// once, even while a stdin frame waits for the stream window.
 func (p *Process) abandonLoop() {
 	select {
 	case <-p.readerDone:
 		return
 	case <-p.abandon:
-	}
-	_ = p.raw.SetWriteDeadline(time.Now().Add(abandonTimeout))
-	if err := p.conn.Send(&proto.ExecFrame{Op: proto.ExecSignal, Signal: int(unix.SIGKILL)}); err != nil {
-		p.log.Debug("rexec: send SIGKILL", "err", err)
 	}
 	_ = p.raw.Close()
 	// Close only half-closes a multiplexed stream; the deadline ends

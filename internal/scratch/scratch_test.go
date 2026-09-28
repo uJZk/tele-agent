@@ -99,6 +99,14 @@ func writeLocal(t *testing.T, name, data string) {
 	}
 }
 
+// upload takes the pending local changes with an ample budget and commits
+// them, as for a command that started.
+func upload(m *Mapper) []proto.ScratchFile {
+	u := m.Uploads(proto.MaxDataFrame)
+	u.Commit()
+	return u.Files
+}
+
 func byPath(files []proto.ScratchFile) map[string]proto.ScratchFile {
 	m := make(map[string]proto.ScratchFile, len(files))
 	for _, f := range files {
@@ -116,9 +124,8 @@ func TestUploads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, err := m.Uploads()
-	if err != nil || len(files) != 0 {
-		t.Fatalf("Uploads after New = %+v, %v; want nothing", files, err)
+	if files := upload(m); len(files) != 0 {
+		t.Fatalf("Uploads after New = %+v; want nothing", files)
 	}
 
 	writeLocal(t, filepath.Join(tmp, "new"), "fresh")
@@ -136,11 +143,7 @@ func TestUploads(t *testing.T) {
 	}
 	writeLocal(t, filepath.Join(tmp, tempPrefix+"x"), "partial")
 
-	files, err = m.Uploads()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := byPath(files)
+	got := byPath(upload(m))
 	want := map[string]proto.ScratchFile{
 		"tmp:new":       {Area: proto.ScratchTmp, Path: "new", Mode: 0o640, Data: []byte("fresh")},
 		"tmp:sub/dir/f": {Area: proto.ScratchTmp, Path: "sub/dir/f", Mode: 0o600, Data: []byte("nested")},
@@ -150,8 +153,8 @@ func TestUploads(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Uploads =\n%+v\nwant\n%+v", got, want)
 	}
-	if files, err := m.Uploads(); err != nil || len(files) != 0 {
-		t.Fatalf("second Uploads = %+v, %v; want nothing", files, err)
+	if files := upload(m); len(files) != 0 {
+		t.Fatalf("second Uploads = %+v; want nothing", files)
 	}
 }
 
@@ -167,10 +170,7 @@ func TestUploadsLimits(t *testing.T) {
 	for i := range 9 {
 		writeLocal(t, filepath.Join(tmp, "f", string(rune('a'+i))), strings.Repeat("x", proto.ScratchFileMax))
 	}
-	files, err := m.Uploads()
-	if err != nil {
-		t.Fatal(err)
-	}
+	files := upload(m)
 	total := 0
 	for _, f := range files {
 		if f.Path == "big" {
@@ -183,14 +183,14 @@ func TestUploadsLimits(t *testing.T) {
 	}
 	// The deferred file follows in the next call; the oversized one stays
 	// skipped until it changes.
-	files, err = m.Uploads()
-	if err != nil || len(files) != 1 || files[0].Path != "f/i" {
-		t.Fatalf("second Uploads = %d files, %v; want only f/i", len(files), err)
+	files = upload(m)
+	if len(files) != 1 || files[0].Path != "f/i" {
+		t.Fatalf("second Uploads = %d files; want only f/i", len(files))
 	}
 	writeLocal(t, filepath.Join(tmp, "big"), "small now")
-	files, err = m.Uploads()
-	if err != nil || len(files) != 1 || files[0].Path != "big" {
-		t.Fatalf("Uploads after shrink = %+v, %v", files, err)
+	files = upload(m)
+	if len(files) != 1 || files[0].Path != "big" {
+		t.Fatalf("Uploads after shrink = %+v", files)
 	}
 }
 
@@ -198,9 +198,7 @@ func TestApply(t *testing.T) {
 	m, local := testMapper(t)
 	writeLocal(t, filepath.Join(local, "tmp", "gone"), "to delete")
 	writeLocal(t, filepath.Join(local, "tmp", "over"), "old")
-	if _, err := m.Uploads(); err != nil {
-		t.Fatal(err)
-	}
+	upload(m)
 
 	err := m.Apply([]proto.ScratchFile{
 		{Area: proto.ScratchTmp, Path: "cwd", Data: []byte("/home/u\n")},
@@ -243,14 +241,26 @@ func TestApply(t *testing.T) {
 		t.Errorf("deleted file still exists: %v", err)
 	}
 	// Applied files are what the target has: nothing to upload back.
-	if files, err := m.Uploads(); err != nil || len(files) != 0 {
-		t.Fatalf("Uploads after Apply = %+v, %v; want nothing", files, err)
+	if files := upload(m); len(files) != 0 {
+		t.Fatalf("Uploads after Apply = %+v; want nothing", files)
 	}
-	// A later local change is uploaded again.
+	// A later local change is uploaded again, also in a shared area for a
+	// file the target produced.
 	writeLocal(t, filepath.Join(local, "tmp", "cwd"), "/tmp\n")
-	files, err := m.Uploads()
-	if err != nil || len(files) != 1 || string(files[0].Data) != "/tmp\n" {
-		t.Fatalf("Uploads after local change = %+v, %v", files, err)
+	if err := os.Remove(filepath.Join(local, "snap", "snapshot-bash-1.sh")); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]proto.ScratchFile{
+		"tmp:cwd":                            {Area: proto.ScratchTmp, Path: "cwd", Mode: 0o600, Data: []byte("/tmp\n")},
+		"shell-snapshots:snapshot-bash-1.sh": {Area: proto.ScratchSnapshots, Path: "snapshot-bash-1.sh", Deleted: true},
+	}
+	if got := byPath(upload(m)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Uploads after local change = %+v, want %+v", got, want)
+	}
+	// The snapshot is no longer tracked once its removal was committed.
+	writeLocal(t, filepath.Join(local, "snap", "snapshot-bash-1.sh"), "recreated by another session")
+	if files := upload(m); len(files) != 0 {
+		t.Fatalf("Uploads after an untracked change = %+v; want nothing", files)
 	}
 }
 
@@ -322,21 +332,14 @@ func TestConcurrentApplyAndUploads(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				if _, err := m.Uploads(); err != nil {
-					t.Error(err)
-					return
-				}
+				upload(m)
 			}
 		})
 	}
 	wg.Wait()
 	// Every file now matches what was applied last; none is reported as
 	// deleted even though scans raced with the writes.
-	files, err := m.Uploads()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range files {
+	for _, f := range upload(m) {
 		if f.Deleted {
 			t.Fatalf("spurious deletion of %q", f.Path)
 		}

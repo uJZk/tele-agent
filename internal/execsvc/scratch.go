@@ -1,17 +1,18 @@
 package execsvc
 
 import (
+	"cmp"
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
@@ -28,9 +29,33 @@ const tempPrefix = ".tele-tmp-"
 // maxDepth bounds directory recursion; scratch areas are shallow.
 const maxDepth = 32
 
+// Limits of the scratch files returned with ExecExit, besides
+// proto.ScratchFileMax and proto.ScratchTotalMax, which the client checks.
+const (
+	// entryOverhead bounds the CBOR encoding of a proto.ScratchFile
+	// besides the bytes of its path and data: map header, keys, area,
+	// mode, deletion flag and string headers take at most 23 bytes.
+	entryOverhead = 32
+	// returnBudget bounds the encoded scratch files of one ExecExit, so
+	// that the frame stays within proto.MaxDataFrame; the rest of the
+	// frame takes a few dozen bytes.
+	returnBudget = proto.MaxDataFrame - 4<<10
+	// maxReturnEntries bounds the files of one ExecExit, so that a command
+	// that creates or removes a huge number of scratch files cannot keep
+	// the client busy applying them.
+	maxReturnEntries = 1 << 14
+)
+
 type scratchKey struct {
 	area proto.ScratchArea
 	path string
+}
+
+func compareKeys(a, b scratchKey) int {
+	if c := cmp.Compare(a.area, b.area); c != 0 {
+		return c
+	}
+	return strings.Compare(a.path, b.path)
 }
 
 type fileState struct {
@@ -40,9 +65,6 @@ type fileState struct {
 	mode  fs.FileMode
 }
 
-// snapshot is the state of every regular file in the scratch areas.
-type snapshot map[scratchKey]fileState
-
 func stateOf(fi fs.FileInfo) fileState {
 	st := fileState{size: fi.Size(), mtime: fi.ModTime().UnixNano(), mode: fi.Mode()}
 	if sys, ok := fi.Sys().(*syscall.Stat_t); ok {
@@ -51,87 +73,305 @@ func stateOf(fi fs.FileInfo) fileState {
 	return st
 }
 
-// writeScratch applies files uploaded by the client (docs/exec.md
-// section 5). Paths were validated with proto.CheckScratch; os.Root keeps
-// symlinks from leading out of an area.
-func (s *Service) writeScratch(files []proto.ScratchFile) error {
-	for _, f := range files {
-		root := s.areas[f.Area]
-		var err error
-		if f.Deleted {
-			err = removeFile(root, f.Path)
-		} else {
-			err = writeFile(root, f.Path, f.Data, fileMode(f.Mode))
-		}
-		if err != nil {
-			return fmt.Errorf("area %s: %w", f.Area.Dir(), err)
-		}
-	}
-	return nil
+// snapshot is the state of the regular files in the scratch areas.
+type snapshot struct {
+	files map[scratchKey]fileState
+	// unknown holds the directories (path "." for a whole area) and files
+	// that could not be read. What is at or below them is neither new nor
+	// deleted: reporting it as deleted would make the client remove its
+	// copies (and upload the removal back).
+	unknown map[scratchKey]struct{}
 }
 
-func (s *Service) snapshot() snapshot {
-	snap := make(snapshot)
+func newSnapshot() *snapshot {
+	return &snapshot{files: make(map[scratchKey]fileState), unknown: make(map[scratchKey]struct{})}
+}
+
+// covers reports whether k is at or below an unknown entry.
+func (s *snapshot) covers(k scratchKey) bool {
+	if len(s.unknown) == 0 {
+		return false
+	}
+	for p := k.path; ; p = path.Dir(p) {
+		if _, ok := s.unknown[scratchKey{k.area, p}]; ok {
+			return true
+		}
+		if p == "." {
+			return false
+		}
+	}
+}
+
+// uploadRecord is what the service did to a scratch file for the client.
+type uploadRecord struct {
+	state   fileState // the file as written; unused for a removal
+	deleted bool
+	seq     uint64 // Service.upSeq when recorded
+}
+
+// areaRoots are the scratch areas opened for one operation; an area that
+// could not be opened is missing.
+type areaRoots map[proto.ScratchArea]*os.Root
+
+func (r areaRoots) close() {
+	for _, root := range r {
+		_ = root.Close()
+	}
+}
+
+// openAreas opens every scratch area, creating any that a command
+// removed. They are resolved again for each operation because commands
+// may remove and recreate them (rm -rf "$CLAUDE_CODE_TMPDIR" is rewritten
+// to an area): a root kept open would still refer to the removed
+// directory. Areas are opened through the scratch directory, so that one
+// replaced by a symbolic link cannot lead a scan out of it.
+func (s *Service) openAreas() areaRoots {
+	roots := make(areaRoots, len(proto.ScratchAreas))
+	if err := os.MkdirAll(s.scratchDir, 0o700); err != nil {
+		s.logFileErr("create scratch dir", 0, s.scratchDir, err)
+		return roots
+	}
+	parent, err := os.OpenRoot(s.scratchDir)
+	if err != nil {
+		s.logFileErr("open scratch dir", 0, s.scratchDir, err)
+		return roots
+	}
+	defer func() { _ = parent.Close() }()
 	for _, a := range proto.ScratchAreas {
-		walk(s.areas[a], func(rel string, fi fs.FileInfo) {
-			snap[scratchKey{a, rel}] = stateOf(fi)
-		})
+		if err := parent.MkdirAll(a.Dir(), 0o700); err != nil {
+			s.logFileErr("create scratch area", a, a.Dir(), err)
+			continue
+		}
+		r, err := parent.OpenRoot(a.Dir())
+		if err != nil {
+			s.logFileErr("open scratch area", a, a.Dir(), err)
+			continue
+		}
+		roots[a] = r
+	}
+	return roots
+}
+
+// logFileErr logs a failed file operation. Paths are logged only at debug
+// level (docs/coding-standards.md section 10).
+func (s *Service) logFileErr(op string, area proto.ScratchArea, name string, err error) {
+	attrs := []any{"op", op, "err", withoutPath(err)}
+	if area != 0 {
+		attrs = append(attrs, "area", area.Dir())
+	}
+	s.log.Warn("execsvc: scratch file operation failed", attrs...)
+	s.log.Debug("execsvc: scratch file operation failed", "op", op, "path", name, "err", err)
+}
+
+// withoutPath returns err's message without the path a *fs.PathError or
+// *os.LinkError carries.
+func withoutPath(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Op + ": " + pe.Err.Error()
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return le.Op + ": " + le.Err.Error()
+	}
+	return err.Error()
+}
+
+// writeScratch applies files uploaded by the client (docs/exec.md
+// section 5) and records them for changedScratch. Paths were validated
+// with proto.CheckScratch; os.Root keeps symlinks from leading out of an
+// area.
+//
+// A file that cannot be written is logged and skipped, and the command
+// runs without it: the client offers an upload again only after it failed
+// to reach the server, so failing the command instead would fail every
+// later command the same way.
+func (s *Service) writeScratch(roots areaRoots, files []proto.ScratchFile) {
+	if len(files) == 0 {
+		return
+	}
+	done := make(map[scratchKey]uploadRecord, len(files))
+	for _, f := range files {
+		root := roots[f.Area]
+		if root == nil {
+			continue // logged by openAreas
+		}
+		k := scratchKey{f.Area, f.Path}
+		if f.Deleted {
+			if err := removeFile(root, f.Path); err != nil {
+				s.logFileErr("remove uploaded file", f.Area, f.Path, err)
+				continue
+			}
+			done[k] = uploadRecord{deleted: true}
+			continue
+		}
+		st, err := writeFile(root, f.Path, f.Data, fileMode(f.Mode))
+		if err != nil {
+			s.logFileErr("write uploaded file", f.Area, f.Path, err)
+			continue
+		}
+		done[k] = uploadRecord{state: st}
+	}
+
+	s.upMu.Lock()
+	defer s.upMu.Unlock()
+	s.upSeq++
+	for k, r := range done {
+		r.seq = s.upSeq
+		s.uploads[k] = r
+	}
+}
+
+// scan returns the state of every regular file in the open areas.
+func scan(roots areaRoots) *snapshot {
+	snap := newSnapshot()
+	for _, a := range proto.ScratchAreas {
+		root := roots[a]
+		if root == nil {
+			snap.unknown[scratchKey{a, "."}] = struct{}{}
+			continue
+		}
+		walkDir(root, a, ".", 0, snap)
 	}
 	return snap
 }
 
-// changedScratch returns the files that are new or modified since before,
-// with their contents, and those that were removed. Files larger than
-// proto.ScratchFileMax are skipped, and files beyond proto.ScratchTotalMax
-// are dropped; both are logged.
-func (s *Service) changedScratch(before snapshot, log *slog.Logger) []proto.ScratchFile {
-	after := s.snapshot()
-	var changed, deleted []scratchKey
-	for k, st := range after {
-		if old, ok := before[k]; !ok || old != st {
-			changed = append(changed, k)
-		}
-	}
-	for k := range before {
-		if _, ok := after[k]; !ok {
-			deleted = append(deleted, k)
-		}
-	}
-	sortKeys(changed)
-	sortKeys(deleted)
+// changedScratch returns the files that commands changed since before:
+// new and modified files with their contents, and removed files.
+//
+// Changes made by writeScratch are not reported, although they happen
+// after before was taken when another command uploads while this one
+// runs: the client would apply its own upload again, possibly over a
+// newer local file.
+//
+// The result is bounded by proto.ScratchFileMax per file,
+// proto.ScratchTotalMax in total, returnBudget encoded and
+// maxReturnEntries files. Changed files are chosen smallest first, since
+// the files Claude waits for (the cwd file, shell snapshots,
+// CLAUDE_ENV_FILE, task markers) are small and must not be crowded out by
+// a command that writes or removes many files; removals come next. What
+// does not fit is logged and dropped.
+func (s *Service) changedScratch(before *snapshot) []proto.ScratchFile {
+	seq := s.uploadSeq()
+	roots := s.openAreas()
+	defer roots.close()
+	after := scan(roots)
+	changed, deleted := s.diff(before, after, seq)
 
-	files := make([]proto.ScratchFile, 0, len(changed)+len(deleted))
-	total := 0
-	for i, k := range changed {
-		data, st, err := readFile(s.areas[k.area], k.path)
+	slices.SortFunc(changed, func(a, b scratchKey) int {
+		if c := cmp.Compare(after.files[a].size, after.files[b].size); c != 0 {
+			return c
+		}
+		return compareKeys(a, b)
+	})
+	var (
+		b                sizeBudget
+		written, removed []proto.ScratchFile
+		dropped          int
+	)
+	for _, k := range changed {
+		data, st, err := readFile(roots[k.area], k.path)
 		switch {
 		case errors.Is(err, errTooLarge):
-			log.Warn("execsvc: scratch file too large to return", "area", k.area.Dir(), "size", st.size)
-			log.Debug("execsvc: skipped scratch file", "area", k.area.Dir(), "path", k.path)
+			s.log.Warn("execsvc: scratch file too large to return", "area", k.area.Dir(), "size", st.size)
+			s.log.Debug("execsvc: skipped scratch file", "area", k.area.Dir(), "path", k.path)
 			continue
 		case err != nil:
 			continue // removed or replaced since the scan
 		}
-		if total+len(data) > proto.ScratchTotalMax {
-			log.Warn("execsvc: scratch return limit reached, dropping files", "dropped", len(changed)-i)
-			break
+		if !b.take(len(k.path), len(data)) {
+			dropped++
+			continue
 		}
-		total += len(data)
-		files = append(files, proto.ScratchFile{Area: k.area, Path: k.path, Mode: uint32(st.mode.Perm()), Data: data})
+		written = append(written, proto.ScratchFile{Area: k.area, Path: k.path, Mode: uint32(st.mode.Perm()), Data: data})
 	}
 	for _, k := range deleted {
-		files = append(files, proto.ScratchFile{Area: k.area, Path: k.path, Deleted: true})
+		if !b.take(len(k.path), 0) {
+			dropped++
+			continue
+		}
+		removed = append(removed, proto.ScratchFile{Area: k.area, Path: k.path, Deleted: true})
 	}
-	return files
+	if dropped > 0 {
+		s.log.Warn("execsvc: scratch return limit reached, dropping changes", "dropped", dropped)
+	}
+	// Removals first: a file replaced by a directory of the same name is
+	// removed before the directory's files are written.
+	slices.SortFunc(written, compareFiles)
+	return append(removed, written...)
 }
 
-func sortKeys(keys []scratchKey) {
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].area != keys[j].area {
-			return keys[i].area < keys[j].area
+func (s *Service) uploadSeq() uint64 {
+	s.upMu.Lock()
+	defer s.upMu.Unlock()
+	return s.upSeq
+}
+
+// diff compares two snapshots, leaving out what writeScratch did. after
+// was taken once upSeq was seq. Both results are sorted.
+func (s *Service) diff(before, after *snapshot, seq uint64) (changed, deleted []scratchKey) {
+	s.upMu.Lock()
+	defer s.upMu.Unlock()
+	s.pruneUploads(after, seq)
+	for k, st := range after.files {
+		if old, ok := before.files[k]; ok && old == st {
+			continue
 		}
-		return keys[i].path < keys[j].path
-	})
+		if r, ok := s.uploads[k]; ok && !r.deleted && r.state == st {
+			continue
+		}
+		changed = append(changed, k)
+	}
+	for k := range before.files {
+		if _, ok := after.files[k]; ok || after.covers(k) {
+			continue
+		}
+		if r, ok := s.uploads[k]; ok && r.deleted {
+			continue
+		}
+		deleted = append(deleted, k)
+	}
+	slices.SortFunc(changed, compareKeys)
+	slices.SortFunc(deleted, compareKeys)
+	return changed, deleted
+}
+
+// pruneUploads forgets the records that after shows to be outdated: the
+// file changed since it was uploaded, or a removed one exists again. Only
+// records older than after are judged, since after may miss later ones.
+// Callers hold upMu.
+func (s *Service) pruneUploads(after *snapshot, seq uint64) {
+	for k, r := range s.uploads {
+		if r.seq > seq || after.covers(k) {
+			continue
+		}
+		st, exists := after.files[k]
+		if r.deleted && !exists || !r.deleted && exists && st == r.state {
+			continue
+		}
+		delete(s.uploads, k)
+	}
+}
+
+// sizeBudget accounts for the scratch files of one message.
+type sizeBudget struct {
+	encoded, data, entries int
+}
+
+// take adds a file if it fits.
+func (b *sizeBudget) take(pathLen, dataLen int) bool {
+	size := pathLen + dataLen + entryOverhead
+	if b.entries >= maxReturnEntries || b.encoded+size > returnBudget || b.data+dataLen > proto.ScratchTotalMax {
+		return false
+	}
+	b.entries++
+	b.encoded += size
+	b.data += dataLen
+	return true
+}
+
+func compareFiles(a, b proto.ScratchFile) int {
+	return compareKeys(scratchKey{a.Area, a.Path}, scratchKey{b.Area, b.Path})
 }
 
 var (
@@ -179,30 +419,37 @@ func fileMode(mode uint32) os.FileMode {
 
 // writeFile replaces rel with data through a temporary file, so that a
 // command reading it concurrently never sees a partial file and a symlink
-// at rel is replaced rather than followed.
-func writeFile(root *os.Root, rel string, data []byte, mode os.FileMode) error {
+// at rel is replaced rather than followed. It returns the state of the
+// written file, taken before the rename so that a command changing the
+// file right after cannot be taken for the upload.
+func writeFile(root *os.Root, rel string, data []byte, mode os.FileMode) (fileState, error) {
 	dir := path.Dir(rel)
 	if dir != "." {
 		if err := root.MkdirAll(dir, 0o700); err != nil {
-			return err
+			return fileState{}, err
 		}
 	}
 	tmp := path.Join(dir, tempPrefix+rand.Text())
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return err
+		return fileState{}, err
 	}
 	_, werr := f.Write(data)
 	cerr := f.Chmod(mode) // exact mode, independent of umask
-	if err := errors.Join(werr, cerr, f.Close()); err != nil {
+	var st fileState
+	fi, serr := f.Stat()
+	if serr == nil {
+		st = stateOf(fi)
+	}
+	if err := errors.Join(werr, cerr, serr, f.Close()); err != nil {
 		_ = root.Remove(tmp)
-		return err
+		return fileState{}, err
 	}
 	if err := root.Rename(tmp, rel); err != nil {
 		_ = root.Remove(tmp)
-		return err
+		return fileState{}, err
 	}
-	return nil
+	return st, nil
 }
 
 // removeFile removes rel unless it is a directory; a missing file is not
@@ -210,32 +457,42 @@ func writeFile(root *os.Root, rel string, data []byte, mode os.FileMode) error {
 func removeFile(root *os.Root, rel string) error {
 	fi, err := root.Lstat(rel)
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
+	case gone(err):
 		return nil
 	case err != nil:
 		return err
 	case fi.IsDir():
 		return nil
 	}
-	if err := root.Remove(rel); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := root.Remove(rel); err != nil && !gone(err) {
 		return err
 	}
 	return nil
 }
 
-// walk calls fn for every regular file below root without following
-// symbolic links. Unreadable directories are skipped.
-func walk(root *os.Root, fn func(rel string, fi fs.FileInfo)) {
-	walkDir(root, ".", 0, fn)
+// gone reports whether err means that a path no longer exists, as opposed
+// to a failure to find out.
+func gone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, unix.ENOTDIR)
 }
 
-func walkDir(root *os.Root, dir string, depth int, fn func(rel string, fi fs.FileInfo)) {
+// walkDir adds every regular file at or below dir to snap without
+// following symbolic links. Directories and files it cannot read are
+// recorded as unknown.
+func walkDir(root *os.Root, area proto.ScratchArea, dir string, depth int, snap *snapshot) {
 	d, err := root.Open(dir)
 	if err != nil {
+		if !gone(err) {
+			snap.unknown[scratchKey{area, dir}] = struct{}{}
+		}
 		return
 	}
-	ents, _ := d.ReadDir(-1)
+	ents, err := d.ReadDir(-1)
 	_ = d.Close()
+	if err != nil {
+		// The entries read so far are still valid.
+		snap.unknown[scratchKey{area, dir}] = struct{}{}
+	}
 	for _, ent := range ents {
 		name := ent.Name()
 		if strings.HasPrefix(name, tempPrefix) {
@@ -248,11 +505,15 @@ func walkDir(root *os.Root, dir string, depth int, fn func(rel string, fi fs.Fil
 		switch {
 		case ent.IsDir():
 			if depth < maxDepth {
-				walkDir(root, rel, depth+1, fn)
+				walkDir(root, area, rel, depth+1, snap)
 			}
 		case ent.Type().IsRegular():
-			if fi, err := root.Lstat(rel); err == nil && fi.Mode().IsRegular() {
-				fn(rel, fi)
+			fi, err := root.Lstat(rel)
+			switch {
+			case err == nil && fi.Mode().IsRegular():
+				snap.files[scratchKey{area, rel}] = stateOf(fi)
+			case err != nil && !gone(err):
+				snap.unknown[scratchKey{area, rel}] = struct{}{}
 			}
 		}
 	}

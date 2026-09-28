@@ -12,6 +12,18 @@
 // shim was killed, so the whole process group is killed with it. After
 // the exit status only the pipes are closed, which leaves background
 // children running as they would locally (docs/exec.md section 2).
+//
+// Signals travel in the exec stream behind stdin data, and the stream has
+// no flow control for stdin of its own. The server therefore queues stdin
+// for a command that does not read it (up to stdinQueueMax) and keeps
+// handling the client's frames meanwhile; only beyond that does a signal
+// or the client's end of the stream wait until the command reads its
+// input or exits.
+//
+// TODO(session layer): docs/exec.md section 4 asks for output to be
+// buffered while the session is disconnected (bounded, spilling to disk).
+// Nothing here buffers beyond the stream window, so a command blocks once
+// its output pipe is full until the session resumes.
 package execsvc
 
 import (
@@ -23,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
@@ -31,7 +44,7 @@ import (
 // none.
 const DefaultPath = "/usr/local/bin:/usr/bin:/bin"
 
-// ErrClosed is returned by Serve after Close.
+// ErrClosed is returned by Serve after Close or Terminate.
 var ErrClosed = errors.New("execsvc: service closed")
 
 // Syncer provides the exec barrier (docs/exec.md section 6).
@@ -58,16 +71,23 @@ type Config struct {
 
 // Service runs the commands of one session.
 type Service struct {
-	env    []string
-	target proto.TargetInfo
-	syncer Syncer
-	log    *slog.Logger
-	areas  map[proto.ScratchArea]*os.Root
+	env        []string
+	target     proto.TargetInfo
+	syncer     Syncer
+	log        *slog.Logger
+	scratchDir string
 
 	mu     sync.Mutex
 	closed bool                    // guarded by mu
 	execs  map[*execution]struct{} // guarded by mu
 	wg     sync.WaitGroup          // counts Serve calls that passed the closed check
+
+	upMu sync.Mutex
+	// uploads records the scratch files the service wrote or removed for
+	// the client, so that a command running meanwhile does not report
+	// them as its own changes (see changedScratch).
+	uploads map[scratchKey]uploadRecord // guarded by upMu
+	upSeq   uint64                      // guarded by upMu; last uploadRecord.seq
 }
 
 // BaseEnv returns the environment a login shell of t would start with, as
@@ -99,12 +119,13 @@ func New(cfg Config) (*Service, error) {
 		return nil, fmt.Errorf("execsvc: scratch dir: %w", err)
 	}
 	s := &Service{
-		env:    cfg.BaseEnv,
-		target: cfg.Target,
-		syncer: cfg.Syncer,
-		log:    cfg.Logger,
-		areas:  make(map[proto.ScratchArea]*os.Root, len(proto.ScratchAreas)),
-		execs:  make(map[*execution]struct{}),
+		env:        cfg.BaseEnv,
+		target:     cfg.Target,
+		syncer:     cfg.Syncer,
+		log:        cfg.Logger,
+		scratchDir: cfg.ScratchDir,
+		execs:      make(map[*execution]struct{}),
+		uploads:    make(map[scratchKey]uploadRecord),
 	}
 	if s.env == nil {
 		s.env = BaseEnv(cfg.Target)
@@ -113,17 +134,9 @@ func New(cfg Config) (*Service, error) {
 		s.log = slog.New(slog.DiscardHandler)
 	}
 	for _, a := range proto.ScratchAreas {
-		dir := filepath.Join(cfg.ScratchDir, a.Dir())
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			s.closeAreas()
+		if err := os.MkdirAll(filepath.Join(cfg.ScratchDir, a.Dir()), 0o700); err != nil {
 			return nil, fmt.Errorf("execsvc: create scratch area: %w", err)
 		}
-		r, err := os.OpenRoot(dir)
-		if err != nil {
-			s.closeAreas()
-			return nil, fmt.Errorf("execsvc: open scratch area: %w", err)
-		}
-		s.areas[a] = r
 	}
 	return s, nil
 }
@@ -131,9 +144,9 @@ func New(cfg Config) (*Service, error) {
 // Serve runs the command requested on c, an exec stream whose
 // StreamHeader was already read, and returns when the stream is done.
 // Cancelling ctx kills the command like a client that went away. Serve
-// closes c. It returns ErrClosed after Close, and an error when no valid
-// ExecStart arrived; a command that fails to start is reported to the
-// client instead.
+// closes c. It returns ErrClosed after Close or Terminate, and an error
+// when no valid ExecStart arrived; a command that fails to start is
+// reported to the client instead.
 func (s *Service) Serve(ctx context.Context, c net.Conn) error {
 	e := newExecution(s, c)
 	if !s.add(e) {
@@ -149,24 +162,48 @@ func (s *Service) Serve(ctx context.Context, c net.Conn) error {
 // Close kills every command whose main process is still running, closes
 // every stream, and waits for all Serve calls to return.
 func (s *Service) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
+	for _, e := range s.shutdown() {
+		e.abort()
 	}
+	s.wg.Wait()
+	return nil
+}
+
+// Terminate ends the session's commands the way an expired session lease
+// requires (docs/transport.md section 3): SIGTERM to the process group of
+// every command whose main process still runs, then, once those main
+// processes exited and their exit status was sent, or grace elapsed,
+// Close, which kills the rest with SIGKILL. Commands that have not started
+// yet are not started.
+func (s *Service) Terminate(grace time.Duration) error {
+	execs := s.shutdown()
+	for _, e := range execs {
+		e.terminate()
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+wait:
+	for _, e := range execs {
+		select {
+		case <-e.mainDone:
+		case <-timer.C:
+			break wait
+		}
+	}
+	return s.Close()
+}
+
+// shutdown stops accepting commands and returns the executions in
+// progress.
+func (s *Service) shutdown() []*execution {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.closed = true
 	execs := make([]*execution, 0, len(s.execs))
 	for e := range s.execs {
 		execs = append(execs, e)
 	}
-	s.mu.Unlock()
-
-	for _, e := range execs {
-		e.abort()
-	}
-	s.wg.Wait()
-	s.closeAreas()
-	return nil
+	return execs
 }
 
 func (s *Service) add(e *execution) bool {
@@ -185,10 +222,4 @@ func (s *Service) remove(e *execution) {
 	delete(s.execs, e)
 	s.mu.Unlock()
 	s.wg.Done()
-}
-
-func (s *Service) closeAreas() {
-	for _, r := range s.areas {
-		_ = r.Close()
-	}
 }

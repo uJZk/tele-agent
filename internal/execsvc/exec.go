@@ -32,13 +32,18 @@ type execution struct {
 	stdin *os.File // the command's stdin: a pipe's write end or the pty master
 	pty   bool
 
-	// stdinDone is owned by the reader goroutine: stdin was closed or
-	// broke, and further stdin frames are dropped.
-	stdinDone bool
+	// stdinQ carries stdin data from readLoop to stdinLoop, so that
+	// readLoop never waits for the command to read its input.
+	stdinQ *stdinQueue
 
 	// finishing is set when the server itself ends the stream, so that
 	// the reader's failure is not taken for the client going away.
 	finishing atomic.Bool
+
+	// mainDone is closed once the main process exited and its exit status
+	// was sent, or when it turned out that no command will run.
+	mainDone     chan struct{}
+	mainDoneOnce sync.Once
 
 	mu    sync.Mutex
 	pgid  int     // guarded by mu; 0 until the command started
@@ -53,14 +58,21 @@ type execution struct {
 
 func newExecution(s *Service, c net.Conn) *execution {
 	return &execution{
-		svc:  s,
-		raw:  c,
-		conn: proto.NewConn(c, proto.MaxDataFrame),
-		log:  s.log,
+		svc:      s,
+		raw:      c,
+		conn:     proto.NewConn(c, proto.MaxDataFrame),
+		log:      s.log,
+		stdinQ:   newStdinQueue(),
+		mainDone: make(chan struct{}),
 	}
 }
 
+func (e *execution) markMainDone() {
+	e.mainDoneOnce.Do(func() { close(e.mainDone) })
+}
+
 func (e *execution) run() error {
+	defer e.markMainDone()
 	var start proto.ExecStart
 	if err := e.conn.Recv(&start); err != nil {
 		_ = e.raw.Close()
@@ -70,14 +82,12 @@ func (e *execution) run() error {
 		e.fail(&proto.Error{Errno: uint32(unix.EINVAL), Msg: err.Error()})
 		return fmt.Errorf("execsvc: %w", err)
 	}
-	if err := e.svc.writeScratch(start.Scratch); err != nil {
-		e.log.Warn("execsvc: write uploaded scratch files", "err", err)
-		e.fail(proto.ErrorFrom(fmt.Errorf("write scratch files: %w", err)))
-		return nil
-	}
-	// Taken after the uploads, so that only the command's own changes
-	// (and those of concurrent commands) are reported back.
-	before := e.svc.snapshot()
+	roots := e.svc.openAreas()
+	e.svc.writeScratch(roots, start.Scratch)
+	// Taken after the uploads, so that only changes made by commands are
+	// reported back.
+	before := scan(roots)
+	roots.close()
 	if perr := e.start(&start); perr != nil {
 		e.fail(perr)
 		return nil
@@ -110,7 +120,10 @@ func (e *execution) start(start *proto.ExecStart) *proto.Error {
 	attr := &os.ProcAttr{Dir: start.Dir, Env: mergeEnv(e.svc.env, start.Env)}
 	child, pumps, err := e.setupStdio(start.TTY, attr)
 	if err != nil {
-		return proto.ErrorFrom(err)
+		e.log.Warn("execsvc: set up stdio", "err", err)
+		// The message leaves the errno to Errno, which proto.Error
+		// appends itself.
+		return &proto.Error{Errno: errnoOf(err, unix.EIO), Msg: "set up stdio"}
 	}
 	proc, err := os.StartProcess(path, start.Argv, attr)
 	for _, f := range child {
@@ -195,12 +208,13 @@ func openPipes() (*stdioPipes, error) {
 
 // supervise forwards frames until the command's main process exited and
 // its output pipes reached EOF, or the stream ended.
-func (e *execution) supervise(before snapshot) {
+func (e *execution) supervise(before *snapshot) {
 	if err := e.conn.Send(&proto.ExecFrame{Op: proto.ExecStarted, PID: e.proc.Pid}); err != nil {
 		e.abort()
 	}
-	var reader, pumps sync.WaitGroup
+	var reader, writer, pumps sync.WaitGroup
 	reader.Go(e.readLoop)
+	writer.Go(e.stdinLoop)
 	for _, p := range e.pumps {
 		pumps.Go(func() { p.run(e.conn) })
 	}
@@ -214,6 +228,7 @@ func (e *execution) supervise(before snapshot) {
 	case !e.isAborted():
 		e.reportExit(ps, before)
 	}
+	e.markMainDone()
 
 	pumps.Wait()
 	e.finishing.Store(true)
@@ -222,6 +237,7 @@ func (e *execution) supervise(before snapshot) {
 	// reader even if the client never closes its side.
 	_ = e.raw.SetReadDeadline(time.Now())
 	reader.Wait()
+	writer.Wait()
 	_ = e.stdin.Close()
 }
 
@@ -244,7 +260,7 @@ func (e *execution) waitExit() (*os.ProcessState, error) {
 
 // reportExit sends ExecExit once everything the main process wrote before
 // it exited has been sent.
-func (e *execution) reportExit(ps *os.ProcessState, before snapshot) {
+func (e *execution) reportExit(ps *os.ProcessState, before *snapshot) {
 	st := &proto.ExecStatus{}
 	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 		st.Signal = int(ws.Signal())
@@ -256,11 +272,22 @@ func (e *execution) reportExit(ps *os.ProcessState, before snapshot) {
 	if e.svc.syncer != nil {
 		st.WatchSeq = e.svc.syncer.Sync()
 	}
-	st.Scratch = e.svc.changedScratch(before, e.log)
+	st.Scratch = e.svc.changedScratch(before)
 	for _, p := range e.pumps {
 		p.flush()
 	}
-	if err := e.conn.Send(&proto.ExecFrame{Op: proto.ExecExit, Exit: st}); err != nil {
+	f := &proto.ExecFrame{Op: proto.ExecExit, Exit: st}
+	err := e.conn.Send(f)
+	var tooLarge *proto.FrameTooLargeError
+	if errors.As(err, &tooLarge) {
+		// changedScratch keeps within the limit, so this is a bug; the exit
+		// status matters more than the files. WriteFrame checks the size
+		// before writing anything, so the stream is intact.
+		e.log.Error("execsvc: exit status too large, dropping scratch files", "size", tooLarge.Size, "files", len(st.Scratch))
+		st.Scratch = nil
+		err = e.conn.Send(f)
+	}
+	if err != nil {
 		e.abort()
 	}
 }
@@ -292,9 +319,9 @@ func (e *execution) readLoop() {
 func (e *execution) handle(f *proto.ExecFrame) error {
 	switch f.Op {
 	case proto.ExecStdin:
-		e.writeStdin(f.Data)
+		e.stdinQ.put(f.Data)
 	case proto.ExecStdinEOF:
-		e.closeStdin()
+		e.stdinQ.end()
 	case proto.ExecSignal:
 		if f.Signal < 1 || f.Signal > maxSignal {
 			e.log.Warn("execsvc: ignoring invalid signal", "signal", f.Signal)
@@ -315,16 +342,26 @@ func (e *execution) handle(f *proto.ExecFrame) error {
 	return nil
 }
 
-func (e *execution) writeStdin(data []byte) {
-	if e.stdinDone || len(data) == 0 {
-		return
-	}
-	if _, err := e.stdin.Write(data); err != nil {
-		// EPIPE: the command closed its stdin. Closed or past the
-		// deadline: the main process exited (endStdin).
-		e.stdinDone = true
-		if !errors.Is(err, unix.EPIPE) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrDeadlineExceeded) {
-			e.log.Debug("execsvc: write stdin", "err", err)
+// stdinLoop writes the client's stdin data to the command until the
+// client ends its input, the command stops reading (EPIPE), or the main
+// process exits.
+func (e *execution) stdinLoop() {
+	for {
+		data, eof, ok := e.stdinQ.next()
+		if !ok {
+			if eof {
+				e.closeStdin()
+			}
+			return
+		}
+		if _, err := e.stdin.Write(data); err != nil {
+			// EPIPE: the command closed its stdin. Closed or past the
+			// deadline: the main process exited (endStdin).
+			e.stdinQ.close()
+			if !errors.Is(err, unix.EPIPE) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrDeadlineExceeded) {
+				e.log.Debug("execsvc: write stdin", "err", err)
+			}
+			return
 		}
 	}
 }
@@ -334,10 +371,6 @@ func (e *execution) writeStdin(data []byte) {
 // terminal's EOF character instead, which ends input for a program
 // reading in canonical mode at the start of a line.
 func (e *execution) closeStdin() {
-	if e.stdinDone {
-		return
-	}
-	e.stdinDone = true
 	if e.pty {
 		_, _ = e.stdin.Write([]byte{eofChar(e.stdin)})
 		return
@@ -347,8 +380,9 @@ func (e *execution) closeStdin() {
 
 // endStdin stops stdin forwarding when the main process exited: nothing
 // the client sends later is meant for background children, and a write
-// blocked on a full pipe or pty must not hold the reader forever.
+// blocked on a full pipe or pty must not keep stdinLoop forever.
 func (e *execution) endStdin() {
+	e.stdinQ.close()
 	if e.pty {
 		_ = e.stdin.SetWriteDeadline(time.Now())
 		return
@@ -367,6 +401,18 @@ func (e *execution) killLocked(sig unix.Signal) {
 	}
 }
 
+// terminate asks a running command to stop with SIGTERM to its process
+// group; an execution whose command has not started is aborted.
+func (e *execution) terminate() {
+	e.mu.Lock()
+	started := e.pgid != 0
+	e.killLocked(unix.SIGTERM)
+	e.mu.Unlock()
+	if !started {
+		e.abort()
+	}
+}
+
 // abort ends the execution early: the stream failed or was closed by the
 // client, the context was cancelled, or the service is closing. A running
 // command is killed; after its exit only the output pipes are closed.
@@ -381,6 +427,8 @@ func (e *execution) abort() {
 	pumps := e.pumps
 	e.mu.Unlock()
 
+	// readLoop may wait for room in the queue.
+	e.stdinQ.close()
 	for _, p := range pumps {
 		p.close()
 	}

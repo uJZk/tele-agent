@@ -75,8 +75,25 @@ type Command struct {
 	// input; output to a nil Stdout or Stderr is discarded. The files are
 	// borrowed: the caller closes them after Done.
 	Stdin, Stdout, Stderr *os.File
-	// Scratch holds files to write into the scratch areas first.
+	// Scratch holds files to write into the scratch areas first; the
+	// server has written them once Started is closed. Their encoded size
+	// must stay within ScratchBudget.
 	Scratch []proto.ScratchFile
+}
+
+// scratchFieldMax bounds what the Scratch field adds to an ExecStart
+// besides the files themselves: its key and the array header.
+const scratchFieldMax = 16
+
+// ScratchBudget returns how many bytes of encoded scratch files fit into
+// the ExecStart of cmd next to its argv, directory and environment
+// (scratch.Mapper.Uploads takes it as its budget).
+func ScratchBudget(cmd Command) int {
+	b, err := proto.Marshal(&proto.ExecStart{Argv: cmd.Argv, Dir: cmd.Dir, Env: cmd.Env, TTY: cmd.TTY})
+	if err != nil {
+		return 0
+	}
+	return max(0, proto.MaxDataFrame-len(b)-scratchFieldMax)
 }
 
 // Result is how a remote command ended.
@@ -104,6 +121,15 @@ type Process struct {
 
 	stopStdin *wakeFD // signalled when the command exited or was abandoned
 	stopOut   *wakeFD // signalled when the command was abandoned
+
+	// Frames for sendLoop, which writes every frame. Control frames go
+	// first, so that a signal waits for at most the stdin frame being
+	// written, never for the input behind it.
+	control chan sendRequest
+	input   chan sendRequest
+
+	started    chan struct{} // closed by readLoop on ExecStarted
+	sawStarted bool          // owned by readLoop
 
 	exitOnce sync.Once
 	exited   chan struct{}     // closed by setExit
@@ -155,6 +181,9 @@ func (c *Client) Start(ctx context.Context, cmd Command) (*Process, error) {
 		stderr:     sink{f: cmd.Stderr},
 		stopStdin:  stopStdin,
 		stopOut:    stopOut,
+		control:    make(chan sendRequest),
+		input:      make(chan sendRequest),
+		started:    make(chan struct{}),
 		exited:     make(chan struct{}),
 		abandon:    make(chan struct{}),
 		readerDone: make(chan struct{}),
@@ -162,6 +191,7 @@ func (c *Client) Start(ctx context.Context, cmd Command) (*Process, error) {
 	}
 	var wg sync.WaitGroup
 	wg.Go(p.readLoop)
+	wg.Go(p.sendLoop)
 	wg.Go(p.stdinLoop)
 	wg.Go(p.abandonLoop)
 	go func() {
@@ -198,26 +228,34 @@ func (c *Client) startStream(ctx context.Context, cmd *Command) (net.Conn, error
 	return raw, nil
 }
 
-// Signal delivers sig to the command's process group.
-func (p *Process) Signal(sig int) error {
+// Signal delivers sig to the command's process group. It returns once the
+// request was written to the stream, or when ctx is done; a request that
+// was being written when ctx ended may still arrive.
+//
+// Signals travel behind stdin data. The server queues a large amount of
+// stdin for a command that does not read it, but beyond that a signal
+// waits until the command reads its input or exits (see
+// internal/execsvc).
+func (p *Process) Signal(ctx context.Context, sig int) error {
 	if sig < 1 || sig > maxSignal {
 		return fmt.Errorf("rexec: invalid signal %d", sig)
 	}
 	if err := p.checkRunning(); err != nil {
 		return err
 	}
-	if err := p.conn.Send(&proto.ExecFrame{Op: proto.ExecSignal, Signal: sig}); err != nil {
+	if err := p.send(ctx, p.control, &proto.ExecFrame{Op: proto.ExecSignal, Signal: sig}); err != nil {
 		return fmt.Errorf("rexec: send signal: %w", err)
 	}
 	return nil
 }
 
-// Resize changes the size of the command's pseudo-terminal.
-func (p *Process) Resize(size proto.TTYSize) error {
+// Resize changes the size of the command's pseudo-terminal. It waits like
+// Signal.
+func (p *Process) Resize(ctx context.Context, size proto.TTYSize) error {
 	if err := p.checkRunning(); err != nil {
 		return err
 	}
-	if err := p.conn.Send(&proto.ExecFrame{Op: proto.ExecResize, TTY: &size}); err != nil {
+	if err := p.send(ctx, p.control, &proto.ExecFrame{Op: proto.ExecResize, TTY: &size}); err != nil {
 		return fmt.Errorf("rexec: send resize: %w", err)
 	}
 	return nil
@@ -260,6 +298,13 @@ func (p *Process) Wait(ctx context.Context) (Result, error) {
 		}
 	}
 	return Result{Code: st.Code, Signal: st.Signal, Scratch: st.Scratch, StartErr: st.Err}, nil
+}
+
+// Started is closed when the server reports that the command started,
+// which it does after writing Command.Scratch. It stays open for a command
+// that failed to start (see Result.StartErr).
+func (p *Process) Started() <-chan struct{} {
+	return p.started
 }
 
 // Done is closed when the stream has ended and all output was written, or

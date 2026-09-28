@@ -246,17 +246,17 @@ func TestSignal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Signal(0); err == nil {
+	if err := p.Signal(t.Context(), 0); err == nil {
 		t.Fatal("Signal(0) accepted")
 	}
-	if err := p.Signal(int(unix.SIGTERM)); err != nil {
+	if err := p.Signal(t.Context(), int(unix.SIGTERM)); err != nil {
 		t.Fatal(err)
 	}
 	res, err := p.Wait(t.Context())
 	if err != nil || res.Signal != int(unix.SIGTERM) {
 		t.Fatalf("Wait = %+v, %v; want signal 15", res, err)
 	}
-	if err := p.Signal(int(unix.SIGTERM)); !errors.Is(err, ErrFinished) {
+	if err := p.Signal(t.Context(), int(unix.SIGTERM)); !errors.Is(err, ErrFinished) {
 		t.Fatalf("Signal after exit = %v, want ErrFinished", err)
 	}
 	waitDone(t, p)
@@ -510,7 +510,7 @@ func TestAbandonKillsProcessGroup(t *testing.T) {
 	if _, err := p.Wait(t.Context()); !errors.Is(err, ErrAbandoned) {
 		t.Fatalf("Wait after Abandon = %v, want ErrAbandoned", err)
 	}
-	if err := p.Signal(int(unix.SIGTERM)); !errors.Is(err, ErrAbandoned) {
+	if err := p.Signal(t.Context(), int(unix.SIGTERM)); !errors.Is(err, ErrAbandoned) {
 		t.Fatalf("Signal after Abandon = %v, want ErrAbandoned", err)
 	}
 	for _, pid := range pids {
@@ -601,7 +601,7 @@ func TestPTY(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Resize(proto.TTYSize{Rows: 56, Cols: 78}); err != nil {
+	if err := p.Resize(t.Context(), proto.TTYSize{Rows: 56, Cols: 78}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := feed.WriteString("go\n"); err != nil {
@@ -636,15 +636,18 @@ func TestScratchRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(local, "old"), []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	uploads, err := m.Uploads()
-	if err != nil {
-		t.Fatal(err)
-	}
 	// The files reach the target with the first command.
-	r := runCmd(t, e, Command{Argv: []string{"true"}, Scratch: uploads})
+	cmd := Command{Argv: []string{"true"}, Dir: "/"}
+	up := m.Uploads(ScratchBudget(cmd))
+	if len(up.Files) != 2 {
+		t.Fatalf("uploads = %+v", up.Files)
+	}
+	cmd.Scratch = up.Files
+	r := runCmd(t, e, cmd)
 	if r.res.Code != 0 || len(r.res.Scratch) != 0 {
 		t.Fatalf("first command: %+v", r.res)
 	}
+	up.Commit()
 
 	script := m.Rewrite(`cat /.tele/0123456789abcdef/tmp/in && pwd -P >| /.tele/0123456789abcdef/tmp/cwd && rm /.tele/0123456789abcdef/tmp/old`)
 	r = runCmd(t, e, Command{Argv: sh(script), Dir: "/tmp"})
@@ -660,8 +663,10 @@ func TestScratchRoundTrip(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(local, "old")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("file deleted remotely still exists locally: %v", err)
 	}
-	if files, err := m.Uploads(); err != nil || len(files) != 0 {
-		t.Fatalf("Uploads after Apply = %+v, %v", files, err)
+	up = m.Uploads(proto.MaxDataFrame)
+	defer up.Rollback()
+	if len(up.Files) != 0 {
+		t.Fatalf("Uploads after Apply = %+v", up.Files)
 	}
 }
 

@@ -73,6 +73,7 @@ func newHarness(t *testing.T, adjust func(*Config)) *harness {
 	if adjust != nil {
 		adjust(&cfg)
 	}
+	h.scratch = cfg.ScratchDir
 	h.svc, err = New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -594,11 +595,12 @@ func TestScratch(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmp, "old-upload")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("deleted upload still exists: %v", err)
 	}
+	// Removals come first; uploads the command left alone are not echoed.
 	want := []proto.ScratchFile{
+		{Area: proto.ScratchTmp, Path: "gone", Deleted: true},
 		{Area: proto.ScratchTmp, Path: "d/n", Mode: 0o750, Data: []byte("nested\n")},
 		{Area: proto.ScratchTmp, Path: "out", Mode: 0o644, Data: []byte("out\n")},
 		{Area: proto.ScratchSessionEnv, Path: "e", Mode: 0o644, Data: []byte("env\n")},
-		{Area: proto.ScratchTmp, Path: "gone", Deleted: true},
 	}
 	// Files written by the shell get the umask's mode; compare the rest.
 	for i := range o.exit.Scratch {
@@ -687,4 +689,46 @@ func TestPTYResizeAndEOF(t *testing.T) {
 	if !strings.Contains(out, "40 120\r\n") || !strings.HasSuffix(out, "line\r\ndone\r\n") {
 		t.Fatalf("pty output %q", out)
 	}
+}
+
+func TestTerminateGraceful(t *testing.T) {
+	h := newHarness(t, nil)
+	s := h.start(t, &proto.ExecStart{Argv: sh(`trap 'echo term; exit 7' TERM; echo ready; while :; do sleep 1; done`)})
+	o := &outcome{}
+	for !strings.Contains(o.stdout.String(), "ready\n") {
+		if !s.next(o) {
+			t.Fatal("stream ended early")
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- h.svc.Terminate(testTimeout) }()
+	for s.next(o) {
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// The command handled SIGTERM, and its exit status still reached the
+	// client.
+	if o.exit == nil || o.exit.Code != 7 || o.stdout.String() != "ready\nterm\n" {
+		t.Fatalf("exit %+v, stdout %q", o.exit, o.stdout.String())
+	}
+	if err := h.svc.Serve(context.Background(), nopConn{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Serve after Terminate = %v, want ErrClosed", err)
+	}
+}
+
+func TestTerminateKillsAfterGrace(t *testing.T) {
+	h := newHarness(t, nil)
+	// sleep inherits the ignored SIGTERM.
+	s := h.start(t, &proto.ExecStart{Argv: sh(`trap '' TERM; echo ready; sleep 1000`)})
+	o := &outcome{}
+	for !strings.Contains(o.stdout.String(), "ready\n") {
+		if !s.next(o) {
+			t.Fatal("stream ended early")
+		}
+	}
+	if err := h.svc.Terminate(10 * time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, o.pid)
 }
