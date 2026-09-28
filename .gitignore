@@ -1,0 +1,4 @@
+/bin/
+/internal/teleswitch/lib/*.so
+*.test
+*.out

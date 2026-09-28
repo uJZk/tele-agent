@@ -1,0 +1,166 @@
+package proto
+
+// FSOp identifies an FSRequest. The operations mirror FUSE operations; paths
+// are absolute paths on the target host (docs/telefs.md section 2).
+type FSOp uint8
+
+// File system operations. "Path" and "Name" below refer to FSRequest fields.
+const (
+	// FSLookup: Name in directory Path → Attr.
+	FSLookup FSOp = 1
+	// FSGetattr: Path → Attr.
+	FSGetattr FSOp = 2
+	// FSSetattr: Path (and Handle if set) with SetAttr → Attr.
+	FSSetattr FSOp = 3
+	// FSOpendir: Path → Handle.
+	FSOpendir FSOp = 4
+	// FSReaddir: Handle from Offset, at most Size entries → Entries, EOF.
+	FSReaddir FSOp = 5
+	// FSReleasedir: Handle.
+	FSReleasedir FSOp = 6
+	// FSOpen: Path with Flags → Handle.
+	FSOpen FSOp = 7
+	// FSCreate: Name in directory Path with Flags, Mode → Handle, Attr.
+	FSCreate FSOp = 8
+	// FSRead: Handle at Offset, Size bytes → Data.
+	FSRead FSOp = 9
+	// FSWrite: Data to Handle at Offset → Written.
+	FSWrite FSOp = 10
+	// FSFsync: Handle; Flags&1 requests fdatasync.
+	FSFsync FSOp = 11
+	// FSRelease: Handle.
+	FSRelease FSOp = 12
+	// FSMkdir: Name in directory Path with Mode → Attr.
+	FSMkdir FSOp = 13
+	// FSMknod: Name in directory Path with Mode, Rdev → Attr.
+	FSMknod FSOp = 14
+	// FSUnlink: Name in directory Path.
+	FSUnlink FSOp = 15
+	// FSRmdir: Name in directory Path.
+	FSRmdir FSOp = 16
+	// FSRename: Name in Path → Name2 in Path2, with renameat2 Flags.
+	FSRename FSOp = 17
+	// FSSymlink: Name in directory Path pointing to Target → Attr.
+	FSSymlink FSOp = 18
+	// FSLink: existing Path → Name2 in directory Path2 → Attr.
+	FSLink FSOp = 19
+	// FSReadlink: Path → Target.
+	FSReadlink FSOp = 20
+	// FSStatfs: Path → Statfs.
+	FSStatfs FSOp = 21
+	// FSAccess: Path with Mask (access(2) mode) checked as the target user.
+	FSAccess FSOp = 22
+	// FSGetxattr: attribute Name2 of Path; Size 0 asks for the size only
+	// → Data or Size.
+	FSGetxattr FSOp = 23
+	// FSListxattr: Path; Size 0 asks for the size only → Data or Size.
+	FSListxattr FSOp = 24
+	// FSSetxattr: attribute Name2 of Path to Data with Flags.
+	FSSetxattr FSOp = 25
+	// FSRemovexattr: attribute Name2 of Path.
+	FSRemovexattr FSOp = 26
+	// FSForget: the client dropped directory Path from its cache; the
+	// server stops watching it. No response is expected.
+	FSForget FSOp = 27
+)
+
+// FSRequest is the only client frame on an FS stream.
+type FSRequest struct {
+	Op      FSOp     `cbor:"1,keyasint"`
+	Path    string   `cbor:"2,keyasint,omitempty"`
+	Name    string   `cbor:"3,keyasint,omitempty"`
+	Path2   string   `cbor:"4,keyasint,omitempty"`
+	Name2   string   `cbor:"5,keyasint,omitempty"`
+	Handle  uint64   `cbor:"6,keyasint,omitempty"`
+	Offset  int64    `cbor:"7,keyasint,omitempty"`
+	Size    uint32   `cbor:"8,keyasint,omitempty"`
+	Data    []byte   `cbor:"9,keyasint,omitempty"`
+	Flags   uint32   `cbor:"10,keyasint,omitempty"`
+	Mode    uint32   `cbor:"11,keyasint,omitempty"`
+	Rdev    uint64   `cbor:"12,keyasint,omitempty"`
+	SetAttr *SetAttr `cbor:"13,keyasint,omitempty"`
+	Target  string   `cbor:"14,keyasint,omitempty"`
+	Mask    uint32   `cbor:"15,keyasint,omitempty"`
+}
+
+// FSResponse is the only server frame on an FS stream. Errno is the remote
+// errno, returned unchanged to the kernel (docs/coding-standards.md
+// section 4).
+type FSResponse struct {
+	Errno   uint32     `cbor:"1,keyasint,omitempty"`
+	Attr    *Attr      `cbor:"2,keyasint,omitempty"`
+	Entries []DirEntry `cbor:"3,keyasint,omitempty"`
+	EOF     bool       `cbor:"4,keyasint,omitempty"`
+	Data    []byte     `cbor:"5,keyasint,omitempty"`
+	Handle  uint64     `cbor:"6,keyasint,omitempty"`
+	Written uint32     `cbor:"7,keyasint,omitempty"`
+	Size    uint32     `cbor:"8,keyasint,omitempty"`
+	Statfs  *Statfs    `cbor:"9,keyasint,omitempty"`
+	Target  string     `cbor:"10,keyasint,omitempty"`
+}
+
+// Attr is the result of lstat on the target host. Owners are the raw remote
+// IDs; the client decides how to present them.
+type Attr struct {
+	Dev     uint64 `cbor:"1,keyasint"`
+	Ino     uint64 `cbor:"2,keyasint"`
+	Mode    uint32 `cbor:"3,keyasint"`
+	Nlink   uint32 `cbor:"4,keyasint,omitempty"`
+	UID     uint32 `cbor:"5,keyasint,omitempty"`
+	GID     uint32 `cbor:"6,keyasint,omitempty"`
+	Rdev    uint64 `cbor:"7,keyasint,omitempty"`
+	Size    int64  `cbor:"8,keyasint,omitempty"`
+	Blocks  int64  `cbor:"9,keyasint,omitempty"`
+	Blksize int32  `cbor:"10,keyasint,omitempty"`
+	// Times are nanoseconds since the Unix epoch.
+	Atime int64 `cbor:"11,keyasint,omitempty"`
+	Mtime int64 `cbor:"12,keyasint,omitempty"`
+	Ctime int64 `cbor:"13,keyasint,omitempty"`
+}
+
+// SetAttr bits select which SetAttr fields apply.
+const (
+	SetMode     = 1 << 0
+	SetUID      = 1 << 1
+	SetGID      = 1 << 2
+	SetSize     = 1 << 3
+	SetAtime    = 1 << 4
+	SetMtime    = 1 << 5
+	SetAtimeNow = 1 << 6
+	SetMtimeNow = 1 << 7
+)
+
+// SetAttr describes a setattr request.
+type SetAttr struct {
+	Valid uint32 `cbor:"1,keyasint"`
+	Mode  uint32 `cbor:"2,keyasint,omitempty"`
+	UID   uint32 `cbor:"3,keyasint,omitempty"`
+	GID   uint32 `cbor:"4,keyasint,omitempty"`
+	Size  int64  `cbor:"5,keyasint,omitempty"`
+	// Times are nanoseconds since the Unix epoch.
+	Atime int64 `cbor:"6,keyasint,omitempty"`
+	Mtime int64 `cbor:"7,keyasint,omitempty"`
+}
+
+// DirEntry is one directory entry with its attributes (readdirplus).
+// Offset is the value to pass in the next FSReaddir to continue after it.
+type DirEntry struct {
+	Name   string `cbor:"1,keyasint"`
+	Attr   Attr   `cbor:"2,keyasint"`
+	Offset int64  `cbor:"3,keyasint"`
+}
+
+// Statfs is the result of statfs on the target host.
+type Statfs struct {
+	Blocks  uint64 `cbor:"1,keyasint"`
+	Bfree   uint64 `cbor:"2,keyasint"`
+	Bavail  uint64 `cbor:"3,keyasint"`
+	Files   uint64 `cbor:"4,keyasint"`
+	Ffree   uint64 `cbor:"5,keyasint"`
+	Bsize   uint32 `cbor:"6,keyasint"`
+	Namelen uint32 `cbor:"7,keyasint"`
+	Frsize  uint32 `cbor:"8,keyasint"`
+}
+
+// MaxIO bounds the Size of one FSRead and the Data of one FSWrite.
+const MaxIO = 1 << 20
