@@ -197,6 +197,29 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 - 属性缓存导致读到旧数据，而且服务端无法主动通知客户端失效；
 - 内核 NFS 客户端只能跑在内核 WG 上，所以 WG 也被迫要 root。
 
+### 5A.0 既然命令都转发了，还需要挂载文件系统吗？
+
+**需要，但只是为了 Claude Code 进程自己用。** 命令类操作（Bash、hooks、stdio MCP、`rg`）确实都转发到了远端，但 Claude Code 还有一大块功能是在**本地进程内**直接调用 fs，而不是启动命令：
+
+| 进程内的文件访问 | 没有挂载时的后果 |
+|---|---|
+| Read / Write / Edit / NotebookEdit 工具（bun 的 fs 调用） | 直接读写的是本地磁盘，看不到远端文件 |
+| 启动时加载项目里的 `CLAUDE.md`、`.claude/settings*.json`、`.mcp.json`、`.claude/{skills,commands,agents}` | 项目配置、hooks 定义、技能全部丢失 |
+| Bash 的 spawn `cwd` 参数，以及执行后读取 cwd 文件、检查目录是否存在（「Shell cwd was reset to …」逻辑） | 本地不存在该目录 → spawn 报 ENOENT，或者 cwd 被重置回项目根 |
+| 编辑前必须先读、文件是否被外部修改（基于 mtime） | 无法判断，Edit 被拒绝或误判 |
+| checkpoint / `/rewind`（回滚文件） | 回滚的是本地文件，远端不受影响 |
+| `@` 文件引用与补全、图片/PDF 读取、git 状态上下文 | 失效或错误 |
+
+**不挂载也不是完全做不到**（即 5A.1 的方案 C）：
+
+- 用 `--disallowedTools Read,Write,Edit,NotebookEdit,Glob,Grep` 禁掉内置文件工具，改由 `tele-agent` MCP 提供远程版本；
+- 启动时从远端拉取 CLAUDE.md、settings 和 `.mcp.json`，通过 `--append-system-prompt`、`--settings`、`--mcp-config` 注入；
+- 在本地 userns 里用 tmpfs 建一个**只有目录骨架**的同路径树，满足 spawn cwd 的要求；每次命令结束后，shim 按远端的 pwd 补建目录。
+
+代价是失去「透明」：编辑安全检查、diff 展示、rewind、`@` 引用、图片读取、权限规则里的路径匹配都会失效；模型也要改用非原生的工具名。因此它只适合作为**降级模式**（例如 FUSE 不可用的环境），不作为默认方案。
+
+**折中**：telefs 只承担 Claude 进程自身的文件访问，重负载（搜索、构建、测试、git）都在远端直接执行，所以它的访问量和性能要求都很低，主要是 Read/Edit 单个文件和启动时加载配置。
+
 ### 5A.1 候选对比
 
 | 方案 | 透明度 | 权限需求 | 一致性 | 工作量 | 结论 |
