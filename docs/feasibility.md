@@ -18,7 +18,7 @@
 | Read/Write/Edit/Glob/Grep | ✅ 高 | 同路径挂载（推荐 telefs，见 5A；或 NFS）；`USE_BUILTIN_RIPGREP=0` + 远程 `rg` shim | 缓存一致性（telefs 用 exec 屏障 + 失效推送解决） |
 | 本地 MCP `tele-agent`（列出/切换主机、安装说明） | ✅ 高 | Go 写的 stdio MCP server，由启动器注入 | 热切换的边界情况 |
 | WireGuard | ✅ 高 | 内核 WG + `wgctrl`（没有内核模块时退回 wireguard-go） | 需要 root |
-| swgp-go（可关） | ✅ 高 | **以子进程方式**运行（AGPL-3.0 许可证） | 许可证；`-2026` 模式需要时钟同步 |
+| swgp-go（可关） | ✅ 高 | 本项目已改为 AGPL-3.0，可**直接作为库嵌入**（仅在保留 WG 后端时需要） | `-2026` 模式需要时钟同步 |
 | fake-TCP 层（可关，自愈；替代 Phantun） | ✅ 高 | 只用 Musixal/tcpraw（MIT，纯 Go），作为库嵌入 teled/tele-server；只需 CAP_NET_RAW，无需 TUN/NAT；本机实测可用 | 单人维护（vendor 并固定 commit）；需修补 iptables 规则残留问题 |
 | 文件层 | ✅ 高 | **推荐 telefs**（FUSE + tele 自有通道，本地和远端都不需要 root，已实测 userns 挂载）；备选 NFSv4.2 | telefs 需要自研（3–4 周）；NFS 需要 root，且缓存一致性弱 |
 | Go 语言、仅 Linux | ✅ 高 | 整个生态都有成熟 Go 库 | — |
@@ -292,7 +292,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 ### 6.3 swgp-go（可关）
 
 - v1.10.0，纯 Go，`service.Config` / `Manager` 是**导出的 API**，技术上可以直接嵌入。
-- ⚠️ **许可证是 AGPL-3.0**，而本仓库是 MIT。**不要**把它编译进 tele 的二进制。应当作为**独立子进程**分发和托管（聚合分发，不构成衍生作品），由 teled / tele-server 生成 JSON 配置并监管进程。另一种选择是在安装时从上游 release 下载，并固定 sha256 校验。
+- ~~许可证冲突~~：本项目已改为 **AGPL-3.0**，swgp-go 的 `service` 包可以直接编译进 tele。（下面是旧版分析，保留作参考）应当作为**独立子进程**分发和托管（聚合分发，不构成衍生作品），由 teled / tele-server 生成 JSON 配置并监管进程。另一种选择是在安装时从上游 release 下载，并固定 sha256 校验。
 - ⚠️ 上游要求 **go ≥ 1.26**（本环境是 1.24.7）。这只影响我们自己构建它的情况。
 - 模式：默认用 `zero-overhead-2026`，数据包零开销、**不影响 MTU**；可选 `paranoid-2026`（全包 AEAD 并填充到 MTU，会略微降低 MTU、增加带宽）。**`-2026` 模式带重放保护，要求两端时钟同步**，所以 tele-server 安装时要检查 NTP，teled 健康检查要报告时钟偏差；时钟不可控时回退到旧版 `zero-overhead`。
 
@@ -387,10 +387,10 @@ WG（三层隧道）之所以必要，是因为**内核 NFS 客户端**需要一
 |---|---|---|---|---|
 | [Jigsaw-Code/outline-sdk](https://github.com/Jigsaw-Code/outline-sdk) + [outline-ss-server](https://github.com/Jigsaw-Code/outline-ss-server) | v0.0.23 / v1.9.2 | **Apache-2.0** | 否（只支持 AEAD：chacha20-ietf-poly1305 / aes-gcm） | Outline VPN 的生产实现；自带 salt 重放过滤和抗主动探测；客户端支持连接前缀伪装 |
 | shadowsocks/go-shadowsocks2 | v0.1.5 | Apache-2.0 | 否 | 较旧，维护少 |
-| sagernet/sing-shadowsocks | v0.2.9 | **GPL-3.0** | 是 | 不能嵌入 MIT 项目 |
-| database64128/shadowsocks-go | v1.15.0 | **AGPL-3.0** | 是 | 同上 |
+| sagernet/sing-shadowsocks | v0.2.9 | **GPL-3.0** | 是 | GPL-3.0 与 AGPL-3.0 可以组合，但无必要 |
+| **database64128/shadowsocks-go** | v1.15.0 | **AGPL-3.0** | **是** | **已选定**。与 swgp-go 同一作者；`ss2022` 包可以直接当库用；要求 **Go ≥ 1.27** |
 
-**建议**：默认**嵌入 outline-sdk 与 outline-ss-server 的 AEAD 实现**（Apache-2.0，与 MIT 兼容）。如果需要 SS2022 更强的抗重放能力（带时间戳、固定长度头），可以**自行实现 SIP022**：规范公开，需要 BLAKE3 密钥派生加 AES-GCM，约 600–800 行代码。两端都是我们自己的程序，也可以直接在 SS 帧里固定目标地址，不做通用代理。
+**决策（2026-09-28）**：采用 **[database64128/shadowsocks-go](https://github.com/database64128/shadowsocks-go) 的 SS2022（`2022-blake3-aes-256-gcm`）**，**整个项目改为 AGPL-3.0**（仓库 `LICENSE` 已替换为 GNU 官方文本，与上游 LICENSE 的 md5 一致）。**已实测**：用 `ss2022.StreamClientConfig` 和 `StreamServerConfig.NewStreamServer().HandleStream` 在回环上完成加密往返，初始 payload 和双向数据都正确；目标地址字段可以固定为内部名称（例如 `tele.internal:1`），不做通用代理。SS2022 自带时间戳和 salt 重放过滤，因此**要求两端时钟同步**（误差 ≤ 30 秒），install 时需要检查 NTP。
 
 **风险提示**：「全随机字节流」本身在部分审查环境中会被识别（USENIX Security 2023《How the Great Firewall of China Detects and Blocks Fully Encrypted Traffic》）。对策是用 Outline 的前缀伪装功能，或者在外面再套一层 TLS 伪装，作为可选层。如果使用环境没有这类审查，可以忽略。
 
@@ -441,6 +441,27 @@ exec / telefs / 端口转发 / 失效推送
 - **重连可以覆盖所有「连接层」故障**：断网、换 IP、NAT 超时、服务端短暂不可达都能续传，业务无感，体验比 WG 方案更可控。**进程层**故障（tele-server 重启、主机重启）只能部分恢复，需要在文档中说明。
 - **工作量**：会话层 2 周，SS 集成 0.5 周（嵌入 Outline）或 1.5 周（自实现 SIP022），另加断网注入测试：用 `tc netem` 模拟丢包，`iptables` 模拟断流，netns 模拟切换 IP，toxiproxy 做故障注入。
 - **取舍**：TCP 在丢包严重的链路上表现不如 UDP 方案（队头阻塞），通过多条连接分担来缓解。如果将来必须走 UDP，会话层保持不变，只需要把下层换成 QUIC（quic-go）。
+
+### 6B.5 客户端单二进制（已实测）
+
+**可以，而且是自然结果**。去掉 NFS 和 WG 以后，本地不再需要 root 守护进程 `teled`：连接、会话层、FUSE 服务都在 `tele claude` 启动器进程内运行。本地只剩一个静态二进制 `tele`，所有角色用 multi-call（按 `argv[0]` 或子命令）分派：
+
+| 角色 | 调用方式 | 说明 |
+|---|---|---|
+| CLI（`tele host add/ls`、`tele status`） | `tele …` | — |
+| 启动器 + 会话 userns 的第 2 阶段（挂载 FUSE、持有 SS 连接和会话层） | `tele claude …`，内部通过 `/proc/self/exe` 再次 exec 自己 | 是 claude 的父进程；shim 通过 unix socket 与它通信 |
+| Bash shim | 符号链接 `<会话目录>/bin/bash → tele` | `CLAUDE_CODE_SHELL` 的路径**必须包含 "bash"** |
+| hooks / MCP 前缀 | 符号链接 `<会话目录>/bin/tele-exec → tele` | 不能用 `"tele --exec"` 这种带参数的写法：stdio MCP 会把整个 PREFIX 当作可执行文件名去 spawn（见 3.2 节的代码） |
+| `rg`（以及可选的 `git`）shim | 符号链接 `<会话目录>/bin/rg → tele` | 要靠 PATH 查找到，所以文件名必须是 `rg` |
+| `tele-agent` MCP server | `tele mcp`，写在 `--mcp-config` 里 | — |
+
+符号链接由 `tele claude` 在**运行时**建在会话临时目录里，所以对外分发的仍然只有一个文件。
+
+**实测**（Go 1.27.0，`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`）：把 shadowsocks-go 的 SS2022 客户端和服务端、go-fuse v2.11.0、zap 一起链接进去，得到**静态链接、stripped 的 ELF，大小 4.5 MB**。通过符号链接以 `bash` 为名调用时，能正确分派到 shim。完整功能（会话层、MCP SDK、CLI）加上之后，预计 10–15 MB。
+
+**远端**同样可以是这一个二进制（`tele server …` 子命令），这样发布物只有一个文件。`install_guide` 也就简化为「下载同一个文件，然后执行 `tele server install --pair …`」。
+
+**唯一的外部运行时依赖**：`/dev/fuse` 可访问（常规发行版默认 0666），并且允许非特权 user namespace（Ubuntu 需要随包附带 AppArmor profile，见第 4 节）。
 
 ## 7. 本地 MCP：`tele-agent`
 
@@ -494,7 +515,7 @@ tele host confirm myhost 'tele1r:....'
 | R3 | NFS 属性缓存造成读到旧数据或 mtime 误判 | 中 | `actimeo=1`、`lookupcache=positive`、命令结束后定向失效；提供 `noac` 严格模式 |
 | R4 | 需要 root（WG、raw socket、iptables、NFS 挂载） | 中 | 特权集中在 `teled` / `tele-server` 两个 systemd 服务；日常使用的 `tele` 不需要 root |
 | R5 | 非特权 userns 被 AppArmor 或 sysctl 限制 | 中 | 随包提供 AppArmor profile；退化为 teled 代理 pty 模式 |
-| R6 | swgp-go 是 AGPL-3.0 | 中 | 子进程方式分发、不链接；或让用户自行安装 |
+| R6 | 整体采用 AGPL-3.0：分发二进制必须提供源码；若把 tele-server 作为网络服务提供给他人使用，也需要向这些用户提供源码 | 低 | 本项目开源，遵守即可；依赖的 BSD、Apache-2.0、MPL-2.0 许可均与 AGPL-3.0 兼容 |
 | R7 | fake-TCP 依赖单人维护的 Musixal/tcpraw；TTL 规则残留，或与 docker/firewalld 冲突；中间设备导致流卡死 | 中 | vendor 并固定 commit，自行维护补丁；使用专用 iptables 链，启动时清理残留；自愈时换源端口重拨、轮换端口 |
 | R8 | exec 服务本质上是远程代码执行入口 | 高（安全） | 只监听 WG 地址并校验对端 IP；WG 私钥 0600 保存；可选 token；systemd 加固（以目标用户身份执行，不以 root 执行命令） |
 | R9 | Claude Code 的 bubblewrap 沙箱会在本地包一层，与 shim 冲突 | 低 | tele 模式下提示关闭沙箱；以后可在远端复现沙箱 |
@@ -547,7 +568,8 @@ TELE_SESSION=<sid>                                   # shim 用它找到 teled �
 
 1. 热切换和冷切换哪个优先？（建议先做冷切换）
 2. fake-TCP 层已定为 Musixal/tcpraw。是否要保留「降级到纯 UDP」的开关（默认关闭）？
-3. swgp-go 是否接受以独立子进程方式分发（AGPL 合规）？
+3. ~~swgp-go 是否接受以独立子进程方式分发~~：已改为 AGPL-3.0，可以直接嵌入（仅在保留 WG 后端时相关）。
 4. 一个会话是否需要同时挂载多台主机的不同路径（例如 A 的 `/srv/a` 和 B 的 `/srv/b` 同时可见），还是永远只有一台活跃主机？
-5. 文件层用 telefs（推荐，FUSE + 自有通道）还是保留 NFS？选 telefs 后，本地 WG 会改为 wireguard-go + netstack，全链路基本免 root。
-6. 传输层是否改为「SS（TCP）+ 可恢复会话层」，替代 WG + swgp + fake-TCP？（配合 telefs 时推荐；原 WG 链路可以保留为可选后端）
+5. ~~文件层用 telefs 还是 NFS~~ → **已定：telefs**（SS 传输层没有 IP 网络，无法承载 NFS）。
+6. ~~传输层~~ → **已定：shadowsocks-go SS2022（TCP）+ 可恢复会话层**；项目许可证改为 AGPL-3.0。待定：WG + swgp + fake-TCP 链路是否保留为可选后端（建议不保留，以降低维护面）。
+7. 客户端形态 → **单一静态二进制 `tele`**（multi-call，运行时创建符号链接），远端使用同一个二进制（见 6B.5）。
