@@ -367,6 +367,81 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 ---
 
+## 6B. 替代传输：Shadowsocks + 可恢复会话层（配合 telefs 时推荐）
+
+### 6B.1 为什么可以省掉整条 WG 链路
+
+WG（三层隧道）之所以必要，是因为**内核 NFS 客户端**需要一个 IP 网络。改用 telefs 之后，tele 的所有流量都是**自己进程发出的**：exec RPC、telefs RPC、端口转发，全部是应用层的字节流。这时一个加密的四层流就够了，不再需要三层隧道：
+
+| 旧链路 | 作用 | 换成 SS 之后 |
+|---|---|---|
+| WireGuard | 加密 + 提供 IP 网络 | SS AEAD 提供加密；不需要 IP 网络 |
+| swgp-go | 混淆 WG 特征 | SS 流本身就是全随机字节，没有可识别的握手特征 |
+| fake-TCP（tcpraw） | UDP 被封时把 WG 伪装成 TCP | SS 直接跑**真 TCP**，不存在 UDP 被封的问题 |
+
+**连带收益**：两端都**不需要任何特权**（不需要 TUN、raw socket、iptables 或 CAP_NET_RAW）；不需要 MTU 计算；去掉了 AGPL 的 swgp 子进程；也少了单人维护的 tcpraw 依赖。本地只剩「userns + FUSE」这一个内核依赖。
+
+### 6B.2 Shadowsocks 实现选型（已核实许可证）
+
+| 库 | 版本 | 许可证 | SS2022（SIP022） | 说明 |
+|---|---|---|---|---|
+| [Jigsaw-Code/outline-sdk](https://github.com/Jigsaw-Code/outline-sdk) + [outline-ss-server](https://github.com/Jigsaw-Code/outline-ss-server) | v0.0.23 / v1.9.2 | **Apache-2.0** | 否（只支持 AEAD：chacha20-ietf-poly1305 / aes-gcm） | Outline VPN 的生产实现；自带 salt 重放过滤和抗主动探测；客户端支持连接前缀伪装 |
+| shadowsocks/go-shadowsocks2 | v0.1.5 | Apache-2.0 | 否 | 较旧，维护少 |
+| sagernet/sing-shadowsocks | v0.2.9 | **GPL-3.0** | 是 | 不能嵌入 MIT 项目 |
+| database64128/shadowsocks-go | v1.15.0 | **AGPL-3.0** | 是 | 同上 |
+
+**建议**：默认**嵌入 outline-sdk 与 outline-ss-server 的 AEAD 实现**（Apache-2.0，与 MIT 兼容）。如果需要 SS2022 更强的抗重放能力（带时间戳、固定长度头），可以**自行实现 SIP022**：规范公开，需要 BLAKE3 密钥派生加 AES-GCM，约 600–800 行代码。两端都是我们自己的程序，也可以直接在 SS 帧里固定目标地址，不做通用代理。
+
+**风险提示**：「全随机字节流」本身在部分审查环境中会被识别（USENIX Security 2023《How the Great Firewall of China Detects and Blocks Fully Encrypted Traffic》）。对策是用 Outline 的前缀伪装功能，或者在外面再套一层 TLS 伪装，作为可选层。如果使用环境没有这类审查，可以忽略。
+
+### 6B.3 能否「所有方面」应对网络重连？——能，但必须自己做会话层
+
+WG 方案里，**短时**断网几乎自动恢复：WG 会漫游，隧道内的 TCP 靠内核重传撑过去。SS 方案里，底层 TCP 一断，里面**所有流立刻失效**。所以必须在 SS 之上、业务之下加一层**可恢复会话层**（思路同 mosh / Eternal Terminal / QUIC 连接迁移）。其实即使用 WG，**长时间**断网（超过内核 TCP 超时，约 15 分钟）也同样需要这一层，所以它无论如何都值得做。
+
+```
+exec / telefs / 端口转发 / 失效推送
+        │  多路复用流（yamux 或自定义帧）
+  ┌─────▼──────────────────────────┐
+  │ 可恢复会话层 (session id, 每方向 seq/ack, 重放缓冲)   │  ← 断线重拨后续传，上层无感
+  └─────┬──────────────────────────┘
+        │  SS AEAD 流（可多条 TCP 连接）
+       TCP
+```
+
+**会话层机制**：
+
+1. **会话身份**：首次连接时协商 `session_id` 和密钥。重连时，客户端带上 `session_id` 和「已收到的最大 seq」，服务端回复自己的已收 seq，双方从断点**重发未确认的帧**。上层流（包括 MCP 的长连接 stdio）完全无感。
+2. **快速断线检测**：应用层心跳每 5 秒一次，15 秒无响应即判定断开；同时监听本机 netlink 的地址和路由变化（Wi-Fi 切换、换 IP），**立即主动重拨**，不必等 TCP 超时。这比 WG 被动等待流量触发要快。
+3. **先建后断**：检测到链路质量下降时，先建立新连接，再迁移会话，然后关闭旧连接。
+4. **重拨策略**：指数退避加抖动；可以在多个端口或多个 endpoint 之间轮换；重新解析 DNS。
+5. **避免队头阻塞**：telefs 的元数据、大块数据、exec stdio 分别走**不同的 TCP 连接**（同属一个会话），避免一个大文件传输拖慢交互操作。
+
+**各业务在断线期间和重连后的语义**：
+
+| 业务 | 断线期间 | 重连后 | 超过租约时限（默认 30 分钟，可配置） |
+|---|---|---|---|
+| Bash / hooks（exec） | 远端进程**继续运行**，输出写入服务端的有界缓冲（超出部分落盘）；本地 shim 阻塞等待 | 补发缓冲输出，退出码在确认之前一直保留 | 远端进程组先 SIGTERM，再 SIGKILL；shim 返回明确的错误 |
+| Claude 发出的中断或超时（SIGTERM/SIGKILL shim） | 信号排队 | 送达远端并执行 | 同上 |
+| stdio MCP server | 进程继续存活，JSON-RPC 消息排队 | 续传，Claude 无感 | 进程结束；Claude 显示该 MCP 断开，可以用 `/mcp` 重连 |
+| telefs 请求 | 类似 NFS `hard`：请求**阻塞**，不返回错误；`tele-agent` MCP 状态显示「重连中」 | 续传。每个请求带 request id，服务端维护**应答缓存**，保证 create、rename、unlink、append 等非幂等操作**恰好执行一次** | 返回 `EIO`，避免 Claude 永久卡住；阈值可配置 |
+| 缓存失效推送 | 事件在服务端排队 | 续传；如果事件缓冲溢出，服务端声明新的 **epoch**，客户端对整棵树做全量失效 | 全量失效 |
+| 端口转发（HTTP MCP 等） | TCP 流在会话层之上，行为同 exec | 续传 | 断开 |
+
+**会话层也无法覆盖的情况（非目标，但要显式处理）**：
+
+- **tele-server 进程重启或远端重启**：内存中的会话丢失。
+  - telefs 靠**持久句柄**恢复：用 `name_to_handle_at` 或 (dev, ino, generation) 重新打开，然后全量失效缓存。
+  - 正在运行的 exec 丢失，Claude 看到命令失败。
+  - 可选增强：把命令放进 systemd transient scope（`systemd-run --user --scope`）执行，输出写文件。这样 tele-server 重启后可以重新接管，但复杂度较高，放到后续阶段。
+- **本地 tele 启动器崩溃**：FUSE 挂载和 claude 会一起结束，远端进程在租约到期后被清理。用 `tele claude --resume` 可以恢复对话。
+
+### 6B.4 结论
+
+- **能省掉整条链路**：telefs + SS（TCP）+ 可恢复会话层可以替代 WG + swgp + fake-TCP + NFS，而且**两端全程不需要特权**。
+- **重连可以覆盖所有「连接层」故障**：断网、换 IP、NAT 超时、服务端短暂不可达都能续传，业务无感，体验比 WG 方案更可控。**进程层**故障（tele-server 重启、主机重启）只能部分恢复，需要在文档中说明。
+- **工作量**：会话层 2 周，SS 集成 0.5 周（嵌入 Outline）或 1.5 周（自实现 SIP022），另加断网注入测试：用 `tc netem` 模拟丢包，`iptables` 模拟断流，netns 模拟切换 IP，toxiproxy 做故障注入。
+- **取舍**：TCP 在丢包严重的链路上表现不如 UDP 方案（队头阻塞），通过多条连接分担来缓解。如果将来必须走 UDP，会话层保持不变，只需要把下层换成 QUIC（quic-go）。
+
 ## 7. 本地 MCP：`tele-agent`
 
 由 `tele claude` 通过 `--mcp-config` 注入（stdio，**本地**执行，**不**经过 PREFIX。注入时要对 `tele-agent` 自身豁免：用内部标记让 `tele-exec` 识别并在本地直接执行）。在 Claude 中，下表的工具会显示为 `mcp__tele-agent__list`、`mcp__tele-agent__switch` 等。
@@ -475,3 +550,4 @@ TELE_SESSION=<sid>                                   # shim 用它找到 teled �
 3. swgp-go 是否接受以独立子进程方式分发（AGPL 合规）？
 4. 一个会话是否需要同时挂载多台主机的不同路径（例如 A 的 `/srv/a` 和 B 的 `/srv/b` 同时可见），还是永远只有一台活跃主机？
 5. 文件层用 telefs（推荐，FUSE + 自有通道）还是保留 NFS？选 telefs 后，本地 WG 会改为 wireguard-go + netstack，全链路基本免 root。
+6. 传输层是否改为「SS（TCP）+ 可恢复会话层」，替代 WG + swgp + fake-TCP？（配合 telefs 时推荐；原 WG 链路可以保留为可选后端）
