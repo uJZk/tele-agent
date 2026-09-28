@@ -2,7 +2,7 @@
 
 > 状态：可行性研究（未开始实现）  
 > 日期：2026-09-28  
-> 研究对象：Claude Code 2.1.283（本机二进制逆向核实）、swgp-go v1.10.0、Phantun、Linux 内核 WireGuard / NFS
+> 研究对象：Claude Code 2.1.283（本机二进制逆向核实）、swgp-go v1.10.0、Musixal/tcpraw（替代 Phantun）、Linux 内核 WireGuard / NFS
 
 ## 0. 结论摘要
 
@@ -19,7 +19,7 @@
 | 本地 MCP `tele-agent`（列出/切换主机、安装说明） | ✅ 高 | Go 写的 stdio MCP server，由启动器注入 | 热切换的边界情况 |
 | WireGuard | ✅ 高 | 内核 WG + `wgctrl`（没有内核模块时退回 wireguard-go） | 需要 root |
 | swgp-go（可关） | ✅ 高 | **以子进程方式**运行（AGPL-3.0 许可证） | 许可证；`-2026` 模式需要时钟同步 |
-| Phantun（可关，自愈） | ✅ 中高 | 可插拔 fake-TCP：托管上游 Phantun，或 Go 原生 raw-socket 模式（tcpraw 式，仅需 CAP_NET_RAW，无需 TUN/NAT） | 完全无特权不可行；上游模式需要 TUN + nft |
+| fake-TCP 层（可关，自愈；替代 Phantun） | ✅ 高 | 只用 Musixal/tcpraw（MIT，纯 Go），作为库嵌入 teled/tele-server；只需 CAP_NET_RAW，无需 TUN/NAT；本机实测可用 | 单人维护（vendor 并固定 commit）；需修补 iptables 规则残留问题 |
 | NFS 文件层 | ✅ 高 | 内核 nfsd + NFSv4.2，只导出给 WG 对端 IP | 性能、缓存一致性、uid 映射 |
 | Go 语言、仅 Linux | ✅ 高 | 整个生态都有成熟 Go 库 | — |
 
@@ -34,7 +34,7 @@
 1. `tele claude [args...]` 与 `claude [args...]` 行为一致，只是「世界」在远端：Bash、hooks、MCP server 都在远端执行，文件都是远端的文件。
 2. 远端主机**不需要**安装 Node 或 Claude Code，也**不存放** Anthropic 凭证。凭证、会话历史、`~/.claude` 都留在本地。
 3. 本地自动多一个 MCP server `tele`：Claude 可以列出主机、切换主机（包括切回 `local`），并能拿到远端服务端的安装指引。
-4. 传输层：WireGuard → [swgp-go，可关] → [Phantun，可关，要求自愈]。
+4. 传输层：WireGuard → [swgp-go，可关] → [fake-TCP（Musixal/tcpraw，替代 Phantun），可关，要求自愈]。
 5. 文件层用 NFS。全部用 Go 实现，只支持 Linux。
 
 **非目标**：macOS/Windows、多用户共享同一个远端会话、替代 SSH 做通用远程管理、Claude Code 自带的 bubblewrap 沙箱与远程执行的组合（见第 8 节）。
@@ -58,8 +58,8 @@
 │                   │ Read/Write/Edit → fs 调用 → NFS            │        │                                               │
 │                   └ MCP "tele" (本地 stdio)                     │        │                                               │
 │                                                               │        │                                               │
-│  teled (root 守护进程): WG / swgp / phantun / NFS 挂载 / 自愈 │        │  wg ◄─ swgp server ◄─ phantun server          │
-│   wg0 ─► swgp client ─► phantun client ═══ fake-TCP/UDP ══════╪════════╪══►                                            │
+│  teled (root 守护进程): WG / swgp / faketcp / NFS 挂载 / 自愈 │        │  wg ◄─ swgp server ◄─ fakeTCP(tcpraw)          │
+│   wg0 ─► swgp client ─► fakeTCP(tcpraw) ══ fake-TCP/UDP ══════╪════════╪══►                                            │
 └───────────────────────────────────────────────────────────────┘        └───────────────────────────────────────────────┘
 ```
 
@@ -68,9 +68,9 @@
 | 二进制 | 运行位置 | 权限 | 作用 |
 |---|---|---|---|
 | `tele` | 本地 | 普通用户 | CLI：`tele claude`、`tele host add/ls/rm`、`tele status`；`tele mcp` 子命令即名为 `tele-agent` 的 MCP server |
-| `teled` | 本地 | root（systemd） | 管理 WG 接口、swgp/phantun 子进程、NFS 挂载、健康检查与自愈；通过 unix socket 接受 `tele` 的请求（用 SO_PEERCRED 鉴权） |
+| `teled` | 本地 | root（systemd） | 管理 WG 接口、swgp 子进程、进程内 fake-TCP relay、NFS 挂载、健康检查与自愈；通过 unix socket 接受 `tele` 的请求（用 SO_PEERCRED 鉴权） |
 | `tele-sh` / `tele-exec` / `rg` shim | 本地 | 普通用户 | 注入给 Claude Code 的执行垫片，把请求交给 `teled` 复用的多路连接 |
-| `tele-server` | 远端 | root（systemd） | WG 服务端、swgp/phantun 服务端的托管、NFS 导出管理、exec 服务、安装与配对 |
+| `tele-server` | 远端 | root（systemd） | WG 服务端、swgp 服务端托管、进程内 fake-TCP relay、NFS 导出管理、exec 服务、安装与配对 |
 
 ---
 
@@ -192,19 +192,19 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 ### 6.1 分层与端口链
 
 ```
-客户端:  wg0(10.77.x.1) → udp 127.0.0.1:Ps ─► swgp-client → udp 127.0.0.1:Pp ─► phantun-client ═fake-TCP═►
-服务端:  ═►phantun-server :443/tcp → udp 127.0.0.1:Qs ─► swgp-server → udp 127.0.0.1:51820 ─► wg0(10.77.x.2)
+客户端:  wg0(10.77.x.1) → udp 127.0.0.1:Ps ─► swgp-client → udp 127.0.0.1:Pf ─► fakeTCP relay(teled 内) ═fake-TCP═►
+服务端:  ═►fakeTCP relay(tele-server 内) :443/tcp → udp 127.0.0.1:Qs ─► swgp-server → udp 127.0.0.1:51820 ─► wg0(10.77.x.2)
 ```
 
 两层都可以关掉。关掉某一层时，WG peer 的 endpoint 直接指向下一层（或远端公网地址）。三种组合都要进入测试矩阵：{WG}、{WG+swgp}、{WG+phantun}、{WG+swgp+phantun}。
 
-**拓扑**：本地一个 `tele0` 接口，**每台远端主机一个 peer**，每台主机独立一条 swgp/phantun 进程链。地址按主机分配 `10.77.<n>.0/30`，或者 ULA `fd7e:1e::/64`。AllowedIPs 只包含对端的那个 /32，**不做**全局路由，避免影响本机的其他流量。
+**拓扑**：本地一个 `tele0` 接口，**每台远端主机一个 peer**，每台主机独立一条 swgp 进程 + fake-TCP relay 链。地址按主机分配 `10.77.<n>.0/30`，或者 ULA `fd7e:1e::/64`。AllowedIPs 只包含对端的那个 /32，**不做**全局路由，避免影响本机的其他流量。
 
 ### 6.2 WireGuard
 
 - 首选内核 WG（Linux ≥ 5.6），通过 `golang.zx2c4.com/wireguard/wgctrl` 配置，地址和路由用 `vishvananda/netlink`。
 - 没有内核模块时退回 `wireguard-go`（可以作为库嵌入，MIT 许可）。
-- `PersistentKeepalive=25`，用来维持 NAT 映射和 Phantun 流的状态。
+- `PersistentKeepalive=25`，用来维持 NAT 映射和 fake-TCP 流的状态。
 
 ### 6.3 swgp-go（可关）
 
@@ -213,100 +213,67 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 - ⚠️ 上游要求 **go ≥ 1.26**（本环境是 1.24.7）。这只影响我们自己构建它的情况。
 - 模式：默认用 `zero-overhead-2026`，数据包零开销、**不影响 MTU**；可选 `paranoid-2026`（全包 AEAD 并填充到 MTU，会略微降低 MTU、增加带宽）。**`-2026` 模式带重放保护，要求两端时钟同步**，所以 tele-server 安装时要检查 NTP，teled 健康检查要报告时钟偏差；时钟不可控时回退到旧版 `zero-overhead`。
 
-### 6.4 Phantun（可关，需要自愈）
+### 6.4 fake-TCP 层（可关，需要自愈）：只用 Musixal/tcpraw
 
-**上游概况**：Rust 实现，MIT/Apache-2.0，把 UDP 伪装成 TCP（只做三次握手，之后无状态、无重传），依赖 TUN 和 iptables/nftables（客户端做 MASQUERADE，服务端做 DNAT），需要 root。
+> 决策：fake-TCP 层**只**采用 [Musixal/tcpraw](https://github.com/Musixal/tcpraw)。它是 [xtaci/tcpraw](https://github.com/xtaci/tcpraw)（kcptun `--tcp` 模式使用的库）的性能优化 fork，MIT 许可，纯 Go，没有 cgo。最初需求里的 Phantun 因此由它**替代**。两者要解决的问题相同（把 UDP 伪装成 TCP，且不做重传），但线协议不兼容。由于两端都由 tele 控制，这一点没有影响。
 
-**实现选择**：
+#### 6.4.1 为什么是它
 
-| 方案 | 优点 | 缺点 |
-|---|---|---|
-| A. 托管上游二进制（推荐第一阶段） | 立刻可用，协议与上游完全兼容 | 引入非 Go 二进制；自愈只能靠外部监控和重启 |
-| B. phantun-go：Go 重写、线协议兼容（见 6.4.2，**推荐默认**） | 单一 Go 二进制；进程内自愈；可以与上游 Phantun 互通 | 没有现成移植，需自写约 1–1.5k 行代码并做互通测试；需要 TUN 和 NAT 规则 |
-| C. Go 原生 raw-socket 模式（tcpraw 式，见 6.4.1） | 不需要 TUN 和 NAT 规则，只要 `CAP_NET_RAW`；可以作为库嵌入（MIT） | 线协议与 Phantun 不兼容（两端都由我们控制，这点无所谓） |
+**已在本环境实测**（root，loopback，`BenchmarkEcho`，1 KB 往返）：
 
-#### 6.4.1 能不能做成纯用户态？
+| 实现 | ns/op | 吞吐 | 内存/op | 分配次数/op |
+|---|---|---|---|---|
+| xtaci/tcpraw | 78,325 | 13.07 MB/s | 6,070 B | 54 |
+| **Musixal/tcpraw** | **43,486** | **23.55 MB/s** | **2,424 B** | **10** |
 
-先区分两个概念：
+这项基准是往返延迟型测试，不代表吞吐上限，但能说明热路径开销约减半、分配少了 80%。Musixal 的主要改动包括：缓冲池、手写 TCP 包解析（不走 gopacket 的解码分配）、seq/ack 改用原子变量、每个 socket 挂 BPF 过滤器减少无关抓包，以及去掉全局 10ms 时钟 goroutine。
 
-- **「完全无特权」（普通用户、不给任何 capability）：在 Linux 上做不到。** 伪装 TCP 的本质是自己构造 TCP 报文段、绕开内核 TCP 栈，这必须用 raw socket、AF_PACKET 或 TUN，分别需要 `CAP_NET_RAW` 或 `CAP_NET_ADMIN`。能绕开这一点的路子都不成立：
-  - `TCP_REPAIR` 同样需要 `CAP_NET_ADMIN`。
-  - 非特权 user namespace 虽然给了 CAP_NET_ADMIN，但只作用于自己的 netns，那里没有物理网卡。经 slirp4netns/pasta 出网时，报文会被还原成**真实内核 TCP**，伪装就失去了意义，还会引入 TCP-over-TCP 的队头阻塞。
-  - eBPF 方案（如 mimic）和 AF_XDP 需要 root 加载程序。
-- **「用户态实现、最小特权」（不依赖内核模块、不跑 root、不改 iptables）：可以做到。** 其实 Phantun 本身就是用户态程序，真正麻烦的是它依赖 **TUN + NAT 规则**。有两条 Go 路线：
+**工作机制**（通过源码核实）：
 
-| 路线 | 所需特权 | 是否需要防火墙规则 | 说明 |
-|---|---|---|---|
-| **C1. tcpraw 式**（[xtaci/tcpraw](https://github.com/xtaci/tcpraw)，MIT，kcptun 的 `--tcp` 模式在用） | 只需 `CAP_NET_RAW`（可以用 `setcap` 或 systemd `AmbientCapabilities` 授予） | 可选 | 已核实其实现：先用**真实内核 TCP** 完成三次握手（中间设备看到的是标准 Linux TCP 指纹），然后把内核 socket 的 **TTL 设为 1**，让内核自己发出的 ACK 和重传在第一跳就被丢弃；数据走 raw IP socket（`ip4:tcp`）加 BPF 过滤收发。iptables 规则只用来丢掉 TTL=1 的包、避免 ICMP Time Exceeded 噪声，是**可选**的。直接暴露 `net.PacketConn`，可以嵌入 teled 或 tele-server。 |
-| **C2. TUN 版 Phantun 协议的 Go 实现** | `CAP_NET_ADMIN`；可以由安装器预建持久化 TUN（`ip tuntap add mode tun user <u>`），运行时就不需要 root | 需要一次性的 NAT 规则（由安装器写入 nft，运行时只校验） | 与上游 Phantun 线协议兼容，可以和现成的 phantun-server 对接 |
+1. 先用**真实内核 TCP** 完成三次握手。中间设备看到的是标准的 Linux TCP 握手，fingerprint 模拟 Linux：window 65535、TTL 64、NOP,NOP,Timestamp 选项。
+2. 握手后把内核 socket 的 **TTL 设为 1**，让内核自己发出的 ACK 和重传在第一跳就被丢弃；同时用 `io.Copy(io.Discard, tcpconn)` 持续排空内核接收缓冲区，避免堆积。
+3. 数据用 raw IP socket（`ip:tcp`）加 BPF 过滤收发，按真实的 seq/ack 推进，因此对 NAT 友好。
+4. 对外暴露 `net.PacketConn`（`Dial` / `Listen`），可以直接嵌入 teled 和 tele-server，**不需要额外进程，不需要 TUN，不需要 NAT/DNAT，也不需要 `ip_forward`**。
 
-**建议**：把 fake-TCP 做成 teled/tele-server 内部的可插拔 `Transport` 接口，提供三个实现：`phantun-go`（6.4.2，**默认**，与上游线协议兼容）、`rawtcp`（C1，免 TUN、免 NAT 的备选）、`phantun-exec`（托管上游二进制，只在过渡期或排查问题时使用）。C1 相比 phantun-go 的额外好处：
+**权限**：需要 `CAP_NET_RAW`（raw socket）。另外它会用 `go-iptables` 追加一条 `OUTPUT -m ttl --ttl-eq 1 ... -j DROP` 规则，用来吞掉 TTL=1 包触发的 ICMP Time Exceeded。这条规则需要 `CAP_NET_ADMIN`，而且是**可选**的：规则写入失败也能工作，只是会多一些 ICMP 噪声。
 
-- 不需要 TUN，不需要 NAT/DNAT 规则，因此与 docker/firewalld 的冲突风险（R7）大幅下降。
-- 在进程内完成自愈：直接重拨真实 TCP 握手、换源端口，不用重启子进程。
-- 链路上少一个进程，少一跳 localhost UDP。
+**与其他候选的比较（已排除）**：
 
-需要额外验证的点：握手阶段使用了真实内核 TCP，在对称丢包、NAT 超时后的重连行为；以及长时间运行后内核 socket 接收缓冲区的处理（需要持续 drain，或者设置很小的 `SO_RCVBUF`）。
+- Musixal/ZeroTCP：基于 AF_PACKET，只支持 IPv4，用 `sudo iptables` 调命令，错误路径里有 `log.Fatal`，还是 pre-release，**没有 LICENSE 文件**，不适合采用。
+- Musixal/Backhaul：没有 fake-TCP 传输，且是 AGPL 许可。
+- Phantun（上游或 Go 移植）：需要 TUN 和 NAT，而且没有现成的 Go 实现。按本决策不再考虑。
 
-#### 6.4.2 phantun-go：用 Go 重写 Phantun（线协议兼容）
+#### 6.4.2 集成方式
 
-**现状**：目前**没有**现成的 Go 移植。能找到的只有：上游 [dndx/phantun](https://github.com/dndx/phantun)（Rust）、其 fork [sagan/phantun](https://github.com/sagan/phantun)、内核模块版 [phantun-dkms](https://github.com/bjin/phantun-dkms)，以及协议不同的 Go fake-TCP 库 [xitongsys/ptcp](https://github.com/xitongsys/ptcp)。所以 phantun-go 需要我们自己写。上游是 MIT/Apache-2.0 双许可，移植时保留署名即可。
+```
+客户端: wg0 → udp 127.0.0.1:Ps → [swgp-client 子进程, 可关] → udp 127.0.0.1:Pf → teled 内 fakeTCP relay (tcpraw.Dial)  ══►
+服务端: ══► tele-server 内 fakeTCP relay (tcpraw.Listen :443) → udp 127.0.0.1:Qs → [swgp-server, 可关] → wg0 :51820
+```
 
-**协议规模很小**（依据上游 `fake-tcp/src/{lib,packet}.rs`）：
+- relay 是一个很薄的封装（约 200–300 行）：一个 UDP 报文对应一次 `WriteTo`。服务端按对端地址为每个客户端维护一个后端 UDP socket。
+- **引入方式**：MIT 许可，采用 **vendor 并固定 commit**（上游是单人维护，约 23 个提交，最近一次提交在 2026-01），必要时在本仓库 `third_party/tcpraw` 维护自己的补丁。
+- **需要修补或包一层的已知问题**（实测和阅读源码时发现）：
+  1. 进程异常退出时 **iptables 规则会残留**。本次实测两个版本都复现了，已手动清理。对策：启动时按端口扫描并清理残留规则；改用专用链 `TELE-FAKETCP`，退出时整链清空。
+  2. 服务端默认监听 `[::]`，在关闭了 IPv6 的机器上会直接失败（本环境复现了）。对策：按地址族分别监听。
+  3. 依赖 `iptables` 命令。纯 nft 的系统需要 `iptables-nft` 兼容层；可以考虑改用 `google/nftables` 直接写规则（这是一个小补丁）。
+  4. README 的徽章等仍指向 xtaci，属于外观问题。
+- **MTU**：相对 UDP 额外开销 = TCP 头 20 + Timestamp 选项 12 − UDP 头 8 = **24 字节**。据此 WG MTU 取值：IPv4 为 1500 − 20 − 32 − 32 = **1416**，IPv6 为 **1396**。启用 swgp paranoid 模式时还要再减去它的开销。teled 自动计算 MTU。
 
-| 项 | 上游行为 |
-|---|---|
-| 握手 | 客户端 SYN → 服务端 SYN+ACK → 客户端 ACK；connect 最多重试 6 次，每次超时 1s |
-| 报文头 | IPv4 TTL=64、DF；IPv6 hop limit=64；TCP window 固定 0xffff；**只有 SYN 带选项**（NOP + wscale=14） |
-| 数据 | 纯 ACK 标志，`seq += len(payload)`，`ack` 取对端最新 seq；**没有重传、没有拥塞控制和流控** |
-| 确认 | 未确认数据超过 128MB 时补发一个空 ACK |
-| 关闭 | 收到 RST 就关闭连接；本端 drop 时发 RST |
-| 保活 | 没有（依赖上层 WG 的 PersistentKeepalive） |
-| 并发 | TUN 多队列，每个队列一个 reader，连接按四元组查表 |
-| 上层 | 每条 fake-TCP 连接在服务端对应一个到后端的 UDP socket，一个 UDP 报文对应一个 TCP 段 |
-
-**Go 实现拆分**（估计 1,000–1,500 行，加上测试共 1.5–2 周）：
-
-1. `tun`：打开 `/dev/net/tun`，使用 `IFF_TUN|IFF_NO_PI|IFF_MULTI_QUEUE`。直接用 `x/sys/unix` 写 ioctl 就够了，也可以复用 `wireguard/tun`。
-2. `packet`：手写 IPv4/IPv6 + TCP 头的构造、解析和校验和。不用 gopacket，做到零分配，热路径复用 `sync.Pool` 缓冲。
-3. `faketcp`：连接状态机（Idle/SynSent/SynReceived/Established）、四元组表、Listener 与 Dialer。对外提供 `net.PacketConn` 风格的接口。
-4. `relay`：UDP ↔ fake-TCP 的双向转发。客户端监听 `127.0.0.1:Pp`，服务端每条连接对应一个后端 UDP socket。
-5. `netcfg`：用 `google/nftables` 在专用 table 里写客户端 MASQUERADE 和服务端 DNAT 规则，开启 `ip_forward`，并定期校验（参与自愈）。
-6. **互通测试**：CI 里建两个 netns + veth，分别跑「phantun-go ↔ phantun-go」「phantun-go 客户端 ↔ 上游 phantun-server」「上游 phantun-client ↔ phantun-go 服务端」三组，用 `tc netem` 注入丢包、乱序和 NAT 超时。
-
-**相对托管上游二进制的收益**：
-
-- 单一 Go 二进制：不用再分发 Rust 程序，也不用额外做 sha256 固定和下载流程。
-- **进程内自愈**：可以直接感知「连接已建立但只发不收」，立即对旧连接发 RST，然后换源端口重拨，无需重启进程。握手重试次数和超时也能按需调整。
-- **可选扩展，不破坏兼容**：只有两端都是 phantun-go 时，才通过握手后第一个数据包协商扩展能力，比如应用层保活、连接迁移、多连接并发条带化。对端是上游 Phantun 时自动退回严格兼容模式。
-
-**局限**：权限需求与上游相同，需要 TUN（`CAP_NET_ADMIN`）和 NAT 规则。不过 teled 和 tele-server 本来就以 root 运行，所以这在 tele 里不是额外负担。
-
-**变体（待验证）**：线协议兼容只取决于线上报文，与是否用 TUN 无关。所以 phantun-go 也可以做一个 **raw socket 后端**：用 AF_PACKET 或 raw IP 收发，再加一条「丢弃本端内核发出的 RST」的 nft 规则。这样就不需要 TUN、NAT 和 `ip_forward`，同时仍能与上游对接。代价是：内核会对这些「不属于任何 socket」的报文回 RST，必须用规则压住；可行性放到 P2 原型里验证。
-
-**顺带：整条链能否做到「本地免 root」？** 可以作为可选模式。
-
-- **WireGuard**：改用 wireguard-go + gVisor netstack，在进程内运行，不需要 TUN 也不需要 root。
-- **NFS**：内核 NFS 客户端用不了进程内的 netstack，所以要换成用户态 NFS 客户端 + FUSE。非特权 FUSE 挂载由 `fusermount3` 提供，但性能和一致性都不如内核 NFS。
-- **fake-TCP**：走 C1 路线，只需要给二进制一个 `CAP_NET_RAW`。
-
-代价主要在文件层，所以默认仍推荐「teled 以 root 运行 + 内核 WG/NFS」。
-
-**MTU**：Phantun 比 UDP 多 12 字节（TCP 头 20 − UDP 头 8）。上游建议 WG MTU：IPv4 为 1428，IPv6 为 1408。叠加 paranoid 模式时还要再减去 swgp 的开销。teled 根据启用的层**自动计算** MTU，不让用户手填。
-
-**自愈设计（在 teled 中实现，远端 tele-server 对称实现服务端部分）**：
+#### 6.4.3 自愈设计（relay 在进程内，比托管子进程更容易做）
 
 1. **探测**（每 5 秒）
-   - L1：WG `latest-handshake` 的年龄（> 135s 视为异常；正常情况下有流量时 ≤ 120s 会重新握手）。
-   - L2：隧道内对 `tele-server` 健康端点的应用层 ping（带 RTT）。
-   - L3：子进程是否存活、TUN 接口和 iptables/nft 规则是否仍在（防止 firewalld 或 docker 重载时冲掉规则）。
+   - L1：WG `latest-handshake` 的年龄（> 135s 视为异常）。
+   - L2：隧道内对 `tele-server` 健康端点做应用层 ping（带 RTT）。
+   - L3：relay 自身的计数器，例如「只发不收」持续时间和最近一次收包时间；以及 TTL 规则是否仍在（防止 firewalld 或 docker 重载时冲掉规则）。
 2. **分级动作**（带指数退避和抖动，并做 flap 检测）
-   - 规则丢失 → 幂等地重新应用规则。
-   - L2 连续 3 次失败、但子进程还活着 → **重启 phantun-client，并换一个本地 UDP 源端口**。这会让 Phantun 新建 fake-TCP 流，绕开中间设备里卡死的 NAT 或会话状态（这是 Phantun 最常见的故障模式）。
-   - 重启之后仍然失败 → 重新解析 endpoint 的 DNS（应对动态 IP），然后重启整条链（swgp + phantun）。
-   - 服务端：tele-server 定期清理 phantun-server 的空闲连接；隧道长时间没有有效握手时自行重启 phantun-server。服务端的自愈不依赖客户端能否连上。
-   - （可选、默认关闭）**降级**：用户允许时，Phantun 持续失败后临时退回纯 UDP 或 swgp。因为用户开 Phantun 往往就是因为 UDP 被封，所以必须显式开启。
-3. **可观测**：`tele status` 和 `tele-agent` MCP 的 `list` 输出每层的状态、最近一次自愈动作和原因。
+   - 规则丢失 → 幂等地重新写入。
+   - L3「只发不收」超过阈值，或 L2 连续 3 次失败 → 在**进程内**关闭旧的 tcpraw 连接（会发出 RST），用**新的本地源端口**重新 `Dial`。这会新建一条真实 TCP 握手流，绕开中间设备里卡死的 NAT 或会话状态。WG 会自动在新流上继续工作，因为 WG 的 endpoint 始终是本地 relay 的 UDP 端口，不会变。
+   - 连续重拨失败 → 重新解析 endpoint 的 DNS（应对动态 IP），并在备用端口列表之间轮换（例如 443 → 8443 → 自定义端口）。
+   - 服务端：tele-server 回收空闲 flow；监听 socket 出错时自动重建。服务端的自愈不依赖客户端能否连上。
+   - （可选、默认关闭）**降级**：fake-TCP 持续失败时，临时退回纯 UDP 或 swgp。需要用户显式开启。
+3. **可观测**：`tele status` 和 `tele-agent` MCP 的 `list` 输出每层的状态、当前 flow 的四元组、重拨次数、最近一次自愈动作和原因。
+
+**需要在原型中验证**：在真实公网和运营商 NAT 下的吞吐（带 WG，用 iperf3）；长时间运行的稳定性；在 `tc netem` 模拟丢包、乱序以及 NAT 映射过期时的重拨行为。
 
 ### 6.5 控制面 / exec 协议
 
@@ -327,7 +294,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 |---|---|
 | `list` | 列出所有主机，包括 `local`：名称、是否活跃、链路状态、RTT、OS 信息、已导出路径 |
 | `switch(host)` | 切换执行和文件的目标主机 |
-| `status(host?)` | 详细健康状态（WG 握手、swgp、phantun、NFS、自愈历史） |
+| `status(host?)` | 详细健康状态（WG 握手、swgp、fake-TCP、NFS、自愈历史） |
 | `install_guide(host?)` | 返回在远端安装服务端的步骤和一键命令（见下文） |
 | `exec_local(cmd)`（可选） | 在远端模式下，显式在本地执行一次命令 |
 
@@ -343,13 +310,13 @@ MCP server 的 `instructions` 字段告诉模型：当前活跃主机是哪台�
 
 ```bash
 # 本地：生成配对串（包含本地 WG 公钥、选定的传输层参数、一次性 token）
-tele host add myhost --endpoint 203.0.113.5 --phantun --swgp zero-overhead-2026
+tele host add myhost --endpoint 203.0.113.5 --faketcp --swgp zero-overhead-2026
 # → 输出: tele-server install --pair 'tele1:....'
 
 # 远端（root）：
 curl -fsSL https://github.com/ujzk/tele-agent/releases/latest/download/install.sh | sh
 sudo tele-server install --pair 'tele1:....' --export /home/alice/proj --as alice
-# → 安装 systemd unit，配置 wg/swgp/phantun/nfsd/exports，检查 NTP 与防火墙，
+# → 安装 systemd unit，配置 wg/swgp/faketcp/nfsd/exports，检查 NTP 与防火墙，
 #   输出回执串 'tele1r:....'
 
 # 本地：
@@ -367,10 +334,10 @@ tele host confirm myhost 'tele1r:....'
 | R1 | Claude Code 内部行为（cwd 文件、快照、tmp 路径、prefix 覆盖范围）没有文档，可能随版本变化 | **高** | P0 原型；CI 中用 `claude -p` 驱动真实 Claude 跑兼容性测试（在远端执行 `hostname`、写文件后 Read、调用 hook 和 MCP、后台任务、超时中断）；启动时检测版本并告警 |
 | R2 | exec 形式的 hooks 可能绕过 `CLAUDE_CODE_SHELL_PREFIX` | 中 | 启动器用 `--setting-sources` + `--settings` 注入改写后的 hooks；插件 hooks 同样处理 |
 | R3 | NFS 属性缓存造成读到旧数据或 mtime 误判 | 中 | `actimeo=1`、`lookupcache=positive`、命令结束后定向失效；提供 `noac` 严格模式 |
-| R4 | 需要 root（WG、TUN、iptables、NFS 挂载） | 中 | 特权集中在 `teled` / `tele-server` 两个 systemd 服务；日常使用的 `tele` 不需要 root |
+| R4 | 需要 root（WG、raw socket、iptables、NFS 挂载） | 中 | 特权集中在 `teled` / `tele-server` 两个 systemd 服务；日常使用的 `tele` 不需要 root |
 | R5 | 非特权 userns 被 AppArmor 或 sysctl 限制 | 中 | 随包提供 AppArmor profile；退化为 teled 代理 pty 模式 |
 | R6 | swgp-go 是 AGPL-3.0 | 中 | 子进程方式分发、不链接；或让用户自行安装 |
-| R7 | Phantun 与 docker、firewalld、nftables 规则冲突；中间设备导致流卡死 | 中 | 默认用 raw-socket 模式（不需要 NAT 规则）；上游模式使用专用 nft table 并定期校验；自愈时换源端口并重新握手 |
+| R7 | fake-TCP 依赖单人维护的 Musixal/tcpraw；TTL 规则残留，或与 docker/firewalld 冲突；中间设备导致流卡死 | 中 | vendor 并固定 commit，自行维护补丁；使用专用 iptables 链，启动时清理残留；自愈时换源端口重拨、轮换端口 |
 | R8 | exec 服务本质上是远程代码执行入口 | 高（安全） | 只监听 WG 地址并校验对端 IP；WG 私钥 0600 保存；可选 token；systemd 加固（以目标用户身份执行，不以 root 执行命令） |
 | R9 | Claude Code 的 bubblewrap 沙箱会在本地包一层，与 shim 冲突 | 低 | tele 模式下提示关闭沙箱；以后可在远端复现沙箱 |
 | R10 | swgp `-2026` 模式要求时钟同步 | 低 | 安装时检查 NTP；teled 报告时钟偏差；可回退旧模式 |
@@ -382,7 +349,7 @@ tele host confirm myhost 'tele1r:....'
 | 方案 | 说明 | 为什么不选 |
 |---|---|---|
 | SSH 到远端直接运行 claude | 最简单 | 远端要装 Node/Claude 并存放凭证；不能在一个会话里切换主机；不满足「本地 MCP 切换主机」的需求 |
-| SSHFS + ssh 命令包装 | 常见做法 | 没有你要求的 WG/混淆/Phantun 传输层；SSHFS 的一致性和性能不如 NFSv4.2 |
+| SSHFS + ssh 命令包装 | 常见做法 | 没有你要求的 WG/混淆/fake-TCP 传输层；SSHFS 的一致性和性能不如 NFSv4.2 |
 | 修改 Claude Code（打补丁或 hook Node API） | 可以精确控制 | 二进制是 bun 单文件，打补丁脆弱、难以维护，而且可能违反使用条款 |
 | 用 `claude --remote` 类官方远程能力 | — | 语义不同（云端会话），不满足自有主机和自有传输层的需求 |
 
@@ -398,7 +365,7 @@ tele host confirm myhost 'tele1r:....'
 
 **P1 MVP（约 3–4 周）**：`tele-server` exec 服务 + 纯 WG（内核）+ NFSv4.2 + `teled` + `tele claude` + `tele-agent` MCP（list/status/install_guide/冷切换）+ 配对安装。
 
-**P2 传输增强**：swgp-go 子进程托管、Phantun 托管与自愈、MTU 自动计算、四种组合的测试矩阵（可以用 netns + `tc netem` 模拟丢包和 NAT 超时）。
+**P2 传输增强**：swgp-go 子进程托管、fake-TCP（tcpraw）集成与自愈、MTU 自动计算、四种组合的测试矩阵（可以用 netns + `tc netem` 模拟丢包和 NAT 超时）。
 
 **P3 打磨**：热切换、NFS 定向失效、端口转发、AppArmor profile、Go 原生 fake-TCP（可选）、打包（deb/rpm/静态二进制）。
 
@@ -421,6 +388,6 @@ TELE_SESSION=<sid>                                   # shim 用它找到 teled �
 ## 附录 B：未决问题（需要用户决定）
 
 1. 热切换和冷切换哪个优先？（建议先做冷切换）
-2. fake-TCP 默认用 phantun-go（建议，与上游兼容，需要 TUN 和 NAT），还是 rawtcp（只需 CAP_NET_RAW，但与上游不兼容）？phantun-go 的 raw socket 后端是否值得在 P2 验证？
+2. fake-TCP 层已定为 Musixal/tcpraw。是否要保留「降级到纯 UDP」的开关（默认关闭）？
 3. swgp-go 是否接受以独立子进程方式分发（AGPL 合规）？
 4. 一个会话是否需要同时挂载多台主机的不同路径（例如 A 的 `/srv/a` 和 B 的 `/srv/b` 同时可见），还是永远只有一台活跃主机？
