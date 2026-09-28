@@ -15,12 +15,12 @@
 | Hooks 远程执行 | ✅ 高（shell 形式）/ ⚠️ 中（exec 形式） | `CLAUDE_CODE_SHELL_PREFIX` | exec 形式 hook 可能绕过 prefix |
 | stdio MCP 远程执行 | ✅ 高 | `CLAUDE_CODE_SHELL_PREFIX`（已核实会包裹 stdio MCP） | 无 |
 | HTTP/SSE MCP | ⚠️ 中 | 改写 localhost URL 或经隧道端口转发 | 需要改写配置 |
-| Read/Write/Edit/Glob/Grep | ✅ 高 | NFS 同路径挂载；`USE_BUILTIN_RIPGREP=0` + 远程 `rg` shim | NFS 属性缓存导致读到旧数据 |
+| Read/Write/Edit/Glob/Grep | ✅ 高 | 同路径挂载（推荐 telefs，见 5A；或 NFS）；`USE_BUILTIN_RIPGREP=0` + 远程 `rg` shim | 缓存一致性（telefs 用 exec 屏障 + 失效推送解决） |
 | 本地 MCP `tele-agent`（列出/切换主机、安装说明） | ✅ 高 | Go 写的 stdio MCP server，由启动器注入 | 热切换的边界情况 |
 | WireGuard | ✅ 高 | 内核 WG + `wgctrl`（没有内核模块时退回 wireguard-go） | 需要 root |
 | swgp-go（可关） | ✅ 高 | **以子进程方式**运行（AGPL-3.0 许可证） | 许可证；`-2026` 模式需要时钟同步 |
 | fake-TCP 层（可关，自愈；替代 Phantun） | ✅ 高 | 只用 Musixal/tcpraw（MIT，纯 Go），作为库嵌入 teled/tele-server；只需 CAP_NET_RAW，无需 TUN/NAT；本机实测可用 | 单人维护（vendor 并固定 commit）；需修补 iptables 规则残留问题 |
-| NFS 文件层 | ✅ 高 | 内核 nfsd + NFSv4.2，只导出给 WG 对端 IP | 性能、缓存一致性、uid 映射 |
+| 文件层 | ✅ 高 | **推荐 telefs**（FUSE + tele 自有通道，本地和远端都不需要 root，已实测 userns 挂载）；备选 NFSv4.2 | telefs 需要自研（3–4 周）；NFS 需要 root，且缓存一致性弱 |
 | Go 语言、仅 Linux | ✅ 高 | 整个生态都有成熟 Go 库 | — |
 
 最大的不确定性**不在网络层**，而在 **Claude Code 的内部行为**：临时文件路径、shell 快照、cwd 追踪等都没有公开文档，各版本之间可能变化。因此第一件事是做一个 **P0 原型**，把第 3 节列出的行为逐项跑通，并建立一个**跨 Claude Code 版本的兼容性测试**。
@@ -165,7 +165,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 
 ---
 
-## 5. 文件层：NFS
+## 5. 文件层：NFS（备选；推荐方案见 5A）
 
 **选型**：远端用内核 nfsd，NFSv4.2（单端口 2049，便于在 WG 上跑；支持服务端 copy 和 sparse）；本地用内核 NFS 客户端。不推荐用户态的 go-nfs：它只支持 v3，性能和一致性也不如内核实现。
 
@@ -186,6 +186,66 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 **性能预估**（RTT = 30ms 时）：一次 Read ≈ 2–3 个 RTT（LOOKUP/OPEN/READ compound）≈ 60–90ms；一次 Bash ≈ 1 RTT + 执行时间；Grep 走远端 rg ≈ 1 RTT + 扫描时间。整体体验与在远端 SSH 里直接用 Claude 相当，瓶颈仍然是模型响应。
 
 ---
+
+## 5A. 不用 NFS 的方案（推荐：telefs = FUSE + tele 自有通道）
+
+**结论：可以不用 NFS，而且去掉它以后整体更简单，也更容易免 root。** NFS 在本方案里带来的麻烦几乎都与它本身有关：
+
+- 本地挂载必须 root，因为 NFS 不能在 user namespace 里挂载；
+- 远端要配置 nfsd 和 exports，也要 root；
+- 数字 uid 映射，需要 `all_squash`；
+- 属性缓存导致读到旧数据，而且服务端无法主动通知客户端失效；
+- 内核 NFS 客户端只能跑在内核 WG 上，所以 WG 也被迫要 root。
+
+### 5A.1 候选对比
+
+| 方案 | 透明度 | 权限需求 | 一致性 | 工作量 | 结论 |
+|---|---|---|---|---|---|
+| **A. telefs：FUSE（go-fuse）+ 走 tele 自己的 WG/yamux 通道** | 完全透明（真实文件系统，同路径） | 本地**无需 root**（在 userns 里挂载）；远端以**目标用户**身份运行 | **服务端主动推送失效**，可以做到比 NFS 更强 | 3–4 周 | **推荐** |
+| B. 双向同步（类似 mutagen）：本地保留镜像，以每次远程 exec 作为同步屏障 | 基本透明；文件工具的延迟最低 | 无需 root | 需要处理后台进程持续写入、冲突、大目录（node_modules 等）的忽略规则 | 3–5 周 | 备选，适合高 RTT 链路 |
+| C. 禁用内置文件工具（`--disallowedTools`），由 `tele-agent` MCP 提供 remote_read/edit/glob | **不透明**：失去 Claude 原生的读后编辑检查、diff 展示、checkpoint/rewind、@ 引用和图片读取；远端 CLAUDE.md 和 `.claude/` 需要另外注入 | 无需 root | 强一致 | 1–2 周 | 只作为降级手段 |
+| D. LD_PRELOAD 或 ptrace/seccomp 劫持文件系统调用（proot 式） | 透明 | 无需 root | 强一致 | 高 | 否：Claude 是 bun 单文件二进制，劫持很脆弱，有性能代价 |
+| E. 现成的 sshfs/SFTP | 透明 | 需要 fusermount | 与 NFS 类似，没有失效推送 | 低 | 否：要依赖 SSH 通道，不走你指定的传输栈 |
+
+### 5A.2 telefs 设计
+
+```
+本地 claude 进程 ──VFS──► FUSE (/home/u/proj, 在会话 userns 内) ──► tele 启动器内的 telefs 客户端
+     ──yamux stream (WG 隧道内)──► tele-server 内的 telefs 服务端 (以目标用户身份) ──► 远端本地文件系统
+                                            ▲ inotify/fanotify 事件 → 失效推送
+```
+
+- **客户端**：[hanwen/go-fuse v2](https://github.com/hanwen/go-fuse)（v2.11.0，BSD 许可，gocryptfs 等项目在用）。它支持 `DirectMount`（自己调用 `mount(2)`，不需要 fusermount），以及 `NotifyContent` / `NotifyEntry` / `NotifyDelete` 等内核缓存失效接口。
+- **协议**：FUSE 操作一一映射成 RPC：lookup、getattr、readdirplus、open、read、write、create、mkdir、unlink、rename、symlink、readlink、setattr、fsync、statfs，以及少量 xattr。用 protobuf 或 msgpack 编码，跑在已有的 yamux 连接上，与 exec 共用同一条通道。协议状态很薄：inode 用 (dev, ino, generation) 标识。另一个选择是直接采用 9P2000.L（例如 `hugelgupf/p9`，gVisor 系），再加一条失效侧信道。
+- **一致性模型**（比 NFS 强，这是选择 telefs 的主要理由）：
+  1. **exec 屏障**：远端每条命令结束时，tele-server 汇总该命令执行期间 inotify 记录到的变更路径，**在返回退出码之前**推送失效。客户端收到并执行 `Notify*` 之后，shim 才返回。这样可以保证「Bash 改了文件 → 紧接着 Read」这一最常见的顺序一定读到新内容。Claude 基于 mtime 的「文件已被修改」检测也因此变得准确。
+  2. **后台变更**：后台进程、hooks、MCP server 造成的变更同样通过 inotify 流异步推送。
+  3. 因为有了推送，内核的 attr/entry 缓存可以放心设置较长的 TTL（例如 30–60 秒），比 NFS 的 `actimeo=1` 快得多。只有推送断开时才退回短 TTL。
+  4. 写入路径：客户端 write 直接透传；fsync/close 时确认服务端已落盘。先不开 writeback cache，保证远端命令立即可见。
+- **inotify 限制**：大仓库需要调高远端的 `fs.inotify.max_user_watches`，由 install 负责检查和调整。有 root 时也可以改用 fanotify `FAN_MARK_FILESYSTEM`，不受数量限制。
+- **性能**：未命中缓存的操作 ≈ 1 RTT（与 NFS 相同）；命中缓存则为本地速度。Grep/Glob 仍然走远端 `rg` shim。可以预取小文件（首次 readdirplus 时顺带返回 <4 KB 文件的内容），减少往返。
+
+### 5A.3 本机实测（Linux 6.18，go-fuse v2.11.0）
+
+我写了一个最小启动器验证了关键路径：普通用户（uid 1001）在 `CLONE_NEWUSER|CLONE_NEWNS` 中把 uid/gid **映射为自身**，并用 ambient `CAP_SYS_ADMIN` 执行 `DirectMountStrict` 挂载 FUSE。随后子进程能读取已有文件，也能新建文件；宿主侧看到的属主是正确的 `1001:1002`。实测踩到的三个坑都有解：
+
+| 现象 | 原因 | 对策 |
+|---|---|---|
+| 挂载时 EPERM | 本测试容器的 `/dev/fuse` 权限是 0600（常规发行版是 0666） | install 时检查；用户环境通常不存在这个问题 |
+| 读正常、create 返回 EACCES | 内核把 FUSE 根 inode 初始化为 uid 0，而 uid 0 在 userns 中未映射，VFS 的 `HAS_UNMAPPED_ID` 因此拒绝写入 | 挂载后立即 `stat` 挂载点，触发 GETATTR 刷新根 inode 属主 |
+| `BACKING_OPEN` 报 EPERM | go-fuse 的 FUSE passthrough 需要**初始命名空间**的 CAP_SYS_ADMIN | telefs 本来就是远程文件，不使用 passthrough |
+| 子进程 CapEff 仍带 CAP_SYS_ADMIN | ambient capability 会在 exec 时被继承 | 启动 claude 前执行 `PR_CAP_AMBIENT_CLEAR_ALL`，或经过一个小的 exec 中转来清除 |
+
+另外，Ubuntu 23.10+ 的 AppArmor userns 限制（见第 4 节）仍然适用。
+
+### 5A.4 去掉 NFS 带来的连锁简化
+
+1. **本地可以完全不要 root**：内核 NFS 客户端不再需要内核 WG，WG 可以改用 **wireguard-go + gVisor netstack 在进程内运行**（不需要 TUN），telefs 和 exec 的 TCP 都跑在 netstack 上。fake-TCP（Musixal/tcpraw）只需要给二进制 `CAP_NET_RAW`。`teled` 可以从「root 守护进程」降级为普通用户服务。
+2. **远端也基本不要 root**：tele-server 以目标用户身份运行，文件和 exec 天然使用正确的 uid，不需要 exports、nfsd 和 `all_squash`。只有启用 fake-TCP 时需要 `CAP_NET_RAW`（通过 setcap 或 systemd `AmbientCapabilities` 授予），并且要能写那条可选的 TTL 丢弃规则。
+3. **路径同一性更容易**：FUSE 直接挂在会话 userns 的目标路径上，不需要「特权方先挂载、再 bind」这两步。
+4. **共享 scratch**（`CLAUDE_CODE_TMPDIR`、shell-snapshots、session-env）同样用 telefs 挂载。
+
+**代价**：telefs 需要自己写，约 3–4 周，其中测试占大头：可以用 pjdfstest 或 xfstests 的子集做 POSIX 语义回归，再用 git、npm、cargo 等真实工作负载做回归。FUSE 的上下文切换开销在 RTT 面前可以忽略。
 
 ## 6. 传输层
 
@@ -391,3 +451,4 @@ TELE_SESSION=<sid>                                   # shim 用它找到 teled �
 2. fake-TCP 层已定为 Musixal/tcpraw。是否要保留「降级到纯 UDP」的开关（默认关闭）？
 3. swgp-go 是否接受以独立子进程方式分发（AGPL 合规）？
 4. 一个会话是否需要同时挂载多台主机的不同路径（例如 A 的 `/srv/a` 和 B 的 `/srv/b` 同时可见），还是永远只有一台活跃主机？
+5. 文件层用 telefs（推荐，FUSE + 自有通道）还是保留 NFS？选 telefs 后，本地 WG 会改为 wireguard-go + netstack，全链路基本免 root。
