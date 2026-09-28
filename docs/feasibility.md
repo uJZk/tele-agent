@@ -335,6 +335,53 @@ tele host confirm myhost 'tele1r:…'
 
 ---
 
+### 6.6 附加系统提示词（运行环境说明）
+
+**目的**：让模型知道，它的执行环境可能在远程主机上，与全局 `~/.claude/CLAUDE.md`（通常描述本地机器）以及系统提示中的 OS 和平台信息不一定一致；需要确认时，应通过 `tele-agent` MCP 查询。
+
+**注入方式**：`tele claude` 生成 `<sess>/system-prompt.md`，通过 `--append-system-prompt-file` 传入（`claude --help` 中已确认该参数存在）。如果用户自己也传了 `--append-system-prompt[-file]`，tele 把两段内容**拼接**进同一个文件，不覆盖用户的内容。
+
+**只写静态内容**：因为有热切换（D5），系统提示词在会话中途不会更新。所以其中**不写死**主机名、OS 等动态信息，只说明规则，动态信息一律让模型去查 MCP。启动时的活跃主机可以作为「初始值」写入，但要注明它可能已经变化。
+
+**提示词草案**（用英文编写，便于模型遵循；文案在 P0 中结合实际效果调整）：
+
+```text
+# Execution environment (tele)
+
+This Claude Code session is running under `tele`. Claude Code itself runs on the user's
+local machine, but tools may execute on a REMOTE host:
+
+- Bash commands, hooks, stdio MCP servers, Grep/Glob (ripgrep) and git run on the
+  currently ACTIVE host.
+- Files under the project root (and any configured extra roots) are served from the
+  ACTIVE host via a mounted filesystem at the same absolute paths. Paths outside those
+  roots (e.g. /etc, ~/.bashrc) are read from the LOCAL machine by Read/Write/Edit;
+  use Bash to inspect such files on the active host.
+- The active host may be `local` or a remote machine, and it can change during the
+  session (hot switching). At session start it was: {{initial_host}}.
+
+Therefore the environment details in the system prompt (platform, OS version, shell)
+and in the global ~/.claude/CLAUDE.md describe the LOCAL machine and may NOT match the
+machine your commands actually run on. Project-level CLAUDE.md files come from the
+active host.
+
+When the execution environment matters (OS/distro, installed tools, paths, hostname,
+architecture, available resources), check it instead of assuming:
+- call `mcp__tele-agent__status` or `mcp__tele-agent__list` for the active host and
+  its OS/arch details;
+- switch hosts only with `mcp__tele-agent__switch`, and only when the user asks for it
+  or clearly implies it.
+If a command fails in a way that suggests an environment mismatch, re-check the active
+host before retrying.
+```
+
+**配套**：
+
+- `tele-agent` MCP 的 `instructions` 字段重复关键规则的精简版。有些客户端设置会截断系统提示词，两处都写可以保证模型至少能看到一处。
+- `list`、`status`、`switch` 的返回结果总是包含活跃主机的 hostname、OS/发行版、内核、架构、shell、项目根，作为「权威环境信息」。
+- 每次热切换后，switch 的返回结果开头再强调一次：「从现在起命令在 X 上执行」。
+- **兼容性测试**（纳入 R1 的 `claude -p` 测试集）：用「当前系统是什么发行版？」「帮我安装 xx」这类提示，验证模型会先调用 MCP 确认环境，而不是直接照搬系统提示或全局 CLAUDE.md 中的本地信息。
+
 ## 7. 风险与缓解
 
 | # | 风险 | 等级 | 缓解 |
@@ -374,7 +421,8 @@ CLAUDE_CODE_TMPDIR=/tmp/tele-<random>/tmp          # 本地 scratch；远端路�
 USE_BUILTIN_RIPGREP=0
 PATH=<sess>/bin:$PATH                              # rg、git shim
 TELE_SOCK=<sess>/sock                              # shim → 会话主进程
-# 参数：--mcp-config <含 tele-agent>；必要时 --setting-sources/--settings（改写后的 hooks）
+# 参数：--mcp-config <含 tele-agent>；--append-system-prompt-file <sess>/system-prompt.md（6.6，与用户自带的内容拼接）；
+#       必要时 --setting-sources/--settings（改写后的 hooks）
 ```
 
 ## 附录 B：已确认的次要决策
