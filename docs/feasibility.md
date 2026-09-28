@@ -222,7 +222,7 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 | 方案 | 优点 | 缺点 |
 |---|---|---|
 | A. 托管上游二进制（推荐第一阶段） | 立刻可用，协议与上游完全兼容 | 引入非 Go 二进制；自愈只能靠外部监控和重启 |
-| B. Go 原生重写 fake-TCP（第二阶段可选） | 单一语言；可以在进程内做精细自愈（换源端口、重握手） | 约 1.5–2.5k 行代码，要自己测抓包兼容性；TUN 用 `wireguard/tun` 或原始套接字 |
+| B. phantun-go：Go 重写、线协议兼容（见 6.4.2，**推荐默认**） | 单一 Go 二进制；进程内自愈；可以与上游 Phantun 互通 | 没有现成移植，需自写约 1–1.5k 行代码并做互通测试；需要 TUN 和 NAT 规则 |
 | C. Go 原生 raw-socket 模式（tcpraw 式，见 6.4.1） | 不需要 TUN 和 NAT 规则，只要 `CAP_NET_RAW`；可以作为库嵌入（MIT） | 线协议与 Phantun 不兼容（两端都由我们控制，这点无所谓） |
 
 #### 6.4.1 能不能做成纯用户态？
@@ -240,13 +240,49 @@ if (Wo(a.USE_BUILTIN_RIPGREP)) { let {cmd:n} = rm("rg",[]); if(n!=="rg") return 
 | **C1. tcpraw 式**（[xtaci/tcpraw](https://github.com/xtaci/tcpraw)，MIT，kcptun 的 `--tcp` 模式在用） | 只需 `CAP_NET_RAW`（可以用 `setcap` 或 systemd `AmbientCapabilities` 授予） | 可选 | 已核实其实现：先用**真实内核 TCP** 完成三次握手（中间设备看到的是标准 Linux TCP 指纹），然后把内核 socket 的 **TTL 设为 1**，让内核自己发出的 ACK 和重传在第一跳就被丢弃；数据走 raw IP socket（`ip4:tcp`）加 BPF 过滤收发。iptables 规则只用来丢掉 TTL=1 的包、避免 ICMP Time Exceeded 噪声，是**可选**的。直接暴露 `net.PacketConn`，可以嵌入 teled 或 tele-server。 |
 | **C2. TUN 版 Phantun 协议的 Go 实现** | `CAP_NET_ADMIN`；可以由安装器预建持久化 TUN（`ip tuntap add mode tun user <u>`），运行时就不需要 root | 需要一次性的 NAT 规则（由安装器写入 nft，运行时只校验） | 与上游 Phantun 线协议兼容，可以和现成的 phantun-server 对接 |
 
-**建议**：把 fake-TCP 做成 teled/tele-server 内部的可插拔 `Transport` 接口，提供三个实现：`phantun-exec`（托管上游二进制，保证兼容）、`rawtcp`（C1，默认推荐）、`phantun-go`（C2，可选）。C1 带来的好处：
+**建议**：把 fake-TCP 做成 teled/tele-server 内部的可插拔 `Transport` 接口，提供三个实现：`phantun-go`（6.4.2，**默认**，与上游线协议兼容）、`rawtcp`（C1，免 TUN、免 NAT 的备选）、`phantun-exec`（托管上游二进制，只在过渡期或排查问题时使用）。C1 相比 phantun-go 的额外好处：
 
 - 不需要 TUN，不需要 NAT/DNAT 规则，因此与 docker/firewalld 的冲突风险（R7）大幅下降。
 - 在进程内完成自愈：直接重拨真实 TCP 握手、换源端口，不用重启子进程。
 - 链路上少一个进程，少一跳 localhost UDP。
 
 需要额外验证的点：握手阶段使用了真实内核 TCP，在对称丢包、NAT 超时后的重连行为；以及长时间运行后内核 socket 接收缓冲区的处理（需要持续 drain，或者设置很小的 `SO_RCVBUF`）。
+
+#### 6.4.2 phantun-go：用 Go 重写 Phantun（线协议兼容）
+
+**现状**：目前**没有**现成的 Go 移植。能找到的只有：上游 [dndx/phantun](https://github.com/dndx/phantun)（Rust）、其 fork [sagan/phantun](https://github.com/sagan/phantun)、内核模块版 [phantun-dkms](https://github.com/bjin/phantun-dkms)，以及协议不同的 Go fake-TCP 库 [xitongsys/ptcp](https://github.com/xitongsys/ptcp)。所以 phantun-go 需要我们自己写。上游是 MIT/Apache-2.0 双许可，移植时保留署名即可。
+
+**协议规模很小**（依据上游 `fake-tcp/src/{lib,packet}.rs`）：
+
+| 项 | 上游行为 |
+|---|---|
+| 握手 | 客户端 SYN → 服务端 SYN+ACK → 客户端 ACK；connect 最多重试 6 次，每次超时 1s |
+| 报文头 | IPv4 TTL=64、DF；IPv6 hop limit=64；TCP window 固定 0xffff；**只有 SYN 带选项**（NOP + wscale=14） |
+| 数据 | 纯 ACK 标志，`seq += len(payload)`，`ack` 取对端最新 seq；**没有重传、没有拥塞控制和流控** |
+| 确认 | 未确认数据超过 128MB 时补发一个空 ACK |
+| 关闭 | 收到 RST 就关闭连接；本端 drop 时发 RST |
+| 保活 | 没有（依赖上层 WG 的 PersistentKeepalive） |
+| 并发 | TUN 多队列，每个队列一个 reader，连接按四元组查表 |
+| 上层 | 每条 fake-TCP 连接在服务端对应一个到后端的 UDP socket，一个 UDP 报文对应一个 TCP 段 |
+
+**Go 实现拆分**（估计 1,000–1,500 行，加上测试共 1.5–2 周）：
+
+1. `tun`：打开 `/dev/net/tun`，使用 `IFF_TUN|IFF_NO_PI|IFF_MULTI_QUEUE`。直接用 `x/sys/unix` 写 ioctl 就够了，也可以复用 `wireguard/tun`。
+2. `packet`：手写 IPv4/IPv6 + TCP 头的构造、解析和校验和。不用 gopacket，做到零分配，热路径复用 `sync.Pool` 缓冲。
+3. `faketcp`：连接状态机（Idle/SynSent/SynReceived/Established）、四元组表、Listener 与 Dialer。对外提供 `net.PacketConn` 风格的接口。
+4. `relay`：UDP ↔ fake-TCP 的双向转发。客户端监听 `127.0.0.1:Pp`，服务端每条连接对应一个后端 UDP socket。
+5. `netcfg`：用 `google/nftables` 在专用 table 里写客户端 MASQUERADE 和服务端 DNAT 规则，开启 `ip_forward`，并定期校验（参与自愈）。
+6. **互通测试**：CI 里建两个 netns + veth，分别跑「phantun-go ↔ phantun-go」「phantun-go 客户端 ↔ 上游 phantun-server」「上游 phantun-client ↔ phantun-go 服务端」三组，用 `tc netem` 注入丢包、乱序和 NAT 超时。
+
+**相对托管上游二进制的收益**：
+
+- 单一 Go 二进制：不用再分发 Rust 程序，也不用额外做 sha256 固定和下载流程。
+- **进程内自愈**：可以直接感知「连接已建立但只发不收」，立即对旧连接发 RST，然后换源端口重拨，无需重启进程。握手重试次数和超时也能按需调整。
+- **可选扩展，不破坏兼容**：只有两端都是 phantun-go 时，才通过握手后第一个数据包协商扩展能力，比如应用层保活、连接迁移、多连接并发条带化。对端是上游 Phantun 时自动退回严格兼容模式。
+
+**局限**：权限需求与上游相同，需要 TUN（`CAP_NET_ADMIN`）和 NAT 规则。不过 teled 和 tele-server 本来就以 root 运行，所以这在 tele 里不是额外负担。
+
+**变体（待验证）**：线协议兼容只取决于线上报文，与是否用 TUN 无关。所以 phantun-go 也可以做一个 **raw socket 后端**：用 AF_PACKET 或 raw IP 收发，再加一条「丢弃本端内核发出的 RST」的 nft 规则。这样就不需要 TUN、NAT 和 `ip_forward`，同时仍能与上游对接。代价是：内核会对这些「不属于任何 socket」的报文回 RST，必须用规则压住；可行性放到 P2 原型里验证。
 
 **顺带：整条链能否做到「本地免 root」？** 可以作为可选模式。
 
@@ -385,6 +421,6 @@ TELE_SESSION=<sid>                                   # shim 用它找到 teled �
 ## 附录 B：未决问题（需要用户决定）
 
 1. 热切换和冷切换哪个优先？（建议先做冷切换）
-2. fake-TCP 默认用哪种：Go 原生 raw-socket 模式（建议，只需 CAP_NET_RAW，线协议不兼容上游），还是与上游 Phantun 线协议兼容（托管二进制或 Go 版 TUN 实现）？
+2. fake-TCP 默认用 phantun-go（建议，与上游兼容，需要 TUN 和 NAT），还是 rawtcp（只需 CAP_NET_RAW，但与上游不兼容）？phantun-go 的 raw socket 后端是否值得在 P2 验证？
 3. swgp-go 是否接受以独立子进程方式分发（AGPL 合规）？
 4. 一个会话是否需要同时挂载多台主机的不同路径（例如 A 的 `/srv/a` 和 B 的 `/srv/b` 同时可见），还是永远只有一台活跃主机？
