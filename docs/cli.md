@@ -95,7 +95,7 @@ tele host confirm myhost 'tele1r:…'
 | `fs.inotify.max_user_watches` 不足（按项目文件数估算） | 🔐 | 写入 `/etc/sysctl.d/90-tele.conf` 并执行 `sysctl --system`；拒绝时降级为 ⚠️：变更推送会退回短 TTL |
 | 时钟同步（SS2022 要求误差在 30 秒以内） | 误差已超限为 ❌；NTP 未启用为 🔐 | 启用 `timedatectl set-ntp true` 需要同意；误差已经超限时直接报错，因为连接会被拒绝 |
 | `bash`、`rg`、`git` 是否可用 | ⚠️ | 缺少时对应的 Claude 功能会失败（见 [shim](exec.md#shim)） |
-| 内核版本、`/proc/sys/fs/inotify` 可用 | ❌ | 报错，并说明最低要求 |
+| 内核版本、`/proc` 已挂载（telefs 服务端经 `/proc/self/fd` 操作文件，见[对象标识](telefs.md#对象标识)）、`/proc/sys/fs/inotify` 可用 | ❌ | 报错，并说明最低要求 |
 
 **本地检查项**（`tele doctor`；首次运行 `tele <别名>` 时自动执行）：
 

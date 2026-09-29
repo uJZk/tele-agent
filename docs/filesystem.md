@@ -17,11 +17,23 @@ Claude 在项目之外需要访问的路径可以分为几类：自身的二进�
 | 类别 | 消除办法 | 结果 |
 |---|---|---|
 | Claude 二进制与动态库 | **先在本地视图中加载，再切换**：Claude 在本地 mountns 中 exec，动态链接器映射完所有 `DT_NEEDED` 库之后、`main` 之前，由预加载库把整个进程切换到远端视图（见 [teleswitch](#teleswitch)）。之后 `/proc/self/exe` 走的是 magic link，与路径无关，bun 读取内嵌 JS 不受影响。运行时才 dlopen 的库（例如 libgcc_s）加入 `LD_PRELOAD`，在切换前就映射好 | 不需要本地例外 |
-| DNS | 会话主进程在本地回环地址上提供 **CONNECT 代理**，并设置 `HTTPS_PROXY`、`HTTP_PROXY`；用户原有的代理串联在它后面。Claude 自己不做 DNS 解析，由代理在本地视图中完成 | 不需要本地例外 |
-| CA 证书 | **使用本地的 CA**：Claude 的 TLS 连接经本地代理从本机网络出站，信任关系应当与本地网络一致（例如公司的 HTTPS 中间人 CA），而远端可能根本没有装 `ca-certificates`，或者版本很旧。启动时把本地系统 CA 和用户原有的 `NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE` 合并成 `<sess>/ca-bundle.pem`，再用 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS` 指向它。**不** bind 到 `/etc/ssl`，所以远端视图中的 `/etc/ssl/certs` 仍然是远端的 | 用本地 CA，但不增加本地例外 |
+| DNS | 会话主进程在本地回环地址上提供 **CONNECT 代理**，并设置 `HTTPS_PROXY`、`HTTP_PROXY`；用户原有的代理串联在它后面（见下文的「CONNECT 代理」）。Claude 自己不做 DNS 解析，由代理在本地视图中完成 | 不需要本地例外 |
+| CA 证书 | **使用本地的 CA**：Claude 的 TLS 连接经本地代理从本机网络出站，信任关系应当与本地网络一致（例如公司的 HTTPS 中间人 CA），而远端可能根本没有装 `ca-certificates`，或者版本很旧。启动时把本地系统 CA 和用户原有的 `NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 合并成 `<sess>/ca-bundle.pem`（规则见下文的「CA bundle」），再用 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS` 指向它。**不** bind 到 `/etc/ssl`，所以远端视图中的 `/etc/ssl/certs` 仍然是远端的 | 用本地 CA，但不增加本地例外 |
 | `git`、`rg`、`uname` | `PATH` 中只有 `<sess>/bin` 里的转发 shim | 在远端执行 |
 | `/bin/sh`（`shell: true` 的 spawn 固定使用它） | 替换为 tele 的 `sh` shim（见 [shim](exec.md#shim)） | 语义上等同于远端的 sh |
 | 必须在本地运行的程序（例如 `ps`，它要看到本地进程） | `PATH` 中放**本地 exec 代理**（见 [shim](exec.md#shim)） | 在本地执行 |
+
+**CONNECT 代理**：
+
+- 上游代理必须取自用户**原来的**环境，不能取自 tele 为 Claude 准备的环境：后者的 `HTTPS_PROXY` 指向代理自己。
+- 上游代理的设置如果绕回了这个代理（例如残留的 `HTTPS_PROXY` 指向某个 tele 端口），每个请求都会递归转发给自己，直到进程耗尽 fd，FUSE 和会话通道也随之失效。所以代理转发的每个请求都带一个 `Via: <协议版本> tele-<随机>` 条目，随机部分每个会话不同；收到带有自己这个条目的请求时，在认证之前就以 508 拒绝，并提示修正或取消 `HTTPS_PROXY`、`HTTP_PROXY`。上游对 CONNECT 回 508 时，代理向客户端返回 502 和同样的提示。转发时保留客户端原有的 `Via` 条目，所以经过多个 tele 代理的环路也能发现。
+- 这个 `Via` 条目对上游代理和明文 http 的源站可见。
+
+**CA bundle**：
+
+- 本地系统 CA 只读 Go 的系统证书文件列表中**第一个**可读的文件；只有一个文件都读不到时，才读系统证书目录。所以在同时有 bundle 文件的主机上，只放进 `/etc/ssl/certs` 等目录、没有进入 bundle 文件的 CA 会被漏掉。
+- 用户的 `SSL_CERT_FILE`、`SSL_CERT_DIR`、`NODE_EXTRA_CA_CERTS` 是**追加**到系统 CA 上的；这与 Go 不同，Go 中 `SSL_CERT_FILE`、`SSL_CERT_DIR` 会替换系统列表。
+- 用户指定的 CA 路径读不了时启动失败，错误信息指明要修正或取消哪个变量：悄悄丢掉用户配置的 CA，会在之后表现为难以排查的 TLS 失败。
 
 **最终的本地集合**（在远端视图中通过 bind 挂载可见）：
 

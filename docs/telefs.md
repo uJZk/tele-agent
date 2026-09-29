@@ -23,10 +23,23 @@ telefs 是 tele 自己的 FUSE 文件系统：本地由会话主进程提供 FUS
 
 - **本地**：go-fuse v2，由会话主进程在 userns 中用 `DirectMountStrict` 挂载，不需要 fusermount。每个 FUSE 请求占用一条多路复用流。本地集合中的路径由合成的占位节点提供。
 - **协议**：FUSE 操作一一映射为 RPC，消息定义在 `internal/proto`。
-- **远端**：以目标用户身份访问文件。用户无权读取的文件（例如 `/etc/shadow`）返回 EACCES，与远端 Bash 的行为一致。errno 原样传回本地。
-- **标识**：远端文件以 (dev, ino) 标识。inode 号在文件删除后会被复用，所以按路径重新解析节点时，标识不一致的节点按另一个文件处理。
+- **远端**：以目标用户身份访问文件。用户无权读取的文件（例如 `/etc/shadow`）返回 EACCES，与远端 Bash 的行为一致。errno 原样传回本地，只有内核无法表示的 errno 例外：内核只接受 1 到 511 之间的 FUSE 错误码，超出范围的应答会让调用方永远挂起，所以 `ENOTSUPP`（524）换成 `EOPNOTSUPP`，其余换成 `EIO`（见[错误处理](coding-standards.md#错误处理)）。
+- **标识**：远端文件以 (dev, ino) 标识，见[对象标识](#对象标识)。
 - `/proc`、`/sys`、`/dev` 不从远端代理，因为远端视图中它们是本地的真实挂载。远端的进程信息请通过 Bash 查看。
 - **排查辅助**：telefs 在 debug 日志中记录 Claude 进程对疑似运行时文件（`*.so*`、`/etc/ssl` 下的路径）的访问，用于发现新版本 Claude 在切换视图后仍然读取本地运行时文件的情况。
+
+## 对象标识
+
+远端文件以 (dev, ino) 标识。按路径重新解析节点时，标识不一致的节点按另一个文件处理。
+
+远端的路径随时可能被替换成另一个对象（例如编辑器先写临时文件再 rename 覆盖），而内核发来的请求大多只指明节点，不指明打开的文件：
+
+- **内核契约**：只有截断（`ftruncate`、`O_TRUNC`）时 SETATTR 才带文件句柄。`fchmod`、`futimens`、`fstat` 和 `f*xattr` 作用于已打开的 fd 时，到 telefs 这里与按路径的调用完全一样。
+- 所以 telefs 优先通过**同一个远端对象**上已打开的服务端句柄执行这些操作；没有这样的句柄时，请求带上节点的 (dev, ino)，路径已经指向另一个对象时服务端返回 `ESTALE`，不作用于那个对象。
+- 对按路径的系统调用（`chmod`、`utimensat`、`*xattr`、`access`、`readlink`、`truncate`、`statfs`），VFS 收到 `ESTALE` 后以 `LOOKUP_REVAL` 重试一次，重新解析到新的对象。
+- 服务端先用 `O_PATH|O_NOFOLLOW` 固定住请求指向的对象，再对它执行校验和修改，两者不会落在不同的对象上。能用带 `AT_EMPTY_PATH` 的 `*at` 调用时就用；否则经 `/proc/self/fd/N` 操作：xattr 总是如此（`f*xattr` 不接受 `O_PATH` 的 fd），`chmod`、`utimensat`、`access` 在内核不支持对应的 `AT_EMPTY_PATH` 调用（例如缺少 `fchmodat2`、`faccessat2`）或者 seccomp 拒绝它们时也是如此。所以**远端主机必须挂载 `/proc`**。
+
+**局限**：标识只是 (dev, ino)。文件删除后 inode 号可能立即被复用（例如 ext4 上先删除、紧接着创建符号链接），这种替换检测不到。
 
 ## 属主
 
@@ -42,7 +55,7 @@ telefs 把**所有**文件的属主都呈现为本地用户的 uid 和 gid：
 1. **exec 屏障**：远端命令结束时，服务端先推送这条命令执行期间产生的变更，**然后**才返回退出状态；本地执行完对应的失效通知之后，shim 才返回（见 [exec 屏障](exec.md#exec-屏障)）。这保证了最常见的顺序「Bash 改了文件 → 紧接着 Read」一定读到新内容，Claude 基于 mtime 的修改检测也因此准确。
 2. **后台变更**（后台进程、hooks、MCP server 造成的变更）异步推送。
 3. 因为有推送，内核的 attr 和 entry 缓存可以使用较长的 TTL。推送通道断开时退回短 TTL；服务端丢失了事件（例如队列溢出）时，声明新的 **epoch**，本地对整棵树做全量失效。
-4. 写入直接透传，fsync 和 close 时确认远端已落盘。不开 writeback cache，保证远端命令立即能看到写入。
+4. 写入直接透传，fsync 和 close 时确认远端已落盘。不开 writeback cache，保证远端命令立即能看到写入。代价是经某个 fd 写过数据后，关闭它时要多一次远端 `fdatasync` 往返；没有写入的 close 没有额外开销。
 
 ## 变更监视
 

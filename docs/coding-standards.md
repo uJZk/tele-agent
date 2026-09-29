@@ -34,6 +34,7 @@
 - 包装错误用 `fmt.Errorf("open session dir: %w", err)`：小写开头，末尾不加句号，不以 `failed to`、`error` 开头，也不重复下层已经给出的信息。
 - 判断错误用 `errors.Is` / `errors.As`。包级哨兵错误定义为 `var ErrXxx = errors.New("<pkg>: ...")`。
 - **errno 必须保真**：telefs 和 exec 链路上，远端系统调用返回的 `unix.Errno` 要原样传回本地，telefs 交给内核的就是远端的 errno。只有本地确实无法知道原因时（例如会话租约已过期）才使用 `EIO`。
+  - 唯一的例外是内核无法表示的 errno：内核拒绝错误码不在 1 到 511 之间的 FUSE 应答，而 go-fuse 忽略这次写失败，请求永远得不到应答，调用方一直挂起（SIGKILL 也无效），直到 FUSE 连接被中止。这类 errno 是远端文件系统泄漏出来的内核内部错误码，所以 telefs 把 `ENOTSUPP`（524，NFS 会泄漏它）换成 `EOPNOTSUPP`，其余换成 `EIO`，并记录警告。
 - `panic` 只用于程序员错误（违反了不变量）。可以恢复的运行时错误一律返回 error。唯一允许 `recover` 的位置是服务端每个会话的顶层 goroutine：记录堆栈，然后关闭**整个**会话，不能只丢掉出错的那个请求继续运行。
 - 面向用户的错误信息要说明三件事：发生了什么、可能的原因、下一步怎么做（例如提示运行 `tele doctor <别名>`）。
 

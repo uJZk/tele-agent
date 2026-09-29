@@ -47,7 +47,7 @@ Claude 在本地打开、远端命令也要访问的文件：
 | shell 快照（`<config>/shell-snapshots/*.sh`） | 远端（生成脚本） | 远端命令 source；本地 Claude 检查它是否存在 | 远端保留一份；回传一份本地副本，用于通过存在性检查 |
 | `CLAUDE_ENV_FILE`（`<config>/session-env/…`，由 SessionStart hook 写入） | 远端 hook | 本地 Claude | 回传 |
 | `tasks/` 下的标记文件（`echo 0 >| …/tasks/…`） | 远端命令 | 本地 Claude | 回传 |
-| 后台任务的输出文件 | Claude 在**本地** `open(path, "w")`，把 fd 作为子进程的 stdout | 本地 Claude | 无需处理：远端输出经 shim 写入这个本地 fd |
+| 后台任务的输出文件 | Claude 在**本地** `open(path, "w")`，把 fd 作为子进程的 stdout | 本地 Claude | 远端输出经 shim 写入这个本地 fd；它如果位于 scratch 目录中，写入期间不参与同步（见 [scratch 路径改写与回传](exec.md#scratch-路径改写与回传)） |
 
 `<config>` 是 Claude 的配置目录，即 `~/.claude`。机制见 [scratch 路径改写与回传](exec.md#scratch-路径改写与回传)。
 
@@ -94,6 +94,14 @@ LD_PRELOAD=<sess>/lib/teleswitch.so               # 与 TELE_SWITCH_FD、TELE_SW
 
 启动时生成 `<sess>/system-prompt.md`，通过 `--append-system-prompt-file` 传入。如果用户自己也传了 `--append-system-prompt` 或 `--append-system-prompt-file`，两段内容**拼接**进同一个文件，不覆盖用户的内容。
 
+找出这两个参数时要遵循 Claude 的命令行解析规则。Claude 用 commander.js 解析命令行：
+
+- 这两个选项都只有长形式，并且必须带值，写作 `--flag value` 或 `--flag=value`；
+- 值总是取下一个参数，即使它以 `-` 开头；缺少值是错误；
+- `--` 之后的内容都不是选项。
+
+tele 不模拟 Claude 其它选项的参数个数，所以恰好等于这两个选项名的参数一律按选项处理，即使 Claude 会把它当作前一个选项的值：例如参数以 `-p "--append-system-prompt"` 结尾时，tele 报告这个选项缺少值，而不是把它当作提示词。只是包含选项名文字的参数（例如提到它的提示词）不受影响。
+
 内容**只写目标主机的信息**，取值来自建立会话时从服务端获取的信息：
 
 ```text
@@ -130,4 +138,5 @@ This session operates on the remote host "{{alias}}" via tele.
 | 只靠 `SSL_CERT_FILE` 和 `NODE_EXTRA_CA_CERTS`，bun 就会使用 `<sess>/ca-bundle.pem`，不再依赖系统证书目录 | 把本地证书目录 bind 到 `/etc/ssl` 等路径，多一个本地例外 |
 | Claude 写 `~/.claude.json` 的方式与 bind 挂载的单个文件兼容。如果它先写临时文件再 rename 覆盖，rename 到挂载点上会失败（`EBUSY` 或 `EXDEV`） | telefs 把远端 `HOME` 下以 `.claude.json` 开头的名字映射到本地文件，让临时文件和目标文件位于同一个文件系统 |
 | `tasks/` 标记文件位于某个 scratch 前缀之下 | 为它所在的目录增加 scratch 前缀 |
+| Claude 在运行 SessionStart hook 之前，在本地创建了 `CLAUDE_ENV_FILE` 这个文件，而不只是它所在的 `session-env/<id>` 目录。scratch 同步只传普通文件、不传空目录，只有目录时远端 hook 的 `>> "$CLAUDE_ENV_FILE"` 会因远端目录不存在而失败（ENOENT） | 上传时为本会话认领的空目录在远端建出对应目录 |
 | Claude 按绝对路径启动的程序可以逐个列出并处理（见 [shim](exec.md#shim)） | 无 |

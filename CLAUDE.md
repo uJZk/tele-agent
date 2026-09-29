@@ -35,8 +35,8 @@ go test ./internal/<pkg> -run TestName   # 运行单个测试
 - **Go 运行时是多线程的**：`unshare`、`setns`、`capset` 不能在普通 goroutine 中调用，要通过重新 exec 自己完成（见[系统调用、命名空间与进程](docs/coding-standards.md#系统调用命名空间与进程)）。
 - **shim 的 stdio 属于被代理的命令**：绝不向其中写诊断信息，否则会破坏命令输出和 MCP 的 JSON-RPC 流。
 - **视图切换必须失败关闭**：Claude 进程在本地视图中继续运行，会把本地文件当作远端文件修改。
-- **errno 保真**：远端的 errno 原样传回本地，不折叠成 `EIO`。
-- **抽象 unix socket 没有权限保护**：必须校验 `SO_PEERCRED` 和会话 token。
+- **errno 保真**：远端的 errno 原样传回本地，不折叠成 `EIO`。唯一的例外是 telefs 交给内核的 errno：内核只接受 1 到 511，超出范围的 FUSE 应答会让调用方永远挂起（见[组成](docs/telefs.md#组成)）。
+- **抽象 unix socket 没有权限保护**：shim 和会话主进程都要用 `SO_PEERCRED` 校验对方的 uid，会话主进程还要校验会话 token（见[本地的会话主进程](docs/security.md#本地的会话主进程)）。
 - **不要对本地集合的挂载点及其祖先发送 FUSE entry 失效**：可能卸下 bind 挂载（见[已知陷阱](docs/filesystem.md#已知陷阱)）。
 - **Claude Code 的行为大多没有文档**：兼容性测试失败时，先确认并更新 `docs/claude-code.md`，再改代码。
 
