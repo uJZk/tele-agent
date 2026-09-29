@@ -135,6 +135,7 @@ func TestLocalNamesConfig(t *testing.T) {
 		{"ok", []Placeholder{{Path: "/h/.claude", Dir: true}}, []LocalNames{{Dir: "/h", Prefix: ".claude.json", Local: "/l"}}, true},
 		{"placeholder among local names", []Placeholder{{Path: "/h/.claude.json"}}, []LocalNames{{Dir: "/h", Prefix: ".claude.json", Local: "/l"}}, false},
 		{"on a placeholder", []Placeholder{{Path: "/h", Dir: true}}, []LocalNames{{Dir: "/h", Prefix: ".x", Local: "/l"}}, false},
+		{"directory twice", nil, []LocalNames{{Dir: "/h", Prefix: ".x", Local: "/l"}, {Dir: "/h", Prefix: ".y", Local: "/l"}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := buildTree(tc.ps, tc.ls); (err == nil) != tc.ok {
@@ -147,6 +148,7 @@ func TestLocalNamesConfig(t *testing.T) {
 		{Dir: "/h", Prefix: "", Local: "/l"},
 		{Dir: "/h", Prefix: "a/b", Local: "/l"},
 		{Dir: "/h", Prefix: ".x", Local: "l"},
+		{Dir: "/h", Prefix: ".x\x00", Local: "/l"},
 	} {
 		if err := checkLocalNames([]LocalNames{l}); err == nil {
 			t.Errorf("checkLocalNames(%+v) accepted it", l)

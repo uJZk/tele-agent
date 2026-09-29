@@ -4,7 +4,6 @@ import (
 	"context"
 	"maps"
 	"os"
-	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -405,19 +404,27 @@ func (m *mergedDir) loadRemote() bool {
 // only leaves them out.
 func (m *mergedDir) loadLocal() {
 	l := m.n.local
-	ents, err := os.ReadDir(l.root)
+	d, err := os.Open(l.root)
+	if err != nil {
+		m.n.fsys.log.Debug("telefs: list local names", "err", err)
+		return
+	}
+	defer func() { _ = d.Close() }() // read-only
+	// Unsorted names, and a stat of the matches only: the directory is
+	// the local HOME, with many other entries.
+	names, err := d.Readdirnames(-1)
 	if err != nil {
 		m.n.fsys.log.Debug("telefs: list local names", "err", err)
 	}
-	for _, e := range ents {
-		if !l.owns(e.Name()) {
+	for _, name := range names {
+		if !l.owns(name) {
 			continue
 		}
 		var st unix.Stat_t
-		if unix.Lstat(filepath.Join(l.root, e.Name()), &st) != nil {
+		if unix.Fstatat(int(d.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
 			continue
 		}
-		m.entries = append(m.entries, mergedEntry{name: e.Name(), mode: st.Mode & syscall.S_IFMT, ino: localIno(&st), local: true})
+		m.entries = append(m.entries, mergedEntry{name: name, mode: st.Mode & syscall.S_IFMT, ino: localIno(&st), local: true})
 	}
 }
 

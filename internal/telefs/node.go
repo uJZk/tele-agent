@@ -3,14 +3,12 @@ package telefs
 import (
 	"context"
 	"path"
-	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
@@ -222,7 +220,7 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 		return &c.Inode, 0
 	}
 	if n.local.owns(name) {
-		return f.localLookup(ctx, &n.Inode, n, n.local.root, name, out)
+		return n.localAt().lookup(ctx, name, out)
 	}
 	if n.kind == kindPlaceholderDir {
 		out.SetEntryTimeout(shortTTL)
@@ -438,7 +436,7 @@ func (n *node) created(ctx context.Context, name string, resp *proto.FSResponse,
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	f := n.fsys
 	if n.local.owns(name) {
-		return f.localCreate(ctx, &n.Inode, n, n.local.root, name, flags, mode, out)
+		return n.localAt().create(ctx, name, flags, mode, out)
 	}
 	dir, errno := n.newEntry(name)
 	if errno != 0 {
@@ -474,7 +472,7 @@ func (n *node) mkentry(ctx context.Context, req *proto.FSRequest, out *fuse.Entr
 // Mkdir implements fs.NodeMkdirer.
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if n.local.owns(name) {
-		return n.fsys.localMkdir(ctx, &n.Inode, n, n.local.root, name, mode, out)
+		return n.localAt().mkdir(ctx, name, mode, out)
 	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSMkdir, Name: name, Mode: mode}, out)
 }
@@ -490,7 +488,7 @@ func (n *node) Mknod(ctx context.Context, name string, mode, dev uint32, out *fu
 // Symlink implements fs.NodeSymlinker.
 func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if n.local.owns(name) {
-		return n.fsys.localSymlink(ctx, &n.Inode, n, n.local.root, target, name, out)
+		return n.localAt().symlink(ctx, target, name, out)
 	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSSymlink, Name: name, Target: target}, out)
 }
@@ -526,11 +524,10 @@ func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 func (n *node) remove(op proto.FSOp, name string) syscall.Errno {
 	f := n.fsys
 	if n.local.owns(name) {
-		p := filepath.Join(n.local.root, name)
 		if op == proto.FSRmdir {
-			return errnoOf(unix.Rmdir(p))
+			return n.localAt().rmdir(name)
 		}
-		return errnoOf(unix.Unlink(p))
+		return n.localAt().unlink(name)
 	}
 	if n.isProtected(name) {
 		return syscall.EBUSY
@@ -558,11 +555,7 @@ func (n *node) Rmdir(_ context.Context, name string) syscall.Errno {
 func (n *node) Rename(_ context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	f := n.fsys
 	if n.local.owns(name) {
-		dir2, errno := localRenameTarget(n, newParent, newName)
-		if errno != 0 {
-			return errno
-		}
-		return localRename(n.local.root, name, dir2, newName, flags)
+		return n.localAt().rename(name, newParent, newName, flags)
 	}
 	np, ok := newParent.(*node)
 	if !ok || np.local.owns(newName) {

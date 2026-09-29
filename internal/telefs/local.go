@@ -44,21 +44,16 @@ func (l *localDir) owns(name string) bool {
 }
 
 func checkLocalNames(ls []LocalNames) error {
-	dirs := map[string]bool{}
 	for _, l := range ls {
 		if err := proto.CheckPath(l.Dir); err != nil {
 			return fmt.Errorf("telefs: local names: invalid directory %q", l.Dir)
 		}
-		if l.Prefix == "" || strings.Contains(l.Prefix, "/") || l.Prefix == "." || l.Prefix == ".." {
+		if proto.CheckName(l.Prefix) != nil {
 			return fmt.Errorf("telefs: local names in %s: invalid prefix %q", l.Dir, l.Prefix)
 		}
 		if !filepath.IsAbs(l.Local) {
 			return fmt.Errorf("telefs: local names in %s: local directory %q is not absolute", l.Dir, l.Local)
 		}
-		if dirs[l.Dir] {
-			return fmt.Errorf("telefs: local names: %s listed twice", l.Dir)
-		}
-		dirs[l.Dir] = true
 	}
 	return nil
 }
@@ -125,6 +120,10 @@ func (f *FS) localEntry(ctx context.Context, parent *fs.Inode, home *node, st *u
 	return ch
 }
 
+// errnoOf returns the errno of a local system call's error. Unlike
+// go-fuse's fs.ToErrno, which answers ENOSYS, it reports an error without
+// one as EIO, the errno telefs uses when the cause is unknown
+// (docs/coding-standards.md "错误处理").
 func errnoOf(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -136,20 +135,37 @@ func errnoOf(err error) syscall.Errno {
 	return syscall.EIO
 }
 
-// localLookup looks up name in local directory dir.
-func (f *FS) localLookup(ctx context.Context, parent *fs.Inode, home *node, dir, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+// localAt performs the entry operations of one local directory: dir is
+// its local path, parent its inode, home the directory with the rule.
+type localAt struct {
+	fsys   *FS
+	parent *fs.Inode
+	home   *node
+	dir    string
+}
+
+// at returns the entry operations of the directory with the rule itself.
+func (n *node) localAt() localAt {
+	return localAt{fsys: n.fsys, parent: &n.Inode, home: n, dir: n.local.root}
+}
+
+// at returns the entry operations of local directory l.
+func (l *localNode) at() localAt {
+	return localAt{fsys: l.fsys, parent: &l.Inode, home: l.home, dir: l.path()}
+}
+
+func (a localAt) lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var st unix.Stat_t
-	if err := unix.Lstat(filepath.Join(dir, name), &st); err != nil {
+	if err := unix.Lstat(filepath.Join(a.dir, name), &st); err != nil {
 		out.SetEntryTimeout(0)
 		return nil, errnoOf(err)
 	}
-	return f.localEntry(ctx, parent, home, &st, out), 0
+	return a.fsys.localEntry(ctx, a.parent, a.home, &st, out), 0
 }
 
-// localCreate creates and opens file name in local directory dir.
-func (f *FS) localCreate(ctx context.Context, parent *fs.Inode, home *node, dir, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+func (a localAt) create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	// Like go-fuse's loopback: the kernel computes append offsets itself.
-	fd, err := unix.Open(filepath.Join(dir, name), int(flags&^syscall.O_APPEND)|unix.O_CREAT|unix.O_CLOEXEC, mode)
+	fd, err := unix.Open(filepath.Join(a.dir, name), int(flags&^syscall.O_APPEND)|unix.O_CREAT|unix.O_CLOEXEC, mode)
 	if err != nil {
 		return nil, nil, 0, errnoOf(err)
 	}
@@ -158,49 +174,55 @@ func (f *FS) localCreate(ctx context.Context, parent *fs.Inode, home *node, dir,
 		_ = unix.Close(fd)
 		return nil, nil, 0, errnoOf(err)
 	}
-	return f.localEntry(ctx, parent, home, &st, out), fs.NewLoopbackFile(fd), 0, 0
+	return a.fsys.localEntry(ctx, a.parent, a.home, &st, out), fs.NewLoopbackFile(fd), 0, 0
 }
 
-// localMkdir creates directory name in local directory dir.
-func (f *FS) localMkdir(ctx context.Context, parent *fs.Inode, home *node, dir, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	p := filepath.Join(dir, name)
-	if err := unix.Mkdir(p, mode); err != nil {
+func (a localAt) mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if err := unix.Mkdir(filepath.Join(a.dir, name), mode); err != nil {
 		return nil, errnoOf(err)
 	}
-	return f.localLookup(ctx, parent, home, dir, name, out)
+	return a.lookup(ctx, name, out)
 }
 
-// localSymlink creates symlink name in local directory dir.
-func (f *FS) localSymlink(ctx context.Context, parent *fs.Inode, home *node, dir, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if err := unix.Symlink(target, filepath.Join(dir, name)); err != nil {
+func (a localAt) symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if err := unix.Symlink(target, filepath.Join(a.dir, name)); err != nil {
 		return nil, errnoOf(err)
 	}
-	return f.localLookup(ctx, parent, home, dir, name, out)
+	return a.lookup(ctx, name, out)
 }
 
-// localRenameTarget returns the local directory that entry newName of
-// newParent lives in, or EXDEV if it is not local under home.
-func localRenameTarget(home *node, newParent fs.InodeEmbedder, newName string) (string, syscall.Errno) {
+func (a localAt) unlink(name string) syscall.Errno {
+	return errnoOf(unix.Unlink(filepath.Join(a.dir, name)))
+}
+
+func (a localAt) rmdir(name string) syscall.Errno {
+	return errnoOf(unix.Rmdir(filepath.Join(a.dir, name)))
+}
+
+// rename moves entry name to entry newName of newParent, which must be
+// local under the same rule: anything else is another file system (EXDEV).
+func (a localAt) rename(name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	var dir2 string
 	switch np := newParent.(type) {
 	case *localNode:
-		if np.home == home {
-			return np.path(), 0
+		if np.home != a.home {
+			return syscall.EXDEV
 		}
+		dir2 = np.path()
 	case *node:
-		if np == home && home.local.owns(newName) {
-			return home.local.root, 0
+		if np != a.home || !np.local.owns(newName) {
+			return syscall.EXDEV
 		}
+		dir2 = np.local.root
+	default:
+		return syscall.EXDEV
 	}
-	return "", syscall.EXDEV
-}
-
-func localRename(dir1, name, dir2, newName string, flags uint32) syscall.Errno {
-	return errnoOf(unix.Renameat2(unix.AT_FDCWD, filepath.Join(dir1, name), unix.AT_FDCWD, filepath.Join(dir2, newName), uint(flags)))
+	return errnoOf(unix.Renameat2(unix.AT_FDCWD, filepath.Join(a.dir, name), unix.AT_FDCWD, filepath.Join(dir2, newName), uint(flags)))
 }
 
 // Lookup implements fs.NodeLookuper.
 func (l *localNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	return l.fsys.localLookup(ctx, &l.Inode, l.home, l.path(), name, out)
+	return l.at().lookup(ctx, name, out)
 }
 
 // Getattr implements fs.NodeGetattrer.
@@ -271,7 +293,13 @@ func (l *localNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetA
 			return errnoOf(err)
 		}
 	}
-	return l.Getattr(ctx, nil, out)
+	var st unix.Stat_t
+	if err := unix.Lstat(p, &st); err != nil {
+		return errnoOf(err)
+	}
+	l.fsys.localAttr(&out.Attr, &st)
+	out.SetTimeout(0)
+	return 0
 }
 
 // Open implements fs.NodeOpener.
@@ -290,36 +318,32 @@ func (l *localNode) Readdir(context.Context) (fs.DirStream, syscall.Errno) {
 
 // Create implements fs.NodeCreater.
 func (l *localNode) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	return l.fsys.localCreate(ctx, &l.Inode, l.home, l.path(), name, flags, mode, out)
+	return l.at().create(ctx, name, flags, mode, out)
 }
 
 // Mkdir implements fs.NodeMkdirer.
 func (l *localNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	return l.fsys.localMkdir(ctx, &l.Inode, l.home, l.path(), name, mode, out)
+	return l.at().mkdir(ctx, name, mode, out)
 }
 
 // Symlink implements fs.NodeSymlinker.
 func (l *localNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	return l.fsys.localSymlink(ctx, &l.Inode, l.home, l.path(), target, name, out)
+	return l.at().symlink(ctx, target, name, out)
 }
 
 // Unlink implements fs.NodeUnlinker.
 func (l *localNode) Unlink(_ context.Context, name string) syscall.Errno {
-	return errnoOf(unix.Unlink(filepath.Join(l.path(), name)))
+	return l.at().unlink(name)
 }
 
 // Rmdir implements fs.NodeRmdirer.
 func (l *localNode) Rmdir(_ context.Context, name string) syscall.Errno {
-	return errnoOf(unix.Rmdir(filepath.Join(l.path(), name)))
+	return l.at().rmdir(name)
 }
 
 // Rename implements fs.NodeRenamer.
 func (l *localNode) Rename(_ context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	dir2, errno := localRenameTarget(l.home, newParent, newName)
-	if errno != 0 {
-		return errno
-	}
-	return localRename(l.path(), name, dir2, newName, flags)
+	return l.at().rename(name, newParent, newName, flags)
 }
 
 // Readlink implements fs.NodeReadlinker.

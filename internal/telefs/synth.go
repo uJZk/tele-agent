@@ -22,6 +22,16 @@ type synthSpec struct {
 	local    *localDir
 }
 
+// ancestor returns child name of s, creating it as an ancestor if missing.
+func (s *synthSpec) ancestor(name string) *synthSpec {
+	c := s.children[name]
+	if c == nil {
+		c = &synthSpec{kind: kindAncestor, children: map[string]*synthSpec{}}
+		s.children[name] = c
+	}
+	return c
+}
+
 // buildTree validates the placeholders and returns the synthetic tree
 // rooted at "/": every placeholder plus every ancestor of one, and every
 // directory with local names plus its ancestors.
@@ -31,13 +41,11 @@ func buildTree(ps []Placeholder, ls []LocalNames) (*synthSpec, error) {
 		cur := root
 		if l.Dir != "/" {
 			for _, name := range strings.Split(l.Dir[1:], "/") {
-				next := cur.children[name]
-				if next == nil {
-					next = &synthSpec{kind: kindAncestor, children: map[string]*synthSpec{}}
-					cur.children[name] = next
-				}
-				cur = next
+				cur = cur.ancestor(name)
 			}
+		}
+		if cur.local != nil {
+			return nil, fmt.Errorf("telefs: local names: %s listed twice", l.Dir)
 		}
 		cur.local = &localDir{prefix: l.Prefix, root: l.Local}
 	}
@@ -60,7 +68,7 @@ func buildTree(ps []Placeholder, ls []LocalNames) (*synthSpec, error) {
 			last := i == len(parts)-1
 			switch {
 			case next == nil && !last:
-				next = &synthSpec{kind: kindAncestor, children: map[string]*synthSpec{}}
+				next = cur.ancestor(name)
 			case next == nil:
 				next = &synthSpec{kind: kindPlaceholderFile, children: map[string]*synthSpec{}}
 				if p.Dir {
