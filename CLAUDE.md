@@ -9,6 +9,8 @@ make build        # 构建 bin/tele（先编译 teleswitch 预加载库，再嵌
 make test         # 单元测试（-race），不需要特权
 make lint         # golangci-lint，必须零告警
 make check        # 提交前检查：格式、vet、lint、test
+make vuln         # govulncheck
+make dist         # 发布文件：各架构的归档、附带依赖的源码、SHA256SUMS（需要 aarch64-linux-gnu-gcc）
 make test-priv    # 特权集成测试（userns、FUSE）：设置 TELE_TEST_REQUIRE_PRIV=1，环境不具备能力时失败而不是跳过
 go test ./internal/<pkg> -run TestName   # 运行单个测试
 ```

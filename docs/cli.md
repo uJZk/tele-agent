@@ -57,7 +57,8 @@ tele dev -p "…"           # 同上
 tele host add myhost --endpoint 203.0.113.5:8443
 
 # 远端，以 tele 要运行的用户身份（普通用户即可）：
-# 从项目的 GitHub Releases 下载与远端架构对应的 tele，放到 ~/.local/bin/tele 并加上可执行权限
+# 从项目的 GitHub Releases 下载与远端架构对应的 tele-<版本>-linux-<架构>.tar.gz，用 SHA256SUMS 校验，
+# 把其中的 tele 放到 ~/.local/bin/tele（文件名必须是 tele：它按 argv[0] 分派，别的名字会被当作 shim）
 tele server install          # 提示时粘贴配对串；预检、写入配置、启动服务，最后打印回执串 tele1r:…
 
 # 本地

@@ -4,4 +4,3 @@
 
 - **`tele server install/uninstall` 与 `tele doctor`**：预检、`systemd --user` 单元、安装清单与回滚、时钟偏差报告（[预检与修复策略](docs/cli.md#预检与修复策略)）。
 - **AppArmor profile**：随包附带，由 `tele doctor` 安装（[预检与修复策略](docs/cli.md#预检与修复策略)）。
-- **发布**：按架构构建静态二进制、校验和，并附带对应源码（AGPL-3.0）。

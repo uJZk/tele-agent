@@ -14,7 +14,7 @@ TELESWITCH_SO := internal/teleswitch/lib/teleswitch-$(GOARCH).so
 TELESWITCH_CFLAGS := -std=c11 -O2 -fPIC -shared -nostdlib -ffreestanding \
 	-fno-stack-protector -fno-builtin -Wall -Wextra -Werror -Wl,-z,now
 
-.PHONY: all build teleswitch test test-priv lint fmt check clean
+.PHONY: all build teleswitch test test-priv lint vuln fmt check dist clean
 
 all: build
 
@@ -24,7 +24,7 @@ $(TELESWITCH_SO): internal/teleswitch/csrc/teleswitch.c
 	$(CC) $(TELESWITCH_CFLAGS) -o $@ $<
 
 build: teleswitch
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/tele
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/tele
 
 test:
 	$(GO) test -race ./...
@@ -35,10 +35,17 @@ test-priv:
 lint:
 	$(GOLANGCI_LINT) run ./...
 
+vuln:
+	$(GO) tool -modfile=tools/go.mod govulncheck ./...
+
 fmt:
 	$(GOLANGCI_LINT) fmt ./...
 
 check: lint test
 
+# Release files: static binaries per architecture, source, checksums.
+dist:
+	VERSION=$(VERSION) GO=$(GO) scripts/dist.sh
+
 clean:
-	rm -rf bin $(wildcard internal/teleswitch/lib/*.so)
+	rm -rf bin dist $(wildcard internal/teleswitch/lib/*.so)
