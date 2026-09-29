@@ -46,9 +46,11 @@ type Call struct {
 	Own, Child bool
 }
 
+// strace pads the pid column to a fixed width in some versions, so the
+// pid is followed by one or more spaces.
 var (
-	callRE    = regexp.MustCompile(`^(\d+) ([a-z0-9_]+)\((.*)$`)
-	resumedRE = regexp.MustCompile(`^(\d+) <\.\.\. ([a-z0-9_]+) resumed>(.*)$`)
+	callRE    = regexp.MustCompile(`^(\d+) +([a-z0-9_]+)\((.*)$`)
+	resumedRE = regexp.MustCompile(`^(\d+) +<\.\.\. ([a-z0-9_]+) resumed>(.*)$`)
 	resultRE  = regexp.MustCompile(`= (\d+)$`)
 )
 
