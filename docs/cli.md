@@ -32,7 +32,8 @@ tele dev -p "…"           # 同上
 |---|---|
 | `tele host add <别名> …` / `tele host confirm` / `tele host ls` / `tele host rm` | 登记主机、配对，查看状态（连通性、RTT、时钟偏差、操作系统信息） |
 | `tele doctor [别名]` | 本地检查，指定别名时再检查到该主机的连通性（见[预检与修复策略](#预检与修复策略)） |
-| `tele server install` / `run` / `uninstall` | 远端服务 |
+| `tele server install` / `run` / `uninstall` | 远端服务。`run` 在前台运行服务，日志写到 stderr（由 systemd 送进 journal），收到 SIGTERM 或 SIGINT 后结束所有会话再退出；`--listen` 覆盖配置中的监听地址 |
+| `tele version` | 打印版本：发布版本由构建时注入，开发构建显示 Go 工具链记录的 VCS 修订 |
 
 所有子命令名都是保留字，不能用作主机别名。
 
@@ -74,7 +75,8 @@ tele host confirm myhost 'tele1r:…'
 | 路径 | 内容 |
 |---|---|
 | `~/.config/tele/hosts/<别名>.json`（本地） | 主机别名的 endpoint 与凭据（0600）：SS2022 endpoint（`host:port`）用 PSK，`unix:<路径>` endpoint 用 token。其他用户可读时拒绝使用 |
-| `~/.config/tele/`（远端） | 服务端配置、PSK（0600）、安装清单 `install-manifest.json` |
+| `~/.config/tele/server.json`（远端） | 服务端的监听地址与 PSK（0600）。其他用户可读时拒绝启动 |
+| `~/.config/tele/install-manifest.json`（远端） | 安装清单 |
 | `~/.cache/tele/s/<sid>/`（远端） | 会话目录：scratch 文件、溢出到磁盘的命令输出 |
 
 ## 预检与修复策略

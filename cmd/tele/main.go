@@ -11,7 +11,9 @@ import (
 
 	"github.com/ujzk/tele-agent/internal/cli"
 	"github.com/ujzk/tele-agent/internal/launcher"
+	"github.com/ujzk/tele-agent/internal/servercmd"
 	"github.com/ujzk/tele-agent/internal/shim"
+	"github.com/ujzk/tele-agent/internal/version"
 	"github.com/ujzk/tele-agent/internal/view"
 )
 
@@ -38,6 +40,13 @@ func run(name string, args []string) int {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
 		fmt.Fprintln(os.Stderr, launcher.Usage)
 		return 2
+	}
+	switch args[0] {
+	case "version":
+		fmt.Println("tele", version.String())
+		return 0
+	case "server":
+		return servercmd.Main(args[1:], os.Stdout, os.Stderr)
 	}
 	if cli.IsReserved(args[0]) {
 		fmt.Fprintf(os.Stderr, "tele: %s: not implemented yet\n", args[0])

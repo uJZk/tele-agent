@@ -4,6 +4,10 @@ GOARCH        ?= $(shell $(GO) env GOARCH)
 GOLANGCI_LINT ?= $(GO) tool -modfile=tools/go.mod golangci-lint
 
 BIN           := bin/tele
+# Release builds stamp the version; without git it stays empty and tele
+# reports the VCS revision the Go toolchain recorded instead.
+VERSION       ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+LDFLAGS       := -s -w -X github.com/ujzk/tele-agent/internal/version.Version=$(VERSION)
 TELESWITCH_SO := internal/teleswitch/lib/teleswitch-$(GOARCH).so
 # teleswitch runs inside the Claude process before main: no libc, no
 # DT_NEEDED, raw syscalls only (docs/coding-standards.md "C 代码（teleswitch）").
@@ -20,7 +24,7 @@ $(TELESWITCH_SO): internal/teleswitch/csrc/teleswitch.c
 	$(CC) $(TELESWITCH_CFLAGS) -o $@ $<
 
 build: teleswitch
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/tele
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/tele
 
 test:
 	$(GO) test -race ./...
