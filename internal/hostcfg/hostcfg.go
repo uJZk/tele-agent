@@ -31,7 +31,13 @@ type Host struct {
 	// Token authenticates sessions on a unix endpoint, whose transport
 	// does not authenticate the peer.
 	Token string `json:"token,omitempty"`
+	// PendingToken is the one-time pairing token (base64) while pairing
+	// waits for "tele host confirm"; the alias cannot be used until then.
+	PendingToken string `json:"pending_token,omitempty"`
 }
+
+// ErrPending reports an alias whose pairing is not confirmed yet.
+var ErrPending = errors.New("pairing not confirmed")
 
 // ErrUnknownHost reports an alias without a configuration file.
 var ErrUnknownHost = errors.New("unknown host")
@@ -89,6 +95,9 @@ func Load(alias string) (*Host, error) {
 // endpointOverride, if set, replaces the configured endpoint. token is set
 // only for a unix endpoint.
 func (h *Host) Resolve(endpointOverride string) (ep endpoint.Endpoint, token []byte, err error) {
+	if h.PendingToken != "" {
+		return endpoint.Endpoint{}, nil, fmt.Errorf("host %q: %w; run `tele host confirm %s <receipt>` with the receipt `tele server install` printed", h.Alias, ErrPending, h.Alias)
+	}
 	s := h.Endpoint
 	if endpointOverride != "" {
 		s = endpointOverride

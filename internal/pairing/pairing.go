@@ -30,6 +30,10 @@ const (
 	ReceiptPrefix = "tele1r:"
 )
 
+// DefaultPort is the port tele server listens on when pairing names none,
+// as with "tele host add --ssh".
+const DefaultPort = 8443
+
 // TokenLen is the length of the one-time pairing token.
 const TokenLen = 16
 

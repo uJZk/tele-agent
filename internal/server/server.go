@@ -227,7 +227,7 @@ func (s *Server) handshake(ctx context.Context, sess *mux.Session) (*session, er
 		ss.close()
 		return nil, reject(fmt.Sprintf("start exec service: %v", err))
 	}
-	if err := c.Send(&proto.HelloReply{Version: proto.Version, Target: target, ScratchDir: ss.scratch}); err != nil {
+	if err := c.Send(&proto.HelloReply{Version: proto.Version, Target: target, ScratchDir: ss.scratch, ServerTime: time.Now().UnixMilli()}); err != nil {
 		ss.close()
 		return nil, fmt.Errorf("send hello reply: %w", err)
 	}

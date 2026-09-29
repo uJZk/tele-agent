@@ -66,6 +66,9 @@ type HelloReply struct {
 	// ScratchDir is the server-side directory that holds this session's
 	// scratch areas (docs/exec.md "scratch 路径改写与回传").
 	ScratchDir string `cbor:"4,keyasint"`
+	// ServerTime is the server's clock when it sent the reply, in Unix
+	// milliseconds; it lets the client report clock skew.
+	ServerTime int64 `cbor:"5,keyasint,omitempty"`
 }
 
 // TargetInfo describes the target host and user. It feeds the appended

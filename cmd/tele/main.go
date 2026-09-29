@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/ujzk/tele-agent/internal/cli"
+	"github.com/ujzk/tele-agent/internal/hostcmd"
 	"github.com/ujzk/tele-agent/internal/launcher"
 	"github.com/ujzk/tele-agent/internal/servercmd"
 	"github.com/ujzk/tele-agent/internal/shim"
@@ -47,6 +48,8 @@ func run(name string, args []string) int {
 		return 0
 	case "server":
 		return servercmd.Main(args[1:], os.Stdout, os.Stderr)
+	case "host":
+		return hostcmd.Main(args[1:], hostcmd.Streams{In: os.Stdin, Out: os.Stdout, Err: os.Stderr})
 	}
 	if cli.IsReserved(args[0]) {
 		fmt.Fprintf(os.Stderr, "tele: %s: not implemented yet\n", args[0])

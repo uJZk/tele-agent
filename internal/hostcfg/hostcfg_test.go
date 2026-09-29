@@ -83,6 +83,7 @@ func TestLoadErrors(t *testing.T) {
 	write("nopsk", `{"endpoint":"h:1"}`, 0o600)
 	write("badpsk", `{"endpoint":"h:1","psk":"short"}`, 0o600)
 	write("notoken", `{"endpoint":"unix:/s"}`, 0o600)
+	write("pending", `{"endpoint":"h:1","psk":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","pending_token":"AAAA"}`, 0o600)
 
 	for alias, want := range map[string]string{
 		"missing": "unknown host",
@@ -91,6 +92,7 @@ func TestLoadErrors(t *testing.T) {
 		"nopsk":   "no PSK",
 		"badpsk":  "invalid PSK",
 		"notoken": "no token",
+		"pending": "tele host confirm",
 		"a:b":     "",
 		"host":    "",
 	} {

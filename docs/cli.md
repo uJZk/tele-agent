@@ -53,20 +53,24 @@ tele dev -p "…"           # 同上
 ## 安装与配对
 
 ```bash
-# 本地：生成配对串（包含 SS2022 PSK、端口、一次性 token），同时打印远端的安装步骤
+# 本地：生成 PSK 和一次性 token，别名进入「待确认」状态；打印配对串 tele1:… 和远端的步骤
 tele host add myhost --endpoint 203.0.113.5:8443
-# → 输出：tele server install --pair 'tele1:…'
 
-# 远端（普通用户即可；systemd --user + loginctl enable-linger，或由管理员安装为系统服务）
-# 从项目的 GitHub Releases 下载与远端架构对应的 tele 二进制，放到 ~/.local/bin/tele，并加上可执行权限
-tele server install --pair 'tele1:…'
-# → 检查 NTP、inotify 上限，放通端口；输出回执串 'tele1r:…'
+# 远端，以 tele 要运行的用户身份（普通用户即可）：
+# 从项目的 GitHub Releases 下载与远端架构对应的 tele，放到 ~/.local/bin/tele 并加上可执行权限
+tele server install          # 提示时粘贴配对串；预检、写入配置、启动服务，最后打印回执串 tele1r:…
 
 # 本地
 tele host confirm myhost 'tele1r:…'
 ```
 
-本地能通过 SSH 登录远端时，可以用 `tele host add --ssh user@host` 一步完成：通过 SSH 上传 `tele` 二进制并执行 `tele server install --pair …`，远端不需要预先安装 tele。
+- **配对串就是密钥**：它包含 PSK，拿到它就能以远端用户身份执行任意命令。所以 `tele server install` 默认在终端里提示粘贴（不回显），而不是写在命令行上：命令行会留在 shell 历史中，运行期间还能被同一台机器上的其他用户从 `/proc/<pid>/cmdline` 读到。`--pair <配对串>` 只用于自动化，`--pair-file <文件>` 读取后删除该文件。
+- **回执证明服务端装上的正是这次的配对串**：回执中有用 PSK 对一次性 token 计算的 HMAC，`tele host confirm` 核对它之后才解除「待确认」状态；待确认的别名不能用来启动会话。回执本身不含密钥。
+- **一台服务端只有一个 PSK**：对已经配置过的服务端再次执行 `tele server install`，新的 PSK 会取代旧的，之前配对的客户端随之失效，所以 install 会先征得同意。同一个用户想在多台本地机器上使用同一个服务端时，可以把本地的主机文件（见[配置与状态文件](#配置与状态文件)）复制过去。
+- **吊销**：`tele host rm` 只删除本地的 PSK；服务端仍然接受它，要在服务端执行 `tele server uninstall` 或重新配对才能吊销。
+- 配对串中的端口是服务端监听的端口。服务端在 NAT 后面、对外端口与监听端口不同时，用 `tele server install --listen` 指定监听地址，`tele host confirm` 会提示两者不一致。
+
+**`tele host add --ssh [user@]host`** 一步完成配对，远端不需要预先安装 tele：检查远端的架构与本地 tele 相同（不同时报错，改为手动安装），经 SSH 把本地的 tele 上传到 `~/.local/bin/tele`，把配对串经 SSH 的标准输入写入远端一个权限为 0600 的文件（不出现在任何命令行上），执行 `tele server install --pair-file`（本地有终端时分配终端，以便回答预检中需要同意的项目），从输出中取出回执并自动确认。省略 `--endpoint` 时，endpoint 是 SSH 目标的主机名加默认端口 8443。
 
 远端服务默认以 `systemd --user` 运行。
 

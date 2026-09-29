@@ -1,4 +1,4 @@
-package launcher
+package client
 
 import (
 	"bytes"
@@ -28,13 +28,17 @@ func testTarget(t *testing.T) *proto.TargetInfo {
 func TestConnect(t *testing.T) {
 	target := testTarget(t)
 	ep, root := servertest.Start(t, "s3cret", target)
-	s, err := connect(t.Context(), ep, []byte("s3cret"), resume.Config{})
+	s, err := Connect(t.Context(), ep, []byte("s3cret"), resume.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
 	if proto.CheckSessionID(s.ID) != nil || s.Target.Hostname != "target" || s.Target.Home != target.Home {
 		t.Fatalf("session %q, target %+v", s.ID, s.Target)
+	}
+	// Server and client share a clock here, so the estimate is small.
+	if s.RTT <= 0 || s.ClockSkew < -time.Second || s.ClockSkew > time.Second {
+		t.Errorf("RTT %v, clock skew %v", s.RTT, s.ClockSkew)
 	}
 	if !strings.HasPrefix(s.ScratchDir, target.Home+"/") || !strings.HasSuffix(s.ScratchDir, s.ID) {
 		t.Errorf("scratch dir %q, want one per session under the target's home", s.ScratchDir)
@@ -83,14 +87,14 @@ func TestConnect(t *testing.T) {
 
 func TestConnectRejected(t *testing.T) {
 	ep, _ := servertest.Start(t, "s3cret", testTarget(t))
-	_, err := connect(t.Context(), ep, []byte("wrong"), resume.Config{})
+	_, err := Connect(t.Context(), ep, []byte("wrong"), resume.Config{})
 	if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "authentication failed") {
-		t.Fatalf("connect with a wrong token = %v, want the server's refusal", err)
+		t.Fatalf("Connect with a wrong token = %v, want the server's refusal", err)
 	}
 }
 
 func TestConnectHandshakeTimeout(t *testing.T) {
-	// A server that accepts but never answers does not hang the launcher.
+	// A server that accepts but never answers does not hang the client.
 	sock := filepath.Join(t.TempDir(), "mute.sock")
 	var lc net.ListenConfig
 	ln, err := lc.Listen(t.Context(), "unix", sock)
@@ -108,14 +112,14 @@ func TestConnectHandshakeTimeout(t *testing.T) {
 	ep, _ := endpoint.Parse("unix:" + sock)
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := connect(ctx, ep, []byte("x"), resume.Config{}); err == nil {
-		t.Fatal("connect to a mute server succeeded")
+	if _, err := Connect(ctx, ep, []byte("x"), resume.Config{}); err == nil {
+		t.Fatal("Connect to a mute server succeeded")
 	}
 }
 
 func TestCheckTarget(t *testing.T) {
 	ok := proto.HelloReply{Target: proto.TargetInfo{User: "bob", Home: "/home/bob"}, ScratchDir: "/home/bob/.cache/tele/s/x"}
-	if err := checkTarget(&ok); err != nil {
+	if err := CheckTarget(&ok); err != nil {
 		t.Fatal(err)
 	}
 	for name, mod := range map[string]func(*proto.HelloReply){
@@ -126,7 +130,7 @@ func TestCheckTarget(t *testing.T) {
 	} {
 		r := ok
 		mod(&r)
-		if err := checkTarget(&r); err == nil {
+		if err := CheckTarget(&r); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
