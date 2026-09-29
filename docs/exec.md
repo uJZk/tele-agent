@@ -11,7 +11,7 @@ shim 都是指向 `tele` 的符号链接，位于 `<sess>/bin/`，按 `argv[0]` 
 | `bash` | Bash 工具（`CLAUDE_CODE_SHELL`），以及生成 shell 快照 | 在远端运行 `bash`，参数原样转发。`-c` 的脚本如果恰好是 `<sess>/bin/tele-exec` 加一个参数这两个 shell 词，先去掉这一层包装 |
 | `tele-exec` | shell 形式的 hooks、stdio MCP server（`CLAUDE_CODE_SHELL_PREFIX`） | 唯一的参数是一条 shell 字符串，在远端用 `sh -c` 执行，双向转发 stdio |
 | `sh` | `/bin/sh`（`shell: true` 的 spawn 固定使用它，hooks 就是这样启动的） | `-c` 的脚本如果恰好是 `<sess>/bin/tele-exec` 加一个参数，直接按 tele-exec 处理；否则在远端运行 `sh`，参数原样转发。必须识别这种形式，因为远端并不存在 `<sess>/bin/tele-exec` |
-| `rg`、`git`、`uname` | Grep、Glob、Claude 内部的 git 调用、Claude 启动时获取平台信息 | 在远端运行同名程序，参数原样转发 |
+| `rg`、`git`、`uname` | Grep、Glob，Claude 内部的 git 和 rg 调用；`uname` 给按名字调用它的程序（Claude 自己不调用，见[其它内置行为](claude-code.md#其它内置行为)） | 在远端运行同名程序，参数原样转发 |
 | 本地 exec 代理（例如 `ps`） | 必须看到本地进程或本地桌面的调用：tree-kill 用 `ps` 查找子进程，以及打开浏览器、访问剪贴板一类的程序 | 由会话主进程在**本地视图**中执行真实程序 |
 
 - `PATH` 中只有 `<sess>/bin`，Claude 按名字启动、却不在上表中的程序会得到 ENOENT。需要哪些本地 exec 代理，以 `strace` 观察到的 Claude 实际调用为准。

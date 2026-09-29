@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ujzk/tele-agent/internal/testutil/claudetest"
 )
 
@@ -172,5 +174,37 @@ func TestBuiltinRipgrepOff(t *testing.T) {
 	t.Logf("rg invocations: %q", argvs)
 	if len(argvs) == 0 || filepath.Base(argvs[0][0]) != "rg" {
 		t.Fatalf("Grep did not run the rg in PATH")
+	}
+}
+
+// TestOSVersionIsLocal pins a known limitation (docs/claude-code.md "其它
+// 内置行为"): the environment section of Claude's own system prompt takes
+// the OS version from the kernel it runs on, in-process, without starting
+// uname, so under tele it names the local kernel. Only tele's appended
+// prompt describes the target host.
+func TestOSVersionIsLocal(t *testing.T) {
+	claude := claudetest.Require(t)
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err != nil {
+		t.Fatal(err)
+	}
+	release := unix.ByteSliceToString(uts.Release[:])
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "argv")
+	claudetest.WriteScript(t, bin, "uname", logArgv(log, "/usr/bin/uname"))
+	api := claudetest.NewAPI(t, claudetest.Say("ok"))
+	r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "hi", Env: []string{"PATH=" + bin + ":/usr/bin:/bin"}})
+	if r.Err != nil {
+		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
+	}
+	reqs := api.AgentRequests()
+	if len(reqs) == 0 {
+		t.Fatal("no agent request")
+	}
+	if !strings.Contains(string(reqs[0].Raw), "OS Version: Linux "+release) {
+		t.Errorf("request lacks the local kernel %q in its OS Version line", release)
+	}
+	if _, err := os.Stat(log); err == nil {
+		t.Errorf("Claude started uname, so a shim could now supply the target's: %q", invocations(t, log))
 	}
 }

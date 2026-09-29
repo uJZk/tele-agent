@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -104,6 +105,8 @@ type API struct {
 	requests []Request
 	toolID   int
 
+	pages []string // host and path of every other request
+
 	host   string // set for a TLS API: the name in URL
 	caFile string // set for a TLS API: PEM file of its certificate
 }
@@ -130,6 +133,9 @@ func NewTLSAPI(t testing.TB, host string, script ...Turn) *API {
 		t.Fatal(err)
 	}
 	a.srv = httptest.NewUnstartedServer(http.HandlerFunc(a.serve))
+	// Handshakes that fail on purpose (untrusted CA, a name the
+	// certificate does not cover) are not worth a log line.
+	a.srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	a.srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	a.srv.StartTLS()
 	t.Cleanup(a.srv.Close)
@@ -155,6 +161,14 @@ func (a *API) Requests() []Request {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]Request(nil), a.requests...)
+}
+
+// Pages returns host and path of every request that was not a Messages
+// request, such as a page fetched by WebFetch.
+func (a *API) Pages() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.pages...)
 }
 
 // AgentRequests returns the agent requests received so far.
@@ -200,8 +214,12 @@ type wireRequest struct {
 
 func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/v1/messages") {
-		// Connectivity checks and the like.
-		w.WriteHeader(http.StatusOK)
+		// Connectivity checks, and pages for WebFetch.
+		a.mu.Lock()
+		a.pages = append(a.pages, r.Host+r.URL.Path)
+		a.mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<html><body><p>tele page</p></body></html>")
 		return
 	}
 	body, err := io.ReadAll(r.Body)

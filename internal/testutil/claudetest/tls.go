@@ -9,12 +9,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 )
 
-// selfSigned returns a certificate for host that is its own CA, and its
-// PEM encoding.
+// selfSigned returns a certificate for host and its siblings (a wildcard
+// for host's parent domain) that is its own CA, and its PEM encoding.
 func selfSigned(t testing.TB, host string) (tls.Certificate, []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -24,7 +25,7 @@ func selfSigned(t testing.TB, host string) (tls.Certificate, []byte) {
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: host},
-		DNSNames:              []string{host},
+		DNSNames:              names(host),
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
@@ -38,4 +39,11 @@ func selfSigned(t testing.TB, host string) (tls.Certificate, []byte) {
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key},
 		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func names(host string) []string {
+	if _, parent, ok := strings.Cut(host, "."); ok && strings.Contains(parent, ".") {
+		return []string{host, "*." + parent}
+	}
+	return []string{host}
 }

@@ -47,6 +47,8 @@ Claude 自己也调用 `rg`：启动时先执行 `rg --version`，并用 `rg --f
 - API 请求遵循 `HTTPS_PROXY`：经 CONNECT 隧道到达 API 主机，Claude 自己不解析 API 的主机名。
 - `SSL_CERT_FILE` 或 `NODE_EXTRA_CA_CERTS` 任意一个指向的 CA 都会被信任。tele 两个都设置，指向同一个 bundle。
 - 证书不受信任时，Claude 报 API 错误后退出，不会绕过代理直连。
+- WebFetch 的域名预检（向 `api.anthropic.com` 询问域名是否可以抓取）和抓取本身都经过代理；抓回的页面交给模型摘要时走 API。
+- 打开非必要流量（tele 不设 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`）时，Claude 的全部 TCP 连接都指向代理，它自己不做任何 DNS 查询。
 
 ## scratch 文件
 
@@ -56,13 +58,19 @@ Claude 在本地打开、远端命令也要访问的文件：
 |---|---|---|---|
 | cwd 文件（`pwd -P >| …`，位于 `CLAUDE_CODE_TMPDIR`） | 远端命令 | 本地 Claude | **回传** |
 | shell 快照（`<config>/shell-snapshots/*.sh`） | 远端（生成脚本） | 远端命令 source；本地 Claude 检查它是否存在 | 远端保留一份；回传一份本地副本，用于通过存在性检查 |
-| `CLAUDE_ENV_FILE`（`<config>/session-env/…`，由 SessionStart hook 写入） | 远端 hook | 本地 Claude | 回传 |
-| `tasks/` 下的标记文件（`echo 0 >| …/tasks/…`） | 远端命令 | 本地 Claude | 回传 |
+| `CLAUDE_ENV_FILE`（`<config>/session-env/<Claude 会话 id>/sessionstart-hook-<n>.sh`，由 SessionStart hook 写入） | 远端 hook | 本地 Claude | 回传。hook 运行时本地只有它所在的目录，文件本身还不存在，所以上传要在远端建出这个空目录，否则 hook 的 `>> "$CLAUDE_ENV_FILE"` 在远端因目录不存在而失败 |
+| `tasks/` 目录中的文件（`CLAUDE_CODE_TMPDIR/claude-<uid>/<cwd 编码>/<Claude 会话 id>/tasks/`） | 远端命令 | 本地 Claude | 回传；目录位于 `CLAUDE_CODE_TMPDIR` 之下 |
 | 后台任务的输出文件 | Claude 在**本地** `open(path, "w")`，把 fd 作为子进程的 stdout | 本地 Claude | 远端输出经 shim 写入这个本地 fd；它如果位于 scratch 目录中，写入期间不参与同步（见 [scratch 路径改写与回传](exec.md#scratch-路径改写与回传)） |
 
 `<config>` 是 Claude 的配置目录，即 `~/.claude`。机制见 [scratch 路径改写与回传](exec.md#scratch-路径改写与回传)。
 
 **已知限制**：如果用户的命令显式引用后台任务的输出文件（例如 `tail <输出文件路径>`），远端看不到这个文件。Claude 通常用 Read 或 TaskOutput 读取它，影响很小。
+
+## ~/.claude.json
+
+Claude 写全局配置时，先在 `$HOME` 中创建 `.claude.json.tmp.<pid>.<随机>`，写完后 rename 覆盖 `.claude.json`；每次写之前还用 `mkdir` 在 `$HOME` 中建立 `.claude.json.lock` 作为锁。它在 `$HOME` 中直接创建的名字都以 `.claude.json` 开头（配置目录 `.claude` 除外），备份写在 `<config>/backups/`。
+
+所以 `.claude.json` 不能用 bind 挂载单个文件的方式放进远端视图：rename 覆盖挂载点会失败（`EBUSY`），锁目录和临时文件也不能落到远端。远端 `HOME` 中以 `.claude.json` 开头的名字都必须落到本地 `HOME` 的同名条目上。
 
 ## 其它内置行为
 
@@ -73,7 +81,7 @@ Claude 在本地打开、远端命令也要访问的文件：
 | 设置文件的热加载（Claude 通过文件监视发现设置文件的变化） | 内核只为经过本地 VFS 的操作产生 inotify 事件，telefs 的缓存失效不会产生。所以远端命令对设置文件的改动不会触发热加载，经 Claude 自己的 Write/Edit 做的改动仍然会。影响很小 |
 | WebFetch、WebSearch | 在本地或 Anthropic 侧执行，出站 IP 是本地的 |
 | 超时与中断：先 SIGTERM，再 SIGKILL（tree-kill，会调用 `ps`） | shim 转发可捕获的信号。SIGKILL 无法捕获，由会话主进程发现 shim 的连接关闭后结束远端进程组（见 [shim 与会话主进程](exec.md#shim-与会话主进程)）。`ps` 走本地 exec 代理，因为它必须看到本地进程 |
-| 系统提示词中的操作系统和平台 | Claude 启动时调用 `uname`，而 `uname` 是转发 shim，所以得到的是目标主机的信息。另见[附加系统提示词](#附加系统提示词) |
+| 系统提示词中的操作系统和平台 | Claude 在进程内取得内核版本，不启动 `uname`，所以内置的环境信息（`OS Version: Linux <版本>`）在 tele 下是**本地**的内核。这是已知限制：tele 不拦截系统调用，UTS 命名空间也只隔离主机名，不隔离内核版本。目标主机的信息由[附加系统提示词](#附加系统提示词)给出 |
 | 会话存储 `~/.claude/projects/<cwd 编码>` | 以 cwd 路径为键，不同主机上的相同路径会共用会话历史（已知限制，见[启动流程](cli.md#启动流程)） |
 
 ## 注入的环境
@@ -127,7 +135,7 @@ This session operates on the remote host "{{alias}}" via tele.
 
 **有意不写**：tele 的实现细节、本地集合、断线等运行时状态。本地集合带来的例外由 `tele doctor` 和文档说明。
 
-验收标准：Claude 发给 API 的请求中，系统提示词包含目标主机的主机名和发行版，并且不包含本地主机的信息。兼容性测试在模拟 API 一侧检查这一点。
+验收标准：Claude 发给 API 的请求中，系统提示词包含目标主机的主机名和发行版。唯一的本地信息是内置环境信息中的内核版本（见[其它内置行为](#其它内置行为)）。兼容性测试在模拟 API 一侧检查这一点。
 
 ## 验证方法
 
@@ -145,9 +153,6 @@ This session operates on the remote host "{{alias}}" via tele.
 | 在 `main` 之前，bun 仍然是单线程的（`setns(CLONE_NEWNS)` 要求进程不与其它线程共享文件系统信息） | 回到「bind 挂载动态库和 DNS 文件」的做法，本地例外变多 |
 | 切换之后，Claude 不再 dlopen 或打开其它本地运行时文件 | 在切换前预先加载；实在不行，加入本地集合 |
 | 本地 uid 在远端的 `/etc/passwd` 中可能不存在，但 `os.userInfo()` 等调用不受影响，或者 `USER`、`HOME` 足以兜底。另外，glibc 的 NSS 会按远端的 `nsswitch.conf` dlopen 远端的 `libnss_*.so`，远端 glibc 版本不同时可能崩溃 | 切换前预先加载本地的 NSS 模块，或在远端视图中合成 passwd 条目 |
-| 除 API 请求以外（见[代理与 CA](#代理与-ca)），Claude 的其它出站 HTTP（WebFetch、遥测、OAuth 刷新）也都遵循代理。不走代理的连接会在远端视图中做 DNS 解析，从而失败 | 把本地的 DNS 配置文件加入本地集合 |
+| OAuth 令牌的刷新也遵循代理（其它出站连接见[代理与 CA](#代理与-ca)）。不走代理的连接会在远端视图中做 DNS 解析，从而失败 | 把本地的 DNS 配置文件加入本地集合 |
 | bun 信任 `<sess>/ca-bundle.pem`（见[代理与 CA](#代理与-ca)）之后，不再依赖系统证书目录；切换到远端视图后，`/etc/ssl` 是远端的 | 把本地证书目录 bind 到 `/etc/ssl` 等路径，多一个本地例外 |
-| Claude 写 `~/.claude.json` 的方式与 bind 挂载的单个文件兼容。如果它先写临时文件再 rename 覆盖，rename 到挂载点上会失败（`EBUSY` 或 `EXDEV`） | telefs 把远端 `HOME` 下以 `.claude.json` 开头的名字映射到本地文件，让临时文件和目标文件位于同一个文件系统 |
-| `tasks/` 标记文件位于某个 scratch 前缀之下 | 为它所在的目录增加 scratch 前缀 |
-| Claude 在运行 SessionStart hook 之前，在本地创建了 `CLAUDE_ENV_FILE` 这个文件，而不只是它所在的 `session-env/<id>` 目录。scratch 同步只传普通文件、不传空目录，只有目录时远端 hook 的 `>> "$CLAUDE_ENV_FILE"` 会因远端目录不存在而失败（ENOENT） | 上传时为本会话认领的空目录在远端建出对应目录 |
-| Claude 按绝对路径启动的程序可以逐个列出并处理（见 [shim](exec.md#shim)） | 无 |
+| 兼容性测试覆盖的功能中，Claude 自己按绝对路径启动的只有 `/bin/sh`，其余都按 PATH 查找。没有覆盖的功能（打开浏览器、剪贴板、通知等）启动的程序同样可以逐个列出并处理（见 [shim](exec.md#shim)） | 无 |

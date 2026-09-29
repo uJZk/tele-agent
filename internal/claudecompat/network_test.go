@@ -1,7 +1,10 @@
 package claudecompat
 
 import (
+	"fmt"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/ujzk/tele-agent/internal/testutil/claudetest"
@@ -51,5 +54,88 @@ func TestUntrustedCA(t *testing.T) {
 	}
 	if n := len(api.Requests()); n != 0 {
 		t.Fatalf("API received %d requests over an untrusted connection", n)
+	}
+}
+
+// TestWebFetchThroughProxy pins that WebFetch, both its domain check and
+// the fetch itself, goes through HTTPS_PROXY (docs/claude-code.md "代理与
+// CA").
+func TestWebFetchThroughProxy(t *testing.T) {
+	claude := claudetest.Require(t)
+	const page = "docs.tele-compat.invalid"
+	fetch := claudetest.Use("WebFetch", map[string]any{"url": "https://" + page + "/page", "prompt": "summarize"})
+	env := func(api *claudetest.API, proxy *claudetest.Proxy) []string {
+		return []string{"HTTPS_PROXY=" + proxy.URL(), "SSL_CERT_FILE=" + api.CAFile(), "NODE_EXTRA_CA_CERTS=" + api.CAFile()}
+	}
+
+	t.Run("preflight", func(t *testing.T) {
+		// The domain check asks api.anthropic.com, which the proxy sends
+		// to the stand-in, whose certificate does not cover it: the check
+		// fails, but only after the proxy saw it.
+		api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", fetch, claudetest.Say("done"))
+		proxy := claudetest.NewProxy(t, api.Addr())
+		r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "fetch", Args: []string{"--allowedTools", "WebFetch"}, Env: env(api, proxy)})
+		if r.Err != nil {
+			t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
+		}
+		if !slices.Contains(proxy.Targets(), "api.anthropic.com:443") {
+			t.Errorf("proxy saw %q, want the domain check to api.anthropic.com:443", proxy.Targets())
+		}
+	})
+
+	t.Run("fetch", func(t *testing.T) {
+		api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", fetch, claudetest.Say("done"))
+		proxy := claudetest.NewProxy(t, api.Addr())
+		settings := filepath.Join(t.TempDir(), "settings.json")
+		writeJSON(t, settings, map[string]any{"skipWebFetchPreflight": true})
+		r := claudetest.Run(t, claude, api, claudetest.Options{
+			Prompt: "fetch",
+			Args:   []string{"--allowedTools", "WebFetch", "--settings", settings},
+			Env:    env(api, proxy),
+		})
+		if r.Err != nil {
+			t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
+		}
+		if !slices.Contains(proxy.Targets(), page+":443") || !slices.Contains(api.Pages(), page+"/page") {
+			t.Errorf("proxy saw %q, pages %q; want the fetch of %s through the proxy", proxy.Targets(), api.Pages(), page)
+		}
+	})
+}
+
+// TestNoDirectConnections pins that with non-essential traffic enabled,
+// as under tele, every connection Claude opens goes to the proxy and it
+// resolves no names itself (docs/claude-code.md "代理与 CA").
+func TestNoDirectConnections(t *testing.T) {
+	claude := claudetest.Require(t)
+	tr := claudetest.NewTrace(t, claude, "connect", "sendto", "sendmmsg")
+	api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", claudetest.Say("done"))
+	proxy := claudetest.NewProxy(t, api.Addr())
+	r := claudetest.Run(t, tr.Claude, api, claudetest.Options{
+		Prompt: "hi",
+		Env: []string{
+			"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=", "DISABLE_AUTOUPDATER=",
+			"HTTPS_PROXY=" + proxy.URL(), "HTTP_PROXY=" + proxy.URL(),
+			"SSL_CERT_FILE=" + api.CAFile(), "NODE_EXTRA_CA_CERTS=" + api.CAFile(),
+		},
+	})
+	if r.Err != nil || r.Output.Result != "done" {
+		t.Fatalf("claude: %v, result %q\nstderr: %s", r.Err, r.Output.Result, r.Stderr)
+	}
+	proxyAddr := strings.TrimPrefix(proxy.URL(), "http://")
+	host, port, _ := strings.Cut(proxyAddr, ":")
+	toProxy := fmt.Sprintf(`sin_port=htons(%s), sin_addr=inet_addr("%s")`, port, host)
+	n := 0
+	for _, c := range tr.Calls(t) {
+		if !c.Own || !strings.Contains(c.Line, "sa_family=AF_INET") {
+			continue // unix sockets stay local
+		}
+		if c.Name != "connect" || !strings.Contains(c.Line, toProxy) {
+			t.Errorf("network call not to the proxy: %s(%s", c.Name, c.Line)
+			continue
+		}
+		n++
+	}
+	if n == 0 {
+		t.Error("no connection to the proxy recorded")
 	}
 }
