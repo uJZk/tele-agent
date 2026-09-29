@@ -1,0 +1,280 @@
+package cabundle
+
+import (
+	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// newCert returns a self-signed CA certificate, DER-encoded.
+func newCert(t *testing.T, name string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: name},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
+}
+
+func pemOf(ders ...[]byte) []byte {
+	var b bytes.Buffer
+	for _, d := range ders {
+		_ = pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: d})
+	}
+	return b.Bytes()
+}
+
+func write(t *testing.T, path string, data []byte) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// extras names each path as set by SSL_CERT_FILE.
+func extras(paths ...string) []Extra {
+	out := make([]Extra, len(paths))
+	for i, p := range paths {
+		out[i] = Extra{Var: "SSL_CERT_FILE", Path: p}
+	}
+	return out
+}
+
+// names parses a bundle and returns the common names in order, failing on
+// anything that is not a parseable CERTIFICATE block.
+func names(t *testing.T, bundle []byte) []string {
+	t.Helper()
+	var out []string
+	rest := bundle
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			t.Fatalf("bundle holds a %q block with headers %v", block.Type, block.Headers)
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("bundle holds an unparseable certificate: %v", err)
+		}
+		out = append(out, c.Subject.CommonName)
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		t.Fatalf("bundle has trailing data %q", rest)
+	}
+	return out
+}
+
+func TestBuild(t *testing.T) {
+	dir := t.TempDir()
+	a, b, c, d, e := newCert(t, "a"), newCert(t, "b"), newCert(t, "c"), newCert(t, "d"), newCert(t, "e")
+
+	sys1 := write(t, filepath.Join(dir, "sys1.crt"), pemOf(a, b))
+	sys2 := write(t, filepath.Join(dir, "sys2.crt"), pemOf(c))
+	sysDir := filepath.Join(dir, "sysdir")
+	write(t, filepath.Join(sysDir, "s.pem"), pemOf(d))
+	missing := filepath.Join(dir, "missing")
+	dupDir := filepath.Join(dir, "dupdir") // repeats a from sys1, adds e
+	write(t, filepath.Join(dupDir, "x.pem"), pemOf(a))
+	write(t, filepath.Join(dupDir, "y.pem"), pemOf(e))
+
+	userFile := write(t, filepath.Join(dir, "user.pem"), append(pemOf(b), pemOf(e)...)) // b duplicates a system cert
+	userDir := filepath.Join(dir, "userdir")
+	write(t, filepath.Join(userDir, "1.crt"), pemOf(c))
+	write(t, filepath.Join(userDir, "0123abcd.0"), pemOf(d))
+	write(t, filepath.Join(userDir, "README"), pemOf(e))     // wrong name: ignored
+	write(t, filepath.Join(userDir, "0123abcd.x"), pemOf(e)) // not a hash name
+	if err := os.Symlink(missing, filepath.Join(userDir, "dangling.pem")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(userDir, "sub.pem"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		sysFiles []string
+		sysDirs  []string
+		extra    []string
+		want     []string
+	}{
+		{name: "first readable system file plus dirs", sysFiles: []string{missing, sysDir, sys1, sys2}, sysDirs: []string{sysDir}, want: []string{"a", "b", "d"}},
+		{name: "dir duplicating the file", sysFiles: []string{sys1}, sysDirs: []string{dupDir}, want: []string{"a", "b", "e"}},
+		{name: "system dirs when no file", sysFiles: []string{missing}, sysDirs: []string{missing, sysDir}, want: []string{"d"}},
+		{name: "extra file dedups", sysFiles: []string{sys1}, extra: []string{userFile, userFile}, want: []string{"a", "b", "e"}},
+		{name: "extra dir", sysFiles: []string{sys2}, extra: []string{"", userDir}, want: []string{"c", "d"}},
+		{name: "extras only", extra: []string{userDir, userFile}, want: []string{"d", "c", "b", "e"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, skipped, err := build(tt.sysFiles, tt.sysDirs, extras(tt.extra...))
+			if err != nil || skipped != nil {
+				t.Fatalf("build: skipped %v, err %v", skipped, err)
+			}
+			if n := names(t, got); !slices.Equal(n, tt.want) {
+				t.Fatalf("bundle = %v, want %v", n, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildGarbage(t *testing.T) {
+	dir := t.TempDir()
+	good := newCert(t, "good")
+	var in bytes.Buffer
+	in.WriteString("leading text\n")
+	_ = pem.Encode(&in, &pem.Block{Type: "PRIVATE KEY", Bytes: []byte("not a key")})
+	_ = pem.Encode(&in, &pem.Block{Type: "CERTIFICATE", Bytes: []byte("not DER")})
+	_ = pem.Encode(&in, &pem.Block{Type: "TRUSTED CERTIFICATE", Bytes: good})
+	_ = pem.Encode(&in, &pem.Block{Type: "CERTIFICATE", Headers: map[string]string{"X": "y"}, Bytes: good})
+	in.WriteString("-----BEGIN CERTIFICATE-----\ntruncated")
+	f := write(t, filepath.Join(dir, "mixed.pem"), in.Bytes())
+
+	got, _, err := build(nil, nil, extras(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := names(t, got); !slices.Equal(n, []string{"good"}) {
+		t.Fatalf("bundle = %v, want [good]", n)
+	}
+
+	junk := write(t, filepath.Join(dir, "junk.pem"), []byte("\x00\xff no pem here"))
+	if _, _, err := build([]string{junk}, nil, extras(junk)); !errors.Is(err, ErrNoCertificates) {
+		t.Fatalf("build of garbage = %v, want ErrNoCertificates", err)
+	}
+	if _, _, err := build(nil, nil, nil); !errors.Is(err, ErrNoCertificates) {
+		t.Fatalf("build of nothing = %v, want ErrNoCertificates", err)
+	}
+}
+
+// TestBuildExtraSkipped checks that an unreadable user CA path is skipped
+// with a warning naming the setting, as plain claude does, and the rest of
+// the bundle is still built.
+func TestBuildExtraSkipped(t *testing.T) {
+	dir := t.TempDir()
+	sys := write(t, filepath.Join(dir, "sys.crt"), pemOf(newCert(t, "sys")))
+	fifo := filepath.Join(dir, "fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	big := write(t, filepath.Join(dir, "big.pem"), bytes.Repeat([]byte{'x'}, maxFileSize+1))
+
+	missingDir := filepath.Join(dir, "missing-dir")
+	for _, e := range []Extra{
+		{Var: "NODE_EXTRA_CA_CERTS", Path: filepath.Join(dir, "missing.pem")},
+		{Var: "SSL_CERT_FILE", Path: fifo},
+		{Var: "SSL_CERT_FILE", Path: big},
+		{Var: "SSL_CERT_DIR", Path: missingDir},
+	} {
+		got, skipped, err := build([]string{sys}, nil, []Extra{e})
+		if err != nil {
+			t.Errorf("build with %s=%s: %v", e.Var, filepath.Base(e.Path), err)
+			continue
+		}
+		if n := names(t, got); !slices.Equal(n, []string{"sys"}) {
+			t.Errorf("build with %s=%s: bundle = %v, want [sys]", e.Var, filepath.Base(e.Path), n)
+		}
+		if len(skipped) != 1 {
+			t.Errorf("build with %s=%s: skipped = %v, want one warning", e.Var, filepath.Base(e.Path), skipped)
+			continue
+		}
+		// The user must learn which setting to fix.
+		for _, want := range []string{e.Path, e.Var, "unset " + e.Var} {
+			if !strings.Contains(skipped[0].Error(), want) {
+				t.Errorf("warning %q does not name %q", skipped[0], want)
+			}
+		}
+	}
+	// A skipped extra does not hide ErrNoCertificates when nothing is left.
+	if _, skipped, err := build(nil, nil, []Extra{{Var: "SSL_CERT_FILE", Path: fifo}}); !errors.Is(err, ErrNoCertificates) || len(skipped) != 1 {
+		t.Errorf("build with only an unreadable extra = %v, skipped %v; want ErrNoCertificates and one warning", err, skipped)
+	}
+	// A FIFO or oversized file among the system candidates is skipped.
+	got, _, err := build([]string{fifo, big, sys}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := names(t, got); !slices.Equal(n, []string{"sys"}) {
+		t.Fatalf("bundle = %v, want [sys]", n)
+	}
+}
+
+func TestIsCertFileName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"a.pem": true, "b.crt": true, "0123abcd.0": true, "deadbeef.12": true,
+		"README": false, "a.key": false, "0123abcd.": false, "0123ABCD.0": false,
+		"0123abc.0": false, "0123abcd.r0": false, "0123abcd.0.bak": false,
+	} {
+		if got := isCertFileName(name); got != want {
+			t.Errorf("isCertFileName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestBuildSystem checks the real system store where one exists; the unit
+// tests must also pass on hosts without one.
+func TestBuildSystem(t *testing.T) {
+	found := false
+	for _, p := range append(slices.Clone(systemFiles), systemDirs...) {
+		if _, err := os.Stat(p); err == nil {
+			found = true
+		}
+	}
+	if !found {
+		t.Skip("no system CA store on this host")
+	}
+	got, _, err := Build(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names(t, got)) == 0 {
+		t.Fatal("empty system bundle")
+	}
+}
+
+func FuzzAddPEM(f *testing.F) {
+	f.Add([]byte("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"))
+	f.Add([]byte("garbage"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		b := bundle{seen: make(map[string]struct{})}
+		b.addPEM(data)
+		b.addPEM(data)
+		n := names(t, b.out.Bytes())
+		if len(n) != len(b.seen) {
+			t.Fatalf("%d certificates written, %d seen", len(n), len(b.seen))
+		}
+	})
+}
