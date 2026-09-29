@@ -136,6 +136,7 @@ func (o *switchOpener) proxy(c net.Conn, hook fsHook) {
 
 type harnessOpts struct {
 	placeholders []Placeholder
+	localNames   []LocalNames
 	uid, gid     uint32
 	ttl          time.Duration
 	// noWatch leaves the watch stream to the test.
@@ -194,6 +195,7 @@ func newHarness(t *testing.T, o harnessOpts) *harness {
 	h.fs, err = Mount(h.mnt, Config{
 		Opener:       h.opener,
 		Placeholders: o.placeholders,
+		LocalNames:   o.localNames,
 		UID:          o.uid,
 		GID:          o.gid,
 		AttrTimeout:  o.ttl,

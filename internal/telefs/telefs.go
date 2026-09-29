@@ -71,6 +71,8 @@ type Placeholder struct {
 type Config struct {
 	Opener       Opener
 	Placeholders []Placeholder
+	// LocalNames lists directories some of whose entries are local.
+	LocalNames []LocalNames
 	// UID and GID are presented as the owner of every node.
 	UID, GID uint32
 	// AttrTimeout and EntryTimeout are the kernel cache TTLs while the
@@ -129,7 +131,10 @@ func mount(mountpoint string, cfg Config, refreshRoot bool) (*FS, error) {
 	if cfg.Opener == nil {
 		return nil, errors.New("telefs: no opener")
 	}
-	spec, err := buildTree(cfg.Placeholders)
+	if err := checkLocalNames(cfg.LocalNames); err != nil {
+		return nil, err
+	}
+	spec, err := buildTree(cfg.Placeholders, cfg.LocalNames)
 	if err != nil {
 		return nil, err
 	}

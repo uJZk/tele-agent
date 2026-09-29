@@ -3,6 +3,8 @@ package telefs
 import (
 	"context"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
@@ -292,6 +295,7 @@ type mergedEntry struct {
 	mode  uint32
 	ino   uint64
 	synth *node      // synthetic child, or nil
+	local bool       // a local name (LocalNames)
 	attr  proto.Attr // remote child
 	// typeOnly marks a remote child the server could not examine
 	// (proto.DirEntry.TypeOnly).
@@ -347,6 +351,9 @@ func (m *mergedDir) load() {
 	if n.kind == kindAncestor {
 		m.unwatched = !m.loadRemote()
 	}
+	if n.local != nil {
+		m.loadLocal()
+	}
 	m.byName = make(map[string]int, len(m.entries))
 	for i, e := range m.entries {
 		m.byName[e.name] = i
@@ -376,7 +383,7 @@ func (m *mergedDir) loadRemote() bool {
 		watched = watched && !resp.Unwatched
 		for _, e := range resp.Entries {
 			off = e.Offset
-			if e.Name == "." || e.Name == ".." || n.synth[e.Name] != nil {
+			if e.Name == "." || e.Name == ".." || n.synth[e.Name] != nil || n.local.owns(e.Name) {
 				continue
 			}
 			m.entries = append(m.entries, mergedEntry{
@@ -392,6 +399,26 @@ func (m *mergedDir) loadRemote() bool {
 		}
 	}
 	return watched
+}
+
+// loadLocal appends the local names. Like the remote entries, a failure
+// only leaves them out.
+func (m *mergedDir) loadLocal() {
+	l := m.n.local
+	ents, err := os.ReadDir(l.root)
+	if err != nil {
+		m.n.fsys.log.Debug("telefs: list local names", "err", err)
+	}
+	for _, e := range ents {
+		if !l.owns(e.Name()) {
+			continue
+		}
+		var st unix.Stat_t
+		if unix.Lstat(filepath.Join(l.root, e.Name()), &st) != nil {
+			continue
+		}
+		m.entries = append(m.entries, mergedEntry{name: e.Name(), mode: st.Mode & syscall.S_IFMT, ino: localIno(&st), local: true})
+	}
 }
 
 // Readdirent implements fs.FileReaddirenter.
@@ -432,7 +459,7 @@ func (m *mergedDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	gen, unwatched := m.gen, m.unwatched
 	m.mu.Unlock()
 	switch {
-	case !ok:
+	case !ok || e.local:
 		return m.n.Lookup(ctx, name, out)
 	case e.synth != nil:
 		m.n.fsys.synthEntry(e.synth, out)

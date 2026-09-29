@@ -70,7 +70,7 @@ Claude 在本地打开、远端命令也要访问的文件：
 
 Claude 写全局配置时，先在 `$HOME` 中创建 `.claude.json.tmp.<pid>.<随机>`，写完后 rename 覆盖 `.claude.json`；每次写之前还用 `mkdir` 在 `$HOME` 中建立 `.claude.json.lock` 作为锁。它在 `$HOME` 中直接创建的名字都以 `.claude.json` 开头（配置目录 `.claude` 除外），备份写在 `<config>/backups/`。
 
-所以 `.claude.json` 不能用 bind 挂载单个文件的方式放进远端视图：rename 覆盖挂载点会失败（`EBUSY`），锁目录和临时文件也不能落到远端。远端 `HOME` 中以 `.claude.json` 开头的名字都必须落到本地 `HOME` 的同名条目上。
+所以 `.claude.json` 不能用 bind 挂载单个文件的方式放进远端视图：rename 覆盖挂载点会失败（`EBUSY`），锁目录和临时文件也不能落到远端。远端 `HOME` 中以 `.claude.json` 开头的名字都必须落到本地 `HOME` 的同名条目上，这由 telefs 完成（见[组成](telefs.md#组成)中的「本地名字」）。
 
 ## 其它内置行为
 

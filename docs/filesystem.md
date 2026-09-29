@@ -40,7 +40,8 @@ Claude 在项目之外需要访问的路径可以分为几类：自身的二进�
 
 | 路径 | 原因 | 与远端的冲突 |
 |---|---|---|
-| `$HOME/.claude/`、`$HOME/.claude.json` | Claude 自己的凭证、设置和会话历史 | 只有远端用户自己也用 Claude Code 时，才会遮住远端的同名路径 |
+| `$HOME/.claude/` | Claude 自己的凭证、设置和会话历史 | 只有远端用户自己也用 Claude Code 时，才会遮住远端的同名路径 |
+| `$HOME` 中以 `.claude.json` 开头的名字 | Claude 的全局配置，连同写它时用的临时文件和锁目录。不是 bind 挂载，而是由 telefs 直接交给本地 `HOME` 的同名条目（见 [~/.claude.json](claude-code.md#claudejson)） | 同上 |
 | `/etc/claude-code/` | 企业托管策略必须来自本机 | 远端通常不存在 |
 | `/proc`、`/sys`、`/dev` | Claude 进程自身要用（`/proc/self` 等） | 实际上不构成例外：Agent 通过 Bash 或 Grep/Glob 访问这些路径时都在远端执行；只有 Read/Write/Edit 直接打开它们时看到的是本地内容，这种用法很少 |
 | `/bin/sh` | tele 的 `sh` shim | 语义上等同于远端的 sh |
@@ -51,7 +52,7 @@ Claude 在项目之外需要访问的路径可以分为几类：自身的二进�
 ## HOME
 
 - Claude 进程的 `HOME` 设为**远端用户的家目录路径**（例如 `/home/bob`）。这样模型写 `~` 时，含义与远端 Bash 中的 `~` 一致。
-- 本地的 `~/.claude` 和 `~/.claude.json` bind 挂载到这个 `HOME` 下的对应位置（`/home/bob/.claude` → 本地的 `/home/alice/.claude`），Claude 通过 `HOME` 找到自己的配置和凭证。
+- 本地的 `~/.claude` bind 挂载到这个 `HOME` 下的对应位置（`/home/bob/.claude` → 本地的 `/home/alice/.claude`）；`/home/bob/.claude.json*` 由 telefs 交给本地的 `/home/alice/.claude.json*`。Claude 通过 `HOME` 找到自己的配置和凭证。
 
 ## 命名空间的构建
 

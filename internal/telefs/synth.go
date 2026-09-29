@@ -19,12 +19,28 @@ import (
 type synthSpec struct {
 	kind     nodeKind
 	children map[string]*synthSpec
+	local    *localDir
 }
 
 // buildTree validates the placeholders and returns the synthetic tree
-// rooted at "/": every placeholder plus every ancestor of one.
-func buildTree(ps []Placeholder) (*synthSpec, error) {
+// rooted at "/": every placeholder plus every ancestor of one, and every
+// directory with local names plus its ancestors.
+func buildTree(ps []Placeholder, ls []LocalNames) (*synthSpec, error) {
 	root := &synthSpec{kind: kindAncestor, children: map[string]*synthSpec{}}
+	for _, l := range ls {
+		cur := root
+		if l.Dir != "/" {
+			for _, name := range strings.Split(l.Dir[1:], "/") {
+				next := cur.children[name]
+				if next == nil {
+					next = &synthSpec{kind: kindAncestor, children: map[string]*synthSpec{}}
+					cur.children[name] = next
+				}
+				cur = next
+			}
+		}
+		cur.local = &localDir{prefix: l.Prefix, root: l.Local}
+	}
 	explicit := map[string]bool{}
 	for _, p := range ps {
 		if err := proto.CheckPath(p.Path); err != nil || p.Path == "/" {
@@ -62,7 +78,27 @@ func buildTree(ps []Placeholder) (*synthSpec, error) {
 			cur = next
 		}
 	}
+	if err := checkLocalConflicts(root, "/"); err != nil {
+		return nil, err
+	}
 	return root, nil
+}
+
+// checkLocalConflicts rejects local names on anything but an ancestor, and
+// placeholders among local names.
+func checkLocalConflicts(s *synthSpec, p string) error {
+	if s.local != nil && s.kind != kindAncestor {
+		return fmt.Errorf("telefs: local names in %s, which is a placeholder", p)
+	}
+	for name, c := range s.children {
+		if s.local.owns(name) {
+			return fmt.Errorf("telefs: placeholder %s is among local names", path.Join(p, name))
+		}
+		if err := checkLocalConflicts(c, path.Join(p, name)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // newSynthTree creates the nodes of spec, numbering them in a stable order.
@@ -70,7 +106,7 @@ func (f *FS) newSynthTree(spec *synthSpec) *node {
 	next := uint64(synthIno) + 1
 	var mk func(s *synthSpec, vpath string) *node
 	mk = func(s *synthSpec, vpath string) *node {
-		n := &node{fsys: f, kind: s.kind, vpath: vpath, rpath: vpath, synth: map[string]*node{}}
+		n := &node{fsys: f, kind: s.kind, vpath: vpath, rpath: vpath, synth: map[string]*node{}, local: s.local}
 		for _, name := range slices.Sorted(maps.Keys(s.children)) {
 			c := mk(s.children[name], path.Join(vpath, name))
 			c.synthIno = next

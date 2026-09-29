@@ -25,6 +25,7 @@ telefs 是 tele 自己的 FUSE 文件系统：本地由会话主进程提供 FUS
 - **协议**：FUSE 操作一一映射为 RPC，消息定义在 `internal/proto`。
 - **远端**：以目标用户身份访问文件。用户无权读取的文件（例如 `/etc/shadow`）返回 EACCES，与远端 Bash 的行为一致。errno 原样传回本地，只有内核无法表示的 errno 例外：内核只接受 1 到 511 之间的 FUSE 错误码，超出范围的应答会让调用方永远挂起，所以 `ENOTSUPP`（524）换成 `EOPNOTSUPP`，其余换成 `EIO`（见[错误处理](coding-standards.md#错误处理)）。
 - **标识**：远端文件以 (dev, ino) 标识，见[对象标识](#对象标识)。
+- **本地名字**：远端 `HOME` 中以 `.claude.json` 开头的名字由会话主进程直接对本地 `HOME` 的同名条目执行（见 [~/.claude.json](claude-code.md#claudejson)）。本地文件可能被其它本地进程（例如直接运行的 `claude`）修改，这些修改不经过 FUSE，所以这些节点的 entry 和 attr 都不缓存。本地名字和远端名字之间的 rename 返回 `EXDEV`。
 - `/proc`、`/sys`、`/dev` 不从远端代理，因为远端视图中它们是本地的真实挂载。远端的进程信息请通过 Bash 查看。
 - **排查辅助**：telefs 在 debug 日志中记录 Claude 进程对疑似运行时文件（`*.so*`、`/etc/ssl` 下的路径）的访问，用于发现新版本 Claude 在切换视图后仍然读取本地运行时文件的情况。
 

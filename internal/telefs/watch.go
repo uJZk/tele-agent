@@ -355,6 +355,9 @@ func (f *FS) applyChange(ch proto.Change) {
 		return
 	}
 	for _, d := range f.watchers(ch.Dir) {
+		if d.local.owns(ch.Name) {
+			continue // the remote entry is not shown
+		}
 		switch {
 		case ch.Kind == proto.ChangeEntry:
 			f.invalEntry(d, ch.Name)

@@ -3,12 +3,14 @@ package telefs
 import (
 	"context"
 	"path"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
@@ -46,6 +48,9 @@ type node struct {
 	rpath    string
 	synth    map[string]*node
 	synthIno uint64
+	// local, if set, serves some entry names from a local directory
+	// (LocalNames).
+	local *localDir
 
 	// Remote nodes only: the remote identity, fixed at creation.
 	dev, ino uint64
@@ -215,6 +220,9 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	if c := n.synth[name]; c != nil {
 		f.synthEntry(c, out)
 		return &c.Inode, 0
+	}
+	if n.local.owns(name) {
+		return f.localLookup(ctx, &n.Inode, n, n.local.root, name, out)
 	}
 	if n.kind == kindPlaceholderDir {
 		out.SetEntryTimeout(shortTTL)
@@ -429,6 +437,9 @@ func (n *node) created(ctx context.Context, name string, resp *proto.FSResponse,
 // Create implements fs.NodeCreater.
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	f := n.fsys
+	if n.local.owns(name) {
+		return f.localCreate(ctx, &n.Inode, n, n.local.root, name, flags, mode, out)
+	}
 	dir, errno := n.newEntry(name)
 	if errno != 0 {
 		return nil, nil, 0, errno
@@ -462,22 +473,34 @@ func (n *node) mkentry(ctx context.Context, req *proto.FSRequest, out *fuse.Entr
 
 // Mkdir implements fs.NodeMkdirer.
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.local.owns(name) {
+		return n.fsys.localMkdir(ctx, &n.Inode, n, n.local.root, name, mode, out)
+	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSMkdir, Name: name, Mode: mode}, out)
 }
 
 // Mknod implements fs.NodeMknoder.
 func (n *node) Mknod(ctx context.Context, name string, mode, dev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.local.owns(name) {
+		return nil, syscall.EPERM // Claude creates only files and directories there
+	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSMknod, Name: name, Mode: mode, Rdev: remoteRdev(dev)}, out)
 }
 
 // Symlink implements fs.NodeSymlinker.
 func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.local.owns(name) {
+		return n.fsys.localSymlink(ctx, &n.Inode, n, n.local.root, target, name, out)
+	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSSymlink, Name: name, Target: target}, out)
 }
 
 // Link implements fs.NodeLinker.
 func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	f := n.fsys
+	if _, isLocal := target.(*localNode); isLocal || n.local.owns(name) {
+		return nil, syscall.EXDEV
+	}
 	tn, ok := target.(*node)
 	if !ok || tn.kind != kindRemote {
 		return nil, syscall.EPERM
@@ -502,6 +525,13 @@ func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 // remove sends FSUnlink or FSRmdir for entry name of n.
 func (n *node) remove(op proto.FSOp, name string) syscall.Errno {
 	f := n.fsys
+	if n.local.owns(name) {
+		p := filepath.Join(n.local.root, name)
+		if op == proto.FSRmdir {
+			return errnoOf(unix.Rmdir(p))
+		}
+		return errnoOf(unix.Unlink(p))
+	}
 	if n.isProtected(name) {
 		return syscall.EBUSY
 	}
@@ -527,8 +557,15 @@ func (n *node) Rmdir(_ context.Context, name string) syscall.Errno {
 // Rename implements fs.NodeRenamer, including renameat2 flags.
 func (n *node) Rename(_ context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	f := n.fsys
+	if n.local.owns(name) {
+		dir2, errno := localRenameTarget(n, newParent, newName)
+		if errno != 0 {
+			return errno
+		}
+		return localRename(n.local.root, name, dir2, newName, flags)
+	}
 	np, ok := newParent.(*node)
-	if !ok {
+	if !ok || np.local.owns(newName) {
 		return syscall.EXDEV
 	}
 	if n.isProtected(name) || np.isProtected(newName) {

@@ -187,13 +187,13 @@ func TestBuildTree(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := buildTree(tc.ps)
+			_, err := buildTree(tc.ps, nil)
 			if (err == nil) != tc.ok {
 				t.Fatalf("buildTree = %v, want ok=%v", err, tc.ok)
 			}
 		})
 	}
-	root, err := buildTree([]Placeholder{{Path: "/a", Dir: true}, {Path: "/a/b"}})
+	root, err := buildTree([]Placeholder{{Path: "/a", Dir: true}, {Path: "/a/b"}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
