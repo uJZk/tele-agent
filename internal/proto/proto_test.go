@@ -207,6 +207,17 @@ func TestCheckScratch(t *testing.T) {
 	if err := CheckScratch(many); err == nil {
 		t.Error("CheckScratch(over total) = nil")
 	}
+	for _, bad := range []ScratchFile{
+		{Area: ScratchSessionEnv, Path: "d", Dir: true, Data: []byte("x")},
+		{Area: ScratchSessionEnv, Path: "d", Dir: true, Deleted: true},
+	} {
+		if err := CheckScratch([]ScratchFile{bad}); err == nil {
+			t.Errorf("CheckScratch(%+v) accepted a directory with contents or deletion", bad)
+		}
+	}
+	if err := CheckScratch([]ScratchFile{{Area: ScratchSessionEnv, Path: "d", Dir: true}}); err != nil {
+		t.Errorf("CheckScratch(directory) = %v", err)
+	}
 }
 
 func FuzzReadFrame(f *testing.F) {

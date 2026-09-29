@@ -197,6 +197,13 @@ func (s *Service) writeScratch(roots areaRoots, files []proto.ScratchFile) {
 			continue // logged by openAreas
 		}
 		k := scratchKey{f.Area, f.Path}
+		if f.Dir {
+			// Nothing to record: scans report files only.
+			if err := root.MkdirAll(f.Path, 0o700); err != nil {
+				s.logFileErr("create uploaded directory", f.Area, f.Path, err)
+			}
+			continue
+		}
 		if f.Deleted {
 			if err := removeFile(root, f.Path); err != nil {
 				s.logFileErr("remove uploaded file", f.Area, f.Path, err)

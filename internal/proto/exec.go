@@ -157,6 +157,11 @@ type ScratchFile struct {
 	Data []byte `cbor:"4,keyasint,omitempty"`
 	// Deleted reports that the file was removed; Data and Mode are unused.
 	Deleted bool `cbor:"5,keyasint,omitempty"`
+	// Dir asks for the directory Path, with its missing parents, and
+	// nothing in it; Data, Mode and Deleted are unused. It carries an empty
+	// directory a command expects to write into, such as the one of
+	// CLAUDE_ENV_FILE (docs/claude-code.md "scratch 文件").
+	Dir bool `cbor:"6,keyasint,omitempty"`
 }
 
 // CheckScratch validates scratch files received from a peer.
@@ -169,6 +174,9 @@ func CheckScratch(files []ScratchFile) error {
 		}
 		if err := CheckRelPath(f.Path); err != nil {
 			return err
+		}
+		if f.Dir && (f.Deleted || len(f.Data) > 0) {
+			return fmt.Errorf("proto: scratch directory %q with contents or deletion", f.Path)
 		}
 		if len(f.Data) > ScratchFileMax {
 			return fmt.Errorf("proto: scratch file %q: %d bytes exceeds %d", f.Path, len(f.Data), ScratchFileMax)

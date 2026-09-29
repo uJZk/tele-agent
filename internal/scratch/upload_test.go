@@ -31,6 +31,10 @@ func tmpMapper(t *testing.T) (*Mapper, string) {
 func paths(files []proto.ScratchFile) string {
 	var p []string
 	for _, f := range files {
+		if f.Dir {
+			p = append(p, f.Path+"/")
+			continue
+		}
 		p = append(p, fmt.Sprintf("%s:%v", f.Path, f.Deleted))
 	}
 	return strings.Join(p, " ")
@@ -166,7 +170,7 @@ func TestSharedAreasOnlyOwnFiles(t *testing.T) {
 	} {
 		m.Rewrite(s)
 	}
-	if got := paths(upload(m)); got != "claimed/hook-1.sh:false" {
+	if got := paths(upload(m)); got != "claimed/ claimed/hook-1.sh:false" {
 		t.Fatalf("Uploads of a claimed entry = %s", got)
 	}
 	if err := os.RemoveAll(filepath.Join(env, "claimed")); err != nil {
@@ -174,6 +178,39 @@ func TestSharedAreasOnlyOwnFiles(t *testing.T) {
 	}
 	if got := paths(upload(m)); got != "claimed/hook-1.sh:true" {
 		t.Fatalf("Uploads after removing a claimed entry = %s", got)
+	}
+}
+
+func TestClaimedEmptyDirectory(t *testing.T) {
+	// Claude creates CLAUDE_ENV_FILE's directory but not the file before
+	// the SessionStart hook runs (docs/claude-code.md "scratch 文件"): the
+	// empty directory must reach the target, once.
+	env := filepath.Join(t.TempDir(), "session-env")
+	m, err := New([]Area{{ID: proto.ScratchSessionEnv, ClaudePath: "/h/.claude/session-env", LocalPath: env, RemotePath: "/r/e"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(env, "sid"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(env, "other"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	m.Rewrite("CLAUDE_ENV_FILE=/h/.claude/session-env/sid/sessionstart-hook-0.sh")
+
+	u := m.Uploads(proto.MaxDataFrame)
+	if got := paths(u.Files); got != "sid/" {
+		t.Fatalf("Uploads = %s, want the claimed directory only", got)
+	}
+	// Not committed: offered again.
+	u.Rollback()
+	u = m.Uploads(proto.MaxDataFrame)
+	if got := paths(u.Files); got != "sid/" {
+		t.Fatalf("Uploads after Rollback = %s", got)
+	}
+	u.Commit()
+	if files := upload(m); len(files) != 0 {
+		t.Fatalf("Uploads after Commit = %s", paths(files))
 	}
 }
 

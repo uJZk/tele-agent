@@ -255,3 +255,20 @@ func TestUnreadableDirectoryNotReportedDeleted(t *testing.T) {
 		t.Fatalf("unreadable directory: covered %v, changed %v, deleted %v", covered, changed, deleted)
 	}
 }
+
+func TestScratchUploadDirectory(t *testing.T) {
+	// A SessionStart hook appends to CLAUDE_ENV_FILE in a directory that
+	// holds no file yet (docs/claude-code.md "scratch 文件").
+	h := newHarness(t, nil)
+	envFile := filepath.Join(h.scratch, "session-env", "sid", "sessionstart-hook-0.sh")
+	o := run(t, h, &proto.ExecStart{
+		Argv:    sh(`echo 'export A=1' >> "$1"`, envFile),
+		Scratch: []proto.ScratchFile{{Area: proto.ScratchSessionEnv, Path: "sid", Dir: true}},
+	})
+	if o.exit.Code != 0 {
+		t.Fatalf("exit %+v, stderr %q", o.exit, o.stderr.String())
+	}
+	if len(o.exit.Scratch) != 1 || o.exit.Scratch[0].Path != "sid/sessionstart-hook-0.sh" || string(o.exit.Scratch[0].Data) != "export A=1\n" {
+		t.Fatalf("returned %+v, want the hook's file", o.exit.Scratch)
+	}
+}
