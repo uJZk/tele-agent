@@ -34,9 +34,13 @@ const ExpireGrace = 10 * time.Second
 
 // Config configures a Server.
 type Config struct {
-	// Token authenticates sessions. P1 replaces it with SS2022 PSK
-	// authentication plus a per-session key (docs/security.md).
+	// Token authenticates sessions on a transport that does not
+	// authenticate the peer (a unix socket).
 	Token []byte
+	// TransportAuthenticated is set when every transport of the listener
+	// authenticates the peer (SS2022 with the host's PSK); the Hello token
+	// is then not checked (docs/security.md "信任边界").
+	TransportAuthenticated bool
 	// FSRoot is the directory served as the remote "/" — always "/" in
 	// production. Tests serve a temporary directory; it is not a security
 	// boundary.
@@ -189,7 +193,7 @@ func (s *Server) handshake(ctx context.Context, sess *mux.Session) (*session, er
 	if hello.Version != proto.Version {
 		return nil, reject(fmt.Sprintf("protocol version mismatch: server %d, client %d; upgrade the older side", proto.Version, hello.Version))
 	}
-	if subtle.ConstantTimeCompare(hello.Token, s.cfg.Token) != 1 {
+	if !s.cfg.TransportAuthenticated && (len(s.cfg.Token) == 0 || subtle.ConstantTimeCompare(hello.Token, s.cfg.Token) != 1) {
 		return nil, reject("authentication failed")
 	}
 	if err := proto.CheckSessionID(hello.SessionID); err != nil {

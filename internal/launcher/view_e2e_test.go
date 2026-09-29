@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ujzk/tele-agent/internal/hostcfg"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/server"
 	"github.com/ujzk/tele-agent/internal/testutil/claudetest"
@@ -47,7 +48,7 @@ func runTele(t *testing.T, tele, claude string, api *claudetest.API, ep, dir str
 	if err := os.MkdirAll(hostDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	b, _ := json.Marshal(hostConfig{Endpoint: ep, Token: "s3cret"})
+	b, _ := json.Marshal(hostcfg.Host{Endpoint: ep, Token: "s3cret"})
 	if err := os.WriteFile(filepath.Join(hostDir, "dev.json"), b, 0o600); err != nil {
 		t.Fatal(err)
 	}

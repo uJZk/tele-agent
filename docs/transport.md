@@ -15,7 +15,8 @@ exec / telefs / 变更推送 / MCP 代理 / 端口转发
 - 库：[database64128/shadowsocks-go](https://github.com/database64128/shadowsocks-go)，方法 `2022-blake3-aes-256-gcm`。
 - 目标地址固定为一个内部名称（`tele.internal:1`），这是两端之间的约定，tele 不做通用代理。
 - SS2022 自带时间戳和 salt 重放过滤，所以**两端时钟误差必须在 30 秒以内**。`tele server install` 检查 NTP，`tele host ls` 和 `tele doctor` 报告时钟偏差。
-- 未认证的连接按 RejectPolicy 处理：默认一直读到超时再关闭，不回任何字节，以抵抗主动探测。
+- 未认证的连接按 RejectPolicy 处理：一直读到超时再关闭，不回任何字节，以抵抗主动探测。同时处于这种状态的连接数有上限，超过上限的立即关闭，免得探测耗尽文件描述符。
+- 客户端无法区分 PSK 错误、时钟偏差超限和对端不是 tele server：三种情况下服务端都一言不发。所以客户端在收到第一个字节之前出错时，错误信息同时列出这三种可能。
 - 「全随机字节流」在部分审查环境中会被识别。shadowsocks-go 的请求前缀功能可以用来伪装，作为可选的缓解手段。
 
 ## 可恢复会话层

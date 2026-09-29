@@ -73,7 +73,7 @@ tele host confirm myhost 'tele1r:…'
 
 | 路径 | 内容 |
 |---|---|
-| `~/.config/tele/`（本地） | 主机别名、PSK（0600） |
+| `~/.config/tele/hosts/<别名>.json`（本地） | 主机别名的 endpoint 与凭据（0600）：SS2022 endpoint（`host:port`）用 PSK，`unix:<路径>` endpoint 用 token。其他用户可读时拒绝使用 |
 | `~/.config/tele/`（远端） | 服务端配置、PSK（0600）、安装清单 `install-manifest.json` |
 | `~/.cache/tele/s/<sid>/`（远端） | 会话目录：scratch 文件、溢出到磁盘的命令输出 |
 

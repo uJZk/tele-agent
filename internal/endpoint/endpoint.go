@@ -1,26 +1,40 @@
 // Package endpoint parses where a tele server listens and connects to it.
 //
-// "unix:<path>" is a plain unix socket, used for a server on the same machine
-// and in tests. The SS2022 transport over TCP (docs/transport.md) is not
-// implemented yet.
+// "host:port" is the SS2022 transport over TCP (docs/transport.md "SS2022"),
+// authenticated with the host's PSK. "unix:<path>" is a plain unix socket,
+// used for a server on the same machine and in tests; there the file
+// permissions and the session token protect the server.
 package endpoint
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/ujzk/tele-agent/internal/sstransport"
+)
+
+// Networks of an Endpoint.
+const (
+	NetworkUnix   = "unix"
+	NetworkSS2022 = "ss2022"
 )
 
 // Endpoint is a parsed server address.
 type Endpoint struct {
-	Network string // "unix"
-	Address string
+	Network string // NetworkUnix or NetworkSS2022
+	Address string // socket path, or host:port
+	// psk authenticates an SS2022 endpoint (WithPSK). It is not part of
+	// the endpoint's text form and never printed.
+	psk *sstransport.PSK
 }
 
 // Parse parses an endpoint string.
@@ -31,18 +45,44 @@ func Parse(s string) (Endpoint, error) {
 		}
 		return Endpoint{Network: "unix", Address: filepath.Clean(path)}, nil
 	}
-	if _, _, err := net.SplitHostPort(s); err == nil {
-		return Endpoint{}, fmt.Errorf("endpoint %q: the SS2022 transport is not implemented yet; use unix:<path>", s)
+	host, port, err := net.SplitHostPort(s)
+	if err != nil || port == "" {
+		return Endpoint{}, fmt.Errorf("endpoint %q: want host:port or unix:<path>", s)
 	}
-	return Endpoint{}, fmt.Errorf("endpoint %q: want unix:<path>", s)
+	if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
+		return Endpoint{}, fmt.Errorf("endpoint %q: invalid port %q", s, port)
+	}
+	return Endpoint{Network: NetworkSS2022, Address: net.JoinHostPort(host, port)}, nil
 }
 
+// WithPSK returns e authenticated with psk; unix endpoints ignore it.
+func (e Endpoint) WithPSK(psk sstransport.PSK) Endpoint {
+	e.psk = &psk
+	return e
+}
+
+// Authenticates reports whether the transport itself authenticates the
+// peer (SS2022), so that the server need not check a session token.
+func (e Endpoint) Authenticates() bool { return e.Network == NetworkSS2022 }
+
+var errNoPSK = errors.New("SS2022 endpoint without a PSK")
+
+// String returns the endpoint in the form Parse accepts; never the PSK.
 func (e Endpoint) String() string {
+	if e.Network == NetworkSS2022 {
+		return e.Address
+	}
 	return e.Network + ":" + e.Address
 }
 
 // Dial connects to the endpoint.
 func (e Endpoint) Dial(ctx context.Context) (net.Conn, error) {
+	if e.Network == NetworkSS2022 {
+		if e.psk == nil {
+			return nil, fmt.Errorf("connect to %v: %w", e, errNoPSK)
+		}
+		return sstransport.Dial(ctx, e.Address, *e.psk)
+	}
 	var d net.Dialer
 	c, err := d.DialContext(ctx, e.Network, e.Address)
 	if err != nil {
@@ -52,8 +92,16 @@ func (e Endpoint) Dial(ctx context.Context) (net.Conn, error) {
 }
 
 // Listen listens on the endpoint. A stale unix socket file left by a server
-// that is no longer running is replaced; a live one is an error.
-func (e Endpoint) Listen(ctx context.Context) (net.Listener, error) {
+// that is no longer running is replaced; a live one is an error. An SS2022
+// listener returns only authenticated connections; log receives its
+// diagnostics (nil discards them).
+func (e Endpoint) Listen(ctx context.Context, log *slog.Logger) (net.Listener, error) {
+	if e.Network == NetworkSS2022 {
+		if e.psk == nil {
+			return nil, fmt.Errorf("listen on %v: %w", e, errNoPSK)
+		}
+		return sstransport.Listen(ctx, e.Address, *e.psk, log)
+	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, e.Network, e.Address)
 	if err == nil || !errors.Is(err, unix.EADDRINUSE) {

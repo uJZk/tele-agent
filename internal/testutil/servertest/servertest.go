@@ -39,7 +39,7 @@ func StartConfig(t testing.TB, cfg server.Config) endpoint.Endpoint {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln, err := ep.Listen(t.Context())
+	ln, err := ep.Listen(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
