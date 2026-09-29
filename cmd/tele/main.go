@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/ujzk/tele-agent/internal/shim"
 )
 
 func main() {
@@ -15,8 +17,8 @@ func main() {
 
 func run(name string, args []string) int {
 	if name != "tele" {
-		fmt.Fprintf(os.Stderr, "tele: unknown role %q\n", name)
-		return 2
+		// Every other name is a shim in <sess>/bin (docs/exec.md "shim").
+		return shim.Main(name, append([]string{os.Args[0]}, args...))
 	}
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
 		fmt.Fprintln(os.Stderr, "usage: tele [options] <alias>[:<dir>] [claude args...]")

@@ -11,6 +11,7 @@ Bash 工具使用的 shell。
 - 路径中**必须包含** `bash` 或 `zsh`，并且可执行，否则 Claude 会忽略这个变量。所以 shim 命名为 `<sess>/bin/bash`。
 - Bash 工具的调用参数是 `[shell, "-c", <命令串>]`，不是登录 shell。命令串的形式是 `source <快照> 2>/dev/null || true && <关闭 extglob> && <取消名为 unsetenv 的别名和函数> && eval '<命令>' < /dev/null && pwd -P >| <cwd 文件>`。cwd 文件位于 `CLAUDE_CODE_TMPDIR`，名为 `claude-<随机>-cwd`。
 - 命令的 stdin 是 `/dev/null`，所以 Bash 工具的命令从不读取 Claude 的 stdin。
+- Claude 读取 cwd 文件后以它作为下一条命令的工作目录；它如果在项目目录之外，Claude 把工作目录重置回项目根。
 - shell 快照也由这个 shell 生成，调用参数是 `[shell, "-c", "-l", <脚本>]`，即登录 shell。所以快照是**在远端**生成的，记录的是远端的 PATH、别名和函数。
 - 快照中定义了同名函数，把 `rg`、`find`、`grep` 转给 Claude 二进制内嵌的实现，二进制的路径取自 `CLAUDE_CODE_EXECPATH`，或 Claude 的默认安装路径。这些路径在远端通常不可执行，函数随即回退到 `command rg` 等远端程序。
 
