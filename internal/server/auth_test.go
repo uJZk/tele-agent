@@ -146,3 +146,74 @@ func TestSS2022Session(t *testing.T) {
 		t.Fatal("session established with a wrong PSK")
 	}
 }
+
+// TestJoin adds a further connection to a session with its join key: it
+// serves the session's streams, a wrong key is refused, and ending the
+// session closes the joined connection.
+func TestJoin(t *testing.T) {
+	ln, dial := unixListener(t)
+	serve(t, Config{Token: []byte("t")}, ln)
+	primary, reply, err := hello(t, dial, "t")
+	if err != nil || reply.Err != nil {
+		t.Fatalf("primary hello: %v %v", err, reply)
+	}
+	if len(reply.JoinKey) != proto.JoinKeyLen {
+		t.Fatalf("join key of %d bytes", len(reply.JoinKey))
+	}
+	join := func(key []byte) (*mux.Session, *proto.HelloReply) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		conn, err := resume.Dial(ctx, dial, resume.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := mux.Client(conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = m.Close() })
+		st, err := m.Open(proto.StreamControl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = st.SetDeadline(time.Now().Add(10 * time.Second))
+		c := proto.NewConn(st, proto.MaxControlFrame)
+		_ = c.Send(&proto.Hello{Version: proto.Version, Token: []byte("t"), SessionID: "0123456789abcdef", JoinKey: key})
+		var r proto.HelloReply
+		if err := c.Recv(&r); err != nil {
+			t.Fatal(err)
+		}
+		return m, &r
+	}
+	bad := append([]byte(nil), reply.JoinKey...)
+	bad[0] ^= 1
+	if _, r := join(bad); r.Err == nil {
+		t.Fatal("joined with a wrong key")
+	}
+	joined, r := join(reply.JoinKey)
+	if r.Err != nil {
+		t.Fatalf("join: %v", r.Err)
+	}
+	// The joined connection carries the session's FS requests.
+	st, err := joined.Open(proto.StreamFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.WriteFrame(st, &proto.FSRequest{Op: proto.FSGetattr, Path: "/"}); err != nil {
+		t.Fatal(err)
+	}
+	var resp proto.FSResponse
+	if err := proto.ReadFrame(st, &resp, proto.MaxDataFrame); err != nil || resp.Errno != 0 || resp.Attr == nil {
+		t.Fatalf("getattr over the joined connection: %+v, %v", resp, err)
+	}
+	_ = st.Close()
+
+	// Ending the session ends its joined connection.
+	_ = primary.Close()
+	select {
+	case <-joined.Done():
+	case <-time.After(15 * time.Second):
+		t.Fatal("joined connection outlived its session")
+	}
+}

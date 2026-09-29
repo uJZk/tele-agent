@@ -143,7 +143,7 @@ func TestPairingFlow(t *testing.T) {
 	if !strings.Contains(out, "tele host confirm dev") {
 		t.Errorf("add output does not tell how to confirm:\n%s", out)
 	}
-	if _, _, err := mustLoad(t, "dev").Resolve(""); !errors.Is(err, hostcfg.ErrPending) {
+	if _, _, err := loadDev(t).Resolve(""); !errors.Is(err, hostcfg.ErrPending) {
 		t.Fatalf("pending host resolves: %v", err)
 	}
 	if _, out, _ := runMain(t, "", "ls"); !regexp.MustCompile(`dev\s+\S+\s+pending`).MatchString(out) {
@@ -167,7 +167,7 @@ func TestPairingFlow(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Paired \"dev\" with bob@build1") || !strings.Contains(out, "Connected: bob@build1") {
 		t.Fatalf("confirm: %d\n%s\n%s", code, out, errOut)
 	}
-	if _, _, err := mustLoad(t, "dev").Resolve(""); err != nil {
+	if _, _, err := loadDev(t).Resolve(""); err != nil {
 		t.Fatalf("confirmed host does not resolve: %v", err)
 	}
 	if _, out, _ := runMain(t, "", "ls"); !regexp.MustCompile(`dev\s+127\.0\.0\.1:\d+\s+ok\s+bob@build1, TestOS`).MatchString(out) {
@@ -185,13 +185,25 @@ func TestPairingFlow(t *testing.T) {
 	}
 }
 
-func mustLoad(t *testing.T, alias string) *hostcfg.Host {
+// loadDev loads the host the tests add.
+func loadDev(t *testing.T) *hostcfg.Host {
 	t.Helper()
-	h, err := hostcfg.Load(alias)
+	h, err := hostcfg.Load("dev")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return h
+}
+
+func TestAddAlternates(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if code, _, errOut := runMain(t, "", "add", "dev", "--endpoint", "a.example:8443", "--endpoint", "[2001:db8::1]:8443"); code != 0 {
+		t.Fatalf("add: %d %s", code, errOut)
+	}
+	h := loadDev(t)
+	if h.Endpoint != "a.example:8443" || len(h.Alternates) != 1 || h.Alternates[0] != "[2001:db8::1]:8443" {
+		t.Fatalf("host = %+v", h)
+	}
 }
 
 func TestAddOverSSH(t *testing.T) {
@@ -214,7 +226,7 @@ func TestAddOverSSH(t *testing.T) {
 	if !strings.Contains(out, "Paired \"dev\" with bob@fakehost") {
 		t.Errorf("add --ssh did not confirm:\n%s", out)
 	}
-	h := mustLoad(t, "dev")
+	h := loadDev(t)
 	if h.PendingToken != "" || h.Endpoint != "127.0.0.1:"+strconv.Itoa(pairing.DefaultPort) {
 		t.Errorf("host after add --ssh: %+v", h)
 	}

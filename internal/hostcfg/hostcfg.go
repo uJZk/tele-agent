@@ -26,6 +26,11 @@ type Host struct {
 	// Endpoint is where the server listens: host:port (SS2022) or
 	// unix:<path>.
 	Endpoint string `json:"endpoint"`
+	// Alternates are further host:port addresses of the same server, with
+	// the same PSK, such as another address family or another forwarded
+	// port. The session rotates among them when dialing fails
+	// (docs/transport.md "可恢复会话层").
+	Alternates []string `json:"alternates,omitempty"`
 	// PSK authenticates an SS2022 endpoint (base64).
 	PSK string `json:"psk,omitempty"`
 	// Token authenticates sessions on a unix endpoint, whose transport
@@ -91,10 +96,46 @@ func Load(alias string) (*Host, error) {
 	return &h, nil
 }
 
-// Resolve returns the endpoint to connect to, with its credentials:
-// endpointOverride, if set, replaces the configured endpoint. token is set
-// only for a unix endpoint.
+// Resolve returns the primary endpoint with its credentials; see
+// ResolveAll.
 func (h *Host) Resolve(endpointOverride string) (ep endpoint.Endpoint, token []byte, err error) {
+	eps, token, err := h.ResolveAll(endpointOverride)
+	if err != nil {
+		return endpoint.Endpoint{}, nil, err
+	}
+	return eps[0], token, nil
+}
+
+// ResolveAll returns the endpoints to connect to, primary first, with
+// their credentials: endpointOverride, if set, replaces them all. token is
+// set only for a unix endpoint.
+func (h *Host) ResolveAll(endpointOverride string) (eps []endpoint.Endpoint, token []byte, err error) {
+	primary, token, err := h.resolve(endpointOverride)
+	if err != nil {
+		return nil, nil, err
+	}
+	eps = []endpoint.Endpoint{primary}
+	if endpointOverride != "" {
+		return eps, token, nil
+	}
+	for _, a := range h.Alternates {
+		ep, err := endpoint.Parse(a)
+		if err != nil {
+			return nil, nil, fmt.Errorf("host %q: alternate endpoint: %w", h.Alias, err)
+		}
+		if ep.Network != primary.Network {
+			return nil, nil, fmt.Errorf("host %q: alternate endpoint %v is not of the same kind as %v", h.Alias, ep, primary)
+		}
+		if ep.Authenticates() {
+			psk, _ := sstransport.ParsePSK(h.PSK) // checked by resolve
+			ep = ep.WithPSK(psk)
+		}
+		eps = append(eps, ep)
+	}
+	return eps, token, nil
+}
+
+func (h *Host) resolve(endpointOverride string) (ep endpoint.Endpoint, token []byte, err error) {
 	if h.PendingToken != "" {
 		return endpoint.Endpoint{}, nil, fmt.Errorf("host %q: %w; run `tele host confirm %s <receipt>` with the receipt `tele server install` printed", h.Alias, ErrPending, h.Alias)
 	}

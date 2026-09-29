@@ -15,14 +15,17 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/cli"
+	"github.com/ujzk/tele-agent/internal/client"
 	"github.com/ujzk/tele-agent/internal/connectproxy"
 	"github.com/ujzk/tele-agent/internal/fssvc"
+	"github.com/ujzk/tele-agent/internal/netwatch"
 	"github.com/ujzk/tele-agent/internal/portfwd"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/relay"
@@ -114,18 +117,19 @@ func (s *session) run(sigs <-chan os.Signal) (*os.ProcessState, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.onExit(cancel)
 
-	ep, token, err := loadHost(s.cfg.Alias, s.cfg.Endpoint)
+	eps, token, err := loadHostAll(s.cfg.Alias, s.cfg.Endpoint)
 	if err != nil {
 		return nil, err
 	}
 	cctx, ccancel := context.WithTimeout(ctx, connectTimeout)
 	sink := newLogSink()
-	rs, err := connect(cctx, ep, token, resume.Config{Logger: slog.New(sink).With("layer", "resume")})
+	rs, err := client.ConnectDial(cctx, client.Rotate(eps), token, resume.Config{Logger: slog.New(sink).With("layer", "resume")})
 	ccancel()
 	if err != nil {
 		return nil, fmt.Errorf("connect to %q: %w; run \"tele doctor %s\" to check the connection", s.cfg.Alias, err, s.cfg.Alias)
 	}
 	s.onExit(func() { _ = rs.Close() })
+	s.followNetwork(ctx, rs)
 
 	p, err := s.layout(rs)
 	if err != nil {
@@ -166,6 +170,38 @@ func (s *session) run(sigs <-chan os.Signal) (*os.ProcessState, error) {
 		return nil, err
 	}
 	return s.runClaude(env, args, ns, sigs)
+}
+
+// followNetwork moves the session to a new transport as soon as the local
+// network changes, instead of waiting for the old transport to time out
+// (docs/transport.md "可恢复会话层"): a session without transport retries
+// at once, and one with a transport migrates to a new one, keeping the old
+// until the new one is connected.
+func (s *session) followNetwork(ctx context.Context, rs *remoteSession) {
+	var migrating atomic.Bool
+	err := netwatch.Watch(ctx, func() {
+		for _, c := range rs.Conns {
+			c.Kick()
+		}
+		if !migrating.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer migrating.Store(false)
+			mctx, cancel := context.WithTimeout(ctx, connectTimeout)
+			defer cancel()
+			for _, c := range rs.Conns {
+				if err := c.Migrate(mctx); err != nil {
+					s.log.Debug("migrate after a network change", "err", err)
+				}
+			}
+		}()
+	})
+	if err != nil {
+		// Only the early switch is lost: the heartbeat still detects a
+		// dead transport.
+		s.log.Warn("watch the network", "err", err)
+	}
 }
 
 // forwardMCPPorts forwards the loopback ports of the HTTP and SSE MCP
@@ -388,7 +424,8 @@ func (s *session) mountTelefs(ctx context.Context, rs *remoteSession, p paths) (
 	s.onExit(func() { _ = os.Remove(p.mnt) })
 	//nolint:contextcheck // the mount lives until unmount, which teardown does
 	fsys, err := telefs.Mount(p.mnt, telefs.Config{
-		Opener:       rs.Mux,
+		Opener:       rs.Meta,
+		BulkOpener:   rs.Bulk,
 		Placeholders: placeholders(p, isDir(managedDir)),
 		LocalNames:   []telefs.LocalNames{{Dir: p.home, Prefix: ".claude.json", Opener: local}},
 		UID:          uint32(os.Getuid()),

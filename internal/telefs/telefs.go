@@ -69,7 +69,11 @@ type Placeholder struct {
 
 // Config configures a mount.
 type Config struct {
-	Opener       Opener
+	Opener Opener
+	// BulkOpener, if set, carries FSRead and FSWrite on a connection of
+	// their own, so that large transfers do not hold up the small requests
+	// on Opener (docs/transport.md "可恢复会话层").
+	BulkOpener   Opener
 	Placeholders []Placeholder
 	// LocalNames lists directories some of whose entries are local.
 	LocalNames []LocalNames
@@ -90,6 +94,8 @@ const shortTTL = time.Second
 // or the local HOME of a LocalNames rule.
 type backend struct {
 	opener Opener
+	// bulk carries FSRead and FSWrite; nil means opener does.
+	bulk Opener
 	// local marks a LocalNames backend. Other local processes (a plain
 	// claude, for one) change its files behind the mount's back and
 	// nothing pushes their changes, so the kernel caches none of its
@@ -154,7 +160,7 @@ func mount(mountpoint string, cfg Config, refreshRoot bool) (*FS, error) {
 	}
 	f := &FS{
 		cfg:         cfg,
-		remote:      &backend{opener: cfg.Opener},
+		remote:      &backend{opener: cfg.Opener, bulk: cfg.BulkOpener},
 		log:         cfg.Logger,
 		born:        time.Now(),
 		appliedWake: make(chan struct{}),
@@ -249,7 +255,11 @@ func (f *FS) call(req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
 // would make callers retry non-idempotent operations. The transport bounds
 // the wait instead.
 func (f *FS) callOn(b *backend, req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
-	c, err := b.opener.Open(proto.StreamFS)
+	o := b.opener
+	if b.bulk != nil && (req.Op == proto.FSRead || req.Op == proto.FSWrite) {
+		o = b.bulk
+	}
+	c, err := o.Open(proto.StreamFS)
 	if err != nil {
 		f.log.Warn("telefs: open fs stream", "op", req.Op, "err", err)
 		return nil, syscall.EIO

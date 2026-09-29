@@ -23,12 +23,14 @@
 package resume
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ujzk/tele-agent/internal/proto"
@@ -77,6 +79,10 @@ const (
 	// silentBeats is how many heartbeat intervals without a frame drop
 	// the transport.
 	silentBeats = 3
+	// suspectBeats is how many silent heartbeat intervals make the client
+	// try a new transport in the background while the old one may still
+	// recover (make-before-break).
+	suspectBeats = 2
 )
 
 // Config configures both ends.
@@ -115,6 +121,13 @@ type Conn struct {
 	redial redialFunc
 	// attachMu serializes resumptions on the server (resumeServer).
 	attachMu sync.Mutex
+	// resumeMu serializes the client's resumptions: reconnects after a
+	// loss and migrations (Migrate).
+	resumeMu sync.Mutex
+	// migrating is set while a background migration runs.
+	migrating atomic.Bool
+	// kick cuts the client's reconnect backoff short (Kick).
+	kick chan struct{}
 
 	mu   sync.Mutex // guards the fields below
 	cond *sync.Cond // broadcast on every change of them
@@ -161,6 +174,7 @@ func newConn(cfg Config, id, key []byte, redial redialFunc) *Conn {
 		id:        id,
 		key:       key,
 		redial:    redial,
+		kick:      make(chan struct{}, 1),
 		downSince: time.Now(),
 		done:      make(chan struct{}),
 	}
@@ -545,17 +559,31 @@ func (c *Conn) heartbeat() {
 		case <-t.C:
 		}
 		c.mu.Lock()
+		suspect := false
 		if c.tr != nil {
-			if time.Since(c.lastHeard) > silentBeats*c.cfg.Heartbeat {
+			silent := time.Since(c.lastHeard)
+			if silent > silentBeats*c.cfg.Heartbeat {
 				c.log.Info("resume: transport silent; dropping it")
 				c.dropLocked()
 			} else {
+				suspect = silent > suspectBeats*c.cfg.Heartbeat && !c.closing
 				c.pingDue = true
 				c.ackDue = true
 			}
 		}
 		c.cond.Broadcast()
 		c.mu.Unlock()
+		if suspect && c.redial != nil && c.migrating.CompareAndSwap(false, true) {
+			c.log.Info("resume: transport silent; trying a new one")
+			c.wg.Go(func() {
+				defer c.migrating.Store(false)
+				ctx, cancel := context.WithTimeout(doneContext(c.done), handshakeTimeout)
+				defer cancel()
+				if err := c.Migrate(ctx); err != nil {
+					c.log.Debug("resume: migrate", "err", err)
+				}
+			})
+		}
 	}
 }
 

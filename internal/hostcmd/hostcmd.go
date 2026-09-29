@@ -25,7 +25,7 @@ import (
 )
 
 // Usage is the synopsis of "tele host".
-const Usage = `usage: tele host add <alias> (--endpoint <host:port> | --ssh <[user@]host> [--endpoint <host:port>]) [--force]
+const Usage = `usage: tele host add <alias> (--endpoint <host:port>... | --ssh <[user@]host> [--endpoint <host:port>...]) [--force]
        tele host confirm <alias> [<tele1r:…>]
        tele host ls
        tele host rm <alias>`
@@ -100,7 +100,8 @@ func parseAliasFlags(fs *flag.FlagSet, args []string) (alias string, rest []stri
 
 func add(ctx context.Context, args []string, st Streams) error {
 	fs := flag.NewFlagSet("add", flag.ContinueOnError)
-	ep := fs.String("endpoint", "", "host:port the local side connects to")
+	var endpoints stringList
+	fs.Var(&endpoints, "endpoint", "host:port the local side connects to; repeat for alternates")
 	sshDest := fs.String("ssh", "", "[user@]host to install tele server on over SSH")
 	force := fs.Bool("force", false, "replace an existing alias")
 	alias, rest, err := parseAliasFlags(fs, args)
@@ -110,19 +111,24 @@ func add(ctx context.Context, args []string, st Streams) error {
 	if len(rest) > 0 {
 		return usageError{fmt.Errorf("unexpected argument %q", rest[0])}
 	}
-	if *ep == "" {
+	if len(endpoints) == 0 {
 		if *sshDest == "" {
 			return usageError{errors.New("--endpoint or --ssh is required")}
 		}
-		*ep = net.JoinHostPort(sshHost(*sshDest), strconv.Itoa(pairing.DefaultPort))
+		endpoints = stringList{net.JoinHostPort(sshHost(*sshDest), strconv.Itoa(pairing.DefaultPort))}
 	}
-	e, err := endpoint.Parse(*ep)
-	if err != nil {
-		return err
+	var parsed []endpoint.Endpoint
+	for _, s := range endpoints {
+		e, err := endpoint.Parse(s)
+		if err != nil {
+			return err
+		}
+		if !e.Authenticates() {
+			return errors.New("pairing needs host:port endpoints")
+		}
+		parsed = append(parsed, e)
 	}
-	if !e.Authenticates() {
-		return errors.New("pairing needs a host:port endpoint")
-	}
+	e := parsed[0]
 	_, portStr, _ := net.SplitHostPort(e.Address)
 	port, _ := strconv.ParseUint(portStr, 10, 16) // validated by Parse
 
@@ -135,9 +141,14 @@ func add(ctx context.Context, args []string, st Streams) error {
 	if err != nil {
 		return err
 	}
+	var alternates []string
+	for _, a := range parsed[1:] {
+		alternates = append(alternates, a.String())
+	}
 	h := &hostcfg.Host{
 		Alias:        alias,
 		Endpoint:     e.String(),
+		Alternates:   alternates,
 		PSK:          offer.PSK.Encode(),
 		PendingToken: base64.StdEncoding.EncodeToString(offer.Token),
 	}
@@ -301,13 +312,13 @@ func (p probeResult) summary() string {
 
 // probe opens and closes a session with h.
 func probe(ctx context.Context, h *hostcfg.Host) probeResult {
-	ep, token, err := h.Resolve("")
+	eps, token, err := h.ResolveAll("")
 	if err != nil {
 		return probeResult{err: err}
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	s, err := client.Connect(ctx, ep, token, resume.Config{})
+	s, err := client.ConnectDial(ctx, client.Rotate(eps), token, resume.Config{})
 	if err != nil {
 		return probeResult{err: err}
 	}
@@ -346,4 +357,14 @@ func sshHost(dest string) string {
 		return h
 	}
 	return dest
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
 }

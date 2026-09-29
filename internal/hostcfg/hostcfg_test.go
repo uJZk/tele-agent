@@ -111,3 +111,29 @@ func TestLoadErrors(t *testing.T) {
 		t.Errorf("Resolve error leaks the PSK: %v", err)
 	}
 }
+
+func TestAlternates(t *testing.T) {
+	psk, err := sstransport.NewPSK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Host{Alias: "web", Endpoint: "a.example:8443", Alternates: []string{"[2001:db8::1]:8443", "b.example:443"}, PSK: psk.Encode()}
+	eps, token, err := h.ResolveAll("")
+	if err != nil || token != nil || len(eps) != 3 {
+		t.Fatalf("ResolveAll = %v, %q, %v", eps, token, err)
+	}
+	for i, want := range []string{"a.example:8443", "[2001:db8::1]:8443", "b.example:443"} {
+		if eps[i].String() != want || !eps[i].Authenticates() {
+			t.Errorf("endpoint %d = %v, want %s", i, eps[i], want)
+		}
+	}
+	// An override replaces every endpoint.
+	if eps, _, err := h.ResolveAll("c.example:1"); err != nil || len(eps) != 1 || eps[0].String() != "c.example:1" {
+		t.Fatalf("ResolveAll(override) = %v, %v", eps, err)
+	}
+	// Alternates share the primary's kind and credentials.
+	h.Alternates = []string{"unix:/s"}
+	if _, _, err := h.ResolveAll(""); err == nil {
+		t.Fatal("a unix alternate of an SS2022 host was accepted")
+	}
+}

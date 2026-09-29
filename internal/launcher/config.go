@@ -15,3 +15,12 @@ func loadHost(alias, endpointOverride string) (endpoint.Endpoint, []byte, error)
 	}
 	return h.Resolve(endpointOverride)
 }
+
+// loadHostAll is loadHost with the host's alternate endpoints too.
+func loadHostAll(alias, endpointOverride string) ([]endpoint.Endpoint, []byte, error) {
+	h, err := hostcfg.Load(alias)
+	if err != nil {
+		return nil, nil, err
+	}
+	return h.ResolveAll(endpointOverride)
+}

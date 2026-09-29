@@ -123,17 +123,23 @@ func readReply(tr net.Conn) (*proto.ResumeReply, error) {
 func (c *Conn) reconnect(deadline time.Time) {
 	backoff := backoffStart
 	for {
+		ctx, cancel := context.WithDeadline(context.Background(), minTime(deadline, time.Now().Add(handshakeTimeout)))
+		stopOnDone := context.AfterFunc(doneContext(c.done), cancel)
+		// A migration may be restoring the transport right now.
+		c.resumeMu.Lock()
 		c.mu.Lock()
 		stop := c.tr != nil || c.termErr() != nil || c.closing
 		c.mu.Unlock()
+		var err error
+		if !stop && time.Now().Before(deadline) {
+			err = c.resumeClient(ctx)
+		}
+		c.resumeMu.Unlock()
+		stopOnDone()
+		cancel()
 		if stop || !time.Now().Before(deadline) {
 			return
 		}
-		ctx, cancel := context.WithDeadline(context.Background(), minTime(deadline, time.Now().Add(handshakeTimeout)))
-		stopOnDone := context.AfterFunc(doneContext(c.done), cancel)
-		err := c.resumeClient(ctx)
-		stopOnDone()
-		cancel()
 		if err == nil {
 			c.log.Info("resume: session resumed")
 			return
@@ -150,18 +156,77 @@ func (c *Conn) reconnect(deadline time.Time) {
 		select {
 		case <-c.done:
 			return
+		case <-c.kick:
+			// The network changed: retry now, and patiently again.
+			backoff = backoffStart
+			continue
 		case <-time.After(minDuration(wait, time.Until(deadline))):
 		}
 		backoff = min(backoff*2, backoffMax)
 	}
 }
 
-// resumeClient dials and resumes the session over the new transport.
+// resumeClient dials and resumes the session over the new transport. The
+// caller holds resumeMu, and there is no transport.
 func (c *Conn) resumeClient(ctx context.Context) error {
 	tr, err := c.redial(ctx)
 	if err != nil {
 		return err
 	}
+	return c.resumeOn(ctx, tr)
+}
+
+// Kick makes a client that is reconnecting try again at once, as when the
+// local network changed (docs/transport.md "可恢复会话层"). It does nothing
+// while the transport is up.
+func (c *Conn) Kick() {
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+}
+
+// Migrate moves a client session to a new transport while the current one
+// still works: it dials first and gives up the old transport only once the
+// new one is connected, so a failed dial leaves the session as it was
+// (make-before-break). The old transport is retired before the resume
+// handshake, because the handshake reports the bytes received so far and
+// nothing may arrive on the old transport after that. If the handshake
+// fails, the session reconnects as after any loss.
+func (c *Conn) Migrate(ctx context.Context) error {
+	if c.redial == nil {
+		return errors.New("resume: only the client migrates")
+	}
+	c.resumeMu.Lock()
+	defer c.resumeMu.Unlock()
+	c.mu.Lock()
+	err := c.termErr()
+	if err == nil && c.closing {
+		err = ErrClosed
+	}
+	c.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	tr, err := c.redial(ctx)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if err := c.termErr(); err != nil || c.closing {
+		c.mu.Unlock()
+		_ = tr.Close()
+		return errors.Join(err, ErrClosed)
+	}
+	c.log.Info("resume: migrating to a new transport")
+	c.dropLocked()
+	c.mu.Unlock()
+	return c.resumeOn(ctx, tr)
+}
+
+// resumeOn resumes the session over transport tr. The caller holds
+// resumeMu, and there is no current transport.
+func (c *Conn) resumeOn(ctx context.Context, tr net.Conn) error {
 	peerRecv, err := func() (uint64, error) {
 		endHandshake, err := deadlineFrom(ctx, tr)
 		if err != nil {

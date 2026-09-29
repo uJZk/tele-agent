@@ -62,7 +62,14 @@ type Hello struct {
 	Token []byte `cbor:"2,keyasint,omitempty"`
 	// SessionID is chosen by session main; see CheckSessionID.
 	SessionID string `cbor:"3,keyasint"`
+	// JoinKey, when set, adds this connection to the existing session
+	// SessionID instead of starting one: it must equal the JoinKey of that
+	// session's HelloReply (docs/transport.md "可恢复会话层").
+	JoinKey []byte `cbor:"4,keyasint,omitempty"`
 }
+
+// JoinKeyLen is the length of a HelloReply's JoinKey.
+const JoinKeyLen = 32
 
 // ForwardOpen asks the server to connect a forwarded stream to a loopback
 // TCP port on the target host.
@@ -87,6 +94,9 @@ type HelloReply struct {
 	// ServerTime is the server's clock when it sent the reply, in Unix
 	// milliseconds; it lets the client report clock skew.
 	ServerTime int64 `cbor:"5,keyasint,omitempty"`
+	// JoinKey lets further connections join this session (Hello.JoinKey).
+	// The reply to a join carries neither it nor Target.
+	JoinKey []byte `cbor:"6,keyasint,omitempty"`
 }
 
 // TargetInfo describes the target host and user. It feeds the appended

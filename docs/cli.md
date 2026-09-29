@@ -78,7 +78,7 @@ tele host confirm myhost 'tele1r:…'
 
 | 路径 | 内容 |
 |---|---|
-| `~/.config/tele/hosts/<别名>.json`（本地） | 主机别名的 endpoint 与凭据（0600）：SS2022 endpoint（`host:port`）用 PSK，`unix:<路径>` endpoint 用 token。其他用户可读时拒绝使用 |
+| `~/.config/tele/hosts/<别名>.json`（本地） | 主机别名的 endpoint 与凭据（0600）：SS2022 endpoint（`host:port`）用 PSK，`unix:<路径>` endpoint 用 token。`alternates` 列出同一服务端的其他 `host:port`（例如 IPv4 与 IPv6 地址、不同端口），会话层在它们之间轮换（见[可恢复会话层](transport.md#可恢复会话层)）；`tele host add` 多次给出 `--endpoint` 时，第一个是主 endpoint，其余进入 `alternates`。其他用户可读时拒绝使用 |
 | `~/.config/tele/server.json`（远端） | 服务端的监听地址与 PSK（0600）。其他用户可读时拒绝启动 |
 | `~/.config/tele/install-manifest.json`（远端） | 安装清单 |
 | `~/.cache/tele/s/<sid>/`（远端） | 会话目录：scratch 文件、溢出到磁盘的命令输出 |

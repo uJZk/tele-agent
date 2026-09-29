@@ -36,6 +36,10 @@ func TestConnect(t *testing.T) {
 	if proto.CheckSessionID(s.ID) != nil || s.Target.Hostname != "target" || s.Target.Home != target.Home {
 		t.Fatalf("session %q, target %+v", s.ID, s.Target)
 	}
+	// File traffic runs over connections of its own.
+	if len(s.Conns) != 3 || s.Meta == s.Mux || s.Bulk == s.Mux || s.Meta == s.Bulk {
+		t.Errorf("session has %d connections; Meta and Bulk separate: %v %v", len(s.Conns), s.Meta != s.Mux, s.Bulk != s.Mux)
+	}
 	// Server and client share a clock here, so the estimate is small.
 	if s.RTT <= 0 || s.ClockSkew < -time.Second || s.ClockSkew > time.Second {
 		t.Errorf("RTT %v, clock skew %v", s.RTT, s.ClockSkew)
@@ -133,5 +137,36 @@ func TestCheckTarget(t *testing.T) {
 		if err := CheckTarget(&r); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+// TestRotate puts an endpoint that cannot be reached first: the session is
+// established through the second, and later dials start there.
+func TestRotate(t *testing.T) {
+	ep, _ := servertest.Start(t, "s3cret", testTarget(t))
+	dead, err := endpoint.Parse("unix:" + filepath.Join(t.TempDir(), "nobody.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := Rotate([]endpoint.Endpoint{dead, ep})
+	s, err := ConnectDial(t.Context(), dial, []byte("s3cret"), resume.Config{})
+	if err != nil {
+		t.Fatalf("connect through the second endpoint: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if len(s.Conns) == 0 {
+		t.Fatal("session has no resume connection")
+	}
+	// Sticky: the next dial goes straight to the endpoint that worked.
+	c, err := dial(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+
+	// With every endpoint down, the error names them all.
+	_, err = Rotate([]endpoint.Endpoint{dead, dead})(t.Context())
+	if err == nil || strings.Count(err.Error(), "connect to ") != 2 {
+		t.Fatalf("dial with every endpoint down = %v", err)
 	}
 }
