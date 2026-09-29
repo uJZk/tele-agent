@@ -13,6 +13,7 @@ import (
 
 	"github.com/ujzk/tele-agent/internal/endpoint"
 	"github.com/ujzk/tele-agent/internal/proto"
+	"github.com/ujzk/tele-agent/internal/resume"
 	"github.com/ujzk/tele-agent/internal/rexec"
 	"github.com/ujzk/tele-agent/internal/testutil/servertest"
 )
@@ -27,7 +28,7 @@ func testTarget(t *testing.T) *proto.TargetInfo {
 func TestConnect(t *testing.T) {
 	target := testTarget(t)
 	ep, root := servertest.Start(t, "s3cret", target)
-	s, err := connect(t.Context(), ep, []byte("s3cret"))
+	s, err := connect(t.Context(), ep, []byte("s3cret"), resume.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func TestConnect(t *testing.T) {
 
 func TestConnectRejected(t *testing.T) {
 	ep, _ := servertest.Start(t, "s3cret", testTarget(t))
-	_, err := connect(t.Context(), ep, []byte("wrong"))
+	_, err := connect(t.Context(), ep, []byte("wrong"), resume.Config{})
 	if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("connect with a wrong token = %v, want the server's refusal", err)
 	}
@@ -107,7 +108,7 @@ func TestConnectHandshakeTimeout(t *testing.T) {
 	ep, _ := endpoint.Parse("unix:" + sock)
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
-	if _, err := connect(ctx, ep, []byte("x")); err == nil {
+	if _, err := connect(ctx, ep, []byte("x"), resume.Config{}); err == nil {
 		t.Fatal("connect to a mute server succeeded")
 	}
 }

@@ -49,6 +49,11 @@ type execution struct {
 	// was sent, or when it turned out that no command will run.
 	mainDone     chan struct{}
 	mainDoneOnce sync.Once
+	// reaped is closed once the main process was reaped, or when it
+	// turned out that no command will run; unlike mainDone it does not
+	// wait for the exit status to be sent.
+	reaped     chan struct{}
+	reapedOnce sync.Once
 
 	mu    sync.Mutex
 	pgid  int     // guarded by mu; 0 until the command started
@@ -69,11 +74,28 @@ func newExecution(s *Service, c net.Conn) *execution {
 		log:      s.log,
 		stdinQ:   newStdinQueue(),
 		mainDone: make(chan struct{}),
+		reaped:   make(chan struct{}),
 	}
 }
 
 func (e *execution) markMainDone() {
+	e.markReaped()
 	e.mainDoneOnce.Do(func() { close(e.mainDone) })
+}
+
+func (e *execution) markReaped() {
+	e.reapedOnce.Do(func() { close(e.reaped) })
+}
+
+// procDone is closed once the main process is gone, or will never run.
+func (e *execution) procDone() <-chan struct{} {
+	return e.reaped
+}
+
+// statusSent is closed once the main process exited and its exit status
+// was sent, or it will never run.
+func (e *execution) statusSent() <-chan struct{} {
+	return e.mainDone
 }
 
 func (e *execution) run() error {
@@ -175,7 +197,7 @@ func (e *execution) setupStdio(tty *proto.TTYSize, attr *os.ProcAttr) (child []*
 		// ssh -t, so that the command gets terminal signals and job control.
 		attr.Sys = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 		e.stdin, e.pty = master, true
-		return []*os.File{slave}, []*pump{newPump(master, proto.ExecStdout, true)}, nil
+		return []*os.File{slave}, []*pump{newPump(master, proto.ExecStdout, true, e.svc.scratchDir)}, nil
 	}
 	p, err := openPipes()
 	if err != nil {
@@ -184,7 +206,8 @@ func (e *execution) setupStdio(tty *proto.TTYSize, attr *os.ProcAttr) (child []*
 	attr.Files = []*os.File{p.inR, p.outW, p.errW}
 	attr.Sys = &syscall.SysProcAttr{Setpgid: true}
 	e.stdin = p.inW
-	return attr.Files, []*pump{newPump(p.outR, proto.ExecStdout, false), newPump(p.errR, proto.ExecStderr, false)}, nil
+	dir := e.svc.scratchDir
+	return attr.Files, []*pump{newPump(p.outR, proto.ExecStdout, false, dir), newPump(p.errR, proto.ExecStderr, false, dir)}, nil
 }
 
 // stdioPipes are the pipes of a command without a pty.
@@ -262,7 +285,9 @@ func (e *execution) waitExit() (*os.ProcessState, error) {
 	e.mu.Lock()
 	e.exited = true
 	e.mu.Unlock()
-	return e.proc.Wait()
+	ps, err := e.proc.Wait()
+	e.markReaped()
+	return ps, err
 }
 
 // reportExit sends ExecExit once everything the main process wrote before

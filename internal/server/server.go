@@ -21,11 +21,16 @@ import (
 	"github.com/ujzk/tele-agent/internal/hostinfo"
 	"github.com/ujzk/tele-agent/internal/mux"
 	"github.com/ujzk/tele-agent/internal/proto"
+	"github.com/ujzk/tele-agent/internal/resume"
 )
 
 // HandshakeTimeout bounds the time between accepting a connection and
 // receiving a valid Hello.
 const HandshakeTimeout = 30 * time.Second
+
+// ExpireGrace is how long the commands of a session whose lease expired
+// get between SIGTERM and SIGKILL (docs/transport.md "断线语义").
+const ExpireGrace = 10 * time.Second
 
 // Config configures a Server.
 type Config struct {
@@ -41,7 +46,10 @@ type Config struct {
 	// ScratchBase, if set, replaces ~/.cache/tele/s as the directory of
 	// the sessions' scratch directories (tests).
 	ScratchBase string
-	Logger      *slog.Logger
+	// Session configures the resumable session layer; the zero value
+	// takes its defaults.
+	Session resume.Config
+	Logger  *slog.Logger
 }
 
 // Server serves sessions.
@@ -62,19 +70,26 @@ func New(cfg Config) *Server {
 	return &Server{cfg: cfg, log: log}
 }
 
-// Serve accepts connections on ln until ctx ends, then closes every
-// session and waits for them.
+// Serve accepts sessions on the transports of ln until ctx ends, then
+// closes every session and waits for them. A session survives the loss of
+// its transport until its lease expires (internal/resume).
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	cfg := s.cfg.Session
+	if cfg.Logger == nil {
+		cfg.Logger = s.log.With("layer", "resume")
+	}
+	l := resume.Listen(ln, cfg) //nolint:contextcheck // sessions outlive a transport; Close below ends the listener
+	stop := context.AfterFunc(ctx, func() { _ = l.Close() })
 	defer stop()
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	for {
-		conn, err := ln.Accept()
+		conn, err := l.Accept()
 		if err != nil {
+			_ = l.Close()
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -86,7 +101,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 // serveConn runs one session. A panic tears down the whole session, never
 // just one request (docs/coding-standards.md "错误处理").
-func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
+func (s *Server) serveConn(ctx context.Context, conn *resume.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.log.Error("session panic", "panic", r, "stack", string(debug.Stack()))
@@ -118,6 +133,9 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	defer ss.close()
+	// The streams stay intact until the hook returns, so commands get
+	// SIGTERM and a grace period before closing the session kills them.
+	conn.OnExpire(func() { ss.exec.Stop(ExpireGrace) })
 	log := s.log.With("sid", ss.sid)
 	log.Info("session started")
 

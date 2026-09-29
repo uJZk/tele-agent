@@ -21,10 +21,9 @@
 // frames and a signal or the end of the stream never waits for the
 // command to read.
 //
-// TODO(session layer): docs/exec.md "进程与信号" has the session layer
-// buffer output while the session is disconnected (bounded, spilling to
-// disk). Nothing here buffers beyond the stream window, so a command
-// blocks once its output pipe is full until the session resumes.
+// Output goes through a spool (spool.go), bounded and spilling to disk, so
+// that a command keeps running while the session has no transport
+// (docs/exec.md "进程与信号").
 package execsvc
 
 import (
@@ -170,28 +169,39 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// Terminate ends the session's commands the way an expired session lease
-// requires (docs/transport.md "断线语义"): SIGTERM to the process group of
-// every command whose main process still runs, then, once those main
-// processes exited and their exit status was sent, or grace elapsed,
+// Terminate ends the session's commands gracefully: SIGTERM to the process
+// group of every command whose main process still runs, then, once those
+// main processes exited and their exit status was sent, or grace elapsed,
 // Close, which kills the rest with SIGKILL. Commands that have not started
 // yet are not started.
 func (s *Service) Terminate(grace time.Duration) error {
+	s.stop(grace, (*execution).statusSent)
+	return s.Close()
+}
+
+// Stop is what an expired session lease requires (docs/transport.md
+// "断线语义"): like the first half of Terminate, but it waits only until the
+// main processes exited, not until their exit status was sent, since the
+// session has no transport to send it on. Closing the session then kills
+// the rest.
+func (s *Service) Stop(grace time.Duration) {
+	s.stop(grace, (*execution).procDone)
+}
+
+func (s *Service) stop(grace time.Duration, done func(*execution) <-chan struct{}) {
 	execs := s.shutdown()
 	for _, e := range execs {
 		e.terminate()
 	}
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
-wait:
 	for _, e := range execs {
 		select {
-		case <-e.mainDone:
+		case <-done(e):
 		case <-timer.C:
-			break wait
+			return
 		}
 	}
-	return s.Close()
 }
 
 // shutdown stops accepting commands and returns the executions in

@@ -8,12 +8,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/server"
 	"github.com/ujzk/tele-agent/internal/testutil/claudetest"
+	"github.com/ujzk/tele-agent/internal/testutil/faultnet"
 	"github.com/ujzk/tele-agent/internal/testutil/privtest"
 	"github.com/ujzk/tele-agent/internal/testutil/servertest"
 )
@@ -210,4 +212,51 @@ func runtimeLookups(log string) []string {
 		}
 	}
 	return out
+}
+
+// TestTeleSurvivesDisconnects cuts the transport again and again while
+// Claude works: the session resumes each time, so the command's output,
+// the file reads through telefs and Claude itself notice nothing
+// (docs/transport.md "可恢复会话层").
+func TestTeleSurvivesDisconnects(t *testing.T) {
+	tele, claude := requireViewSwitch(t)
+	rhome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rhome, "notes.txt"), []byte("still here\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := &proto.TargetInfo{Hostname: "flaky", User: "bob", Home: rhome, Shell: "/bin/sh", LoginPath: "/usr/local/bin:/usr/bin:/bin"}
+	ep := servertest.StartRoot(t, "s3cret", target, "/")
+	px := faultnet.New(t, strings.TrimPrefix(ep.String(), "unix:"))
+	api := claudetest.NewAPI(t,
+		claudetest.Use("Bash", map[string]any{"command": `for i in 1 2 3 4 5 6; do echo "line$i"; sleep 0.25; done`, "description": "Slow"}),
+		claudetest.Use("Read", map[string]any{"file_path": filepath.Join(rhome, "notes.txt")}),
+		claudetest.Say("done"),
+	)
+	stop := make(chan struct{})
+	var cuts sync.WaitGroup
+	cuts.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(150 * time.Millisecond):
+				px.Cut()
+			}
+		}
+	})
+	r := runTele(t, tele, claude, api, "unix:"+px.Addr(), "", nil, "--allowedTools", "Bash", "Read")
+	close(stop)
+	cuts.Wait()
+	if r.err != nil || r.output.Result != "done" {
+		t.Fatalf("tele: %v, result %q\nstderr:\n%s\nsession log:\n%s", r.err, r.output.Result, r.stderr, r.sessionLogs())
+	}
+	if bash, ok := api.ToolResult(0); !ok || !strings.Contains(bash.ResultText(), "line1\nline2\nline3\nline4\nline5\nline6") {
+		t.Errorf("Bash result %q, want every line once", bash.ResultText())
+	}
+	if read, ok := api.ToolResult(1); !ok || !strings.Contains(read.ResultText(), "still here") {
+		t.Errorf("Read result %q", read.ResultText())
+	}
+	if !strings.Contains(r.log, "session resumed") {
+		t.Errorf("the session never resumed; were there cuts?\n%s", r.log)
+	}
 }

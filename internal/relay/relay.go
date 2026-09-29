@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
@@ -88,6 +89,10 @@ func (r *Relay) remote(ctx context.Context, req *shimsrv.Request, argv []string,
 	m := r.cfg.Scratch
 	// Rewrite before Uploads: it claims the shared-area entries the
 	// command names, which Uploads then includes (scratch.Mapper.Uploads).
+	claudePath := pathOf(r.cfg.Baseline)
+	for i := range argv {
+		argv[i] = dispatch.KeepRemotePath(argv[i], claudePath)
+	}
 	cmd := rexec.Command{
 		Argv:   rewriteAll(m, argv),
 		Dir:    m.Rewrite(req.Dir),
@@ -185,6 +190,16 @@ func status(prog string, res rexec.Result) proto.ShimStatus {
 		return proto.ShimStatus{Signal: res.Signal}
 	}
 	return proto.ShimStatus{Code: res.Code}
+}
+
+// pathOf returns PATH of env.
+func pathOf(env []string) string {
+	for i := len(env) - 1; i >= 0; i-- {
+		if v, ok := strings.CutPrefix(env[i], "PATH="); ok {
+			return v
+		}
+	}
+	return ""
 }
 
 func rewriteAll(m *scratch.Mapper, ss []string) []string {

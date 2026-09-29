@@ -24,6 +24,7 @@ import (
 	"github.com/ujzk/tele-agent/internal/fssvc"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/relay"
+	"github.com/ujzk/tele-agent/internal/resume"
 	"github.com/ujzk/tele-agent/internal/rexec"
 	"github.com/ujzk/tele-agent/internal/scratch"
 	"github.com/ujzk/tele-agent/internal/shimsrv"
@@ -116,7 +117,8 @@ func (s *session) run(sigs <-chan os.Signal) (*os.ProcessState, error) {
 		return nil, err
 	}
 	cctx, ccancel := context.WithTimeout(ctx, connectTimeout)
-	rs, err := connect(cctx, ep, token)
+	sink := newLogSink()
+	rs, err := connect(cctx, ep, token, resume.Config{Logger: slog.New(sink).With("layer", "resume")})
 	ccancel()
 	if err != nil {
 		return nil, fmt.Errorf("connect to %q: %w; run \"tele doctor %s\" to check the connection", s.cfg.Alias, err, s.cfg.Alias)
@@ -132,6 +134,7 @@ func (s *session) run(sigs <-chan os.Signal) (*os.ProcessState, error) {
 		return nil, err
 	}
 	s.log = sd.Log
+	sink.Set(sd.Log.Handler())
 	if err := s.shims(p); err != nil {
 		return nil, err
 	}

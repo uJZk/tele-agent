@@ -468,3 +468,21 @@ func FuzzFilterEnv(f *testing.F) {
 		}
 	})
 }
+
+func TestKeepRemotePath(t *testing.T) {
+	const p = "/.tele/0123456789abcdef/bin"
+	for _, tc := range []struct{ in, want string }{
+		{"cat >> f << 'E'\nexport PATH=" + p + "\nE\n", "cat >> f << 'E'\nexport PATH=\"$PATH\"\nE\n"},
+		{"export PATH=" + p, `export PATH="$PATH"`},
+		{"export PATH=" + p + ":/usr/bin\n", "export PATH=" + p + ":/usr/bin\n"},
+		{"echo export PATH=" + p + "\n", "echo export PATH=" + p + "\n"},
+		{"no path here", "no path here"},
+	} {
+		if got := KeepRemotePath(tc.in, p); got != tc.want {
+			t.Errorf("KeepRemotePath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if got := KeepRemotePath("export PATH=", ""); got != "export PATH=" {
+		t.Errorf("empty Claude PATH changed the argument: %q", got)
+	}
+}

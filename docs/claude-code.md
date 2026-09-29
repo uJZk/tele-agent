@@ -12,7 +12,8 @@ Bash 工具使用的 shell。
 - Bash 工具的调用参数是 `[shell, "-c", <命令串>]`，不是登录 shell。命令串的形式是 `source <快照> 2>/dev/null || true && <关闭 extglob> && <取消名为 unsetenv 的别名和函数> && eval '<命令>' < /dev/null && pwd -P >| <cwd 文件>`。cwd 文件位于 `CLAUDE_CODE_TMPDIR`，名为 `claude-<随机>-cwd`。
 - 命令的 stdin 是 `/dev/null`，所以 Bash 工具的命令从不读取 Claude 的 stdin。
 - Claude 读取 cwd 文件后以它作为下一条命令的工作目录；它如果在项目目录之外，Claude 把工作目录重置回项目根。
-- shell 快照也由这个 shell 生成，调用参数是 `[shell, "-c", "-l", <脚本>]`，即登录 shell。所以快照是**在远端**生成的，记录的是远端的 PATH、别名和函数。
+- shell 快照也由这个 shell 生成，调用参数是 `[shell, "-c", "-l", <脚本>]`，即登录 shell。所以快照是**在远端**生成的，记录的是远端的别名和函数。
+- 但快照中的 PATH 不是登录 shell 的：生成脚本把 **Claude 进程自己的** PATH 作为字面值写进快照，单独一行 `export PATH=<值>`。在 tele 下这是只含 shim 的 `<sess>/bin`，远端并不存在，每条 source 了快照的命令都会找不到程序。所以会话主进程把命令参数中恰好是这一整行的内容改写为 `export PATH="$PATH"`，保留远端命令本来的 PATH（目标用户登录 shell 的 PATH，见[shim](exec.md#shim)）。
 - 快照中定义了同名函数，把 `rg`、`find`、`grep` 转给 Claude 二进制内嵌的实现，二进制的路径取自 `CLAUDE_CODE_EXECPATH`，或 Claude 的默认安装路径。这些路径在远端通常不可执行，函数随即回退到 `command rg` 等远端程序。
 
 ## CLAUDE_CODE_SHELL_PREFIX

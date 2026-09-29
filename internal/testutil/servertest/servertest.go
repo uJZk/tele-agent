@@ -11,6 +11,7 @@ import (
 	"github.com/ujzk/tele-agent/internal/endpoint"
 	"github.com/ujzk/tele-agent/internal/mux"
 	"github.com/ujzk/tele-agent/internal/proto"
+	"github.com/ujzk/tele-agent/internal/resume"
 	"github.com/ujzk/tele-agent/internal/server"
 )
 
@@ -58,7 +59,7 @@ func StartConfig(t testing.TB, cfg server.Config) endpoint.Endpoint {
 // cleanups that must run while it is open after calling Hello.
 func Hello(t testing.TB, ep endpoint.Endpoint, token, sid string) (*mux.Session, proto.HelloReply) {
 	t.Helper()
-	conn, err := ep.Dial(t.Context())
+	conn, err := resume.Dial(t.Context(), ep.Dial, resume.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

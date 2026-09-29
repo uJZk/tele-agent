@@ -13,6 +13,7 @@ import (
 
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/relay"
+	"github.com/ujzk/tele-agent/internal/resume"
 	"github.com/ujzk/tele-agent/internal/rexec"
 	"github.com/ujzk/tele-agent/internal/scratch"
 	"github.com/ujzk/tele-agent/internal/shimsrv"
@@ -93,7 +94,7 @@ func TestExecChainWithClaude(t *testing.T) {
 	target := testTarget(t)
 	target.LoginPath = "/usr/local/bin:/usr/bin:/bin"
 	ep, _ := servertest.Start(t, "s3cret", target)
-	rs, err := connect(t.Context(), ep, []byte("s3cret"))
+	rs, err := connect(t.Context(), ep, []byte("s3cret"), resume.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -109,6 +109,11 @@ func TestClaudeCodeShell(t *testing.T) {
 	if len(snap) != 4 || snap[1] != "-c" || snap[2] != "-l" {
 		t.Errorf("snapshot invocation %q, want [shell -c -l <script>]", snap[:min(len(snap), 3)])
 	}
+	// The snapshot records Claude's own PATH as a line of its own, which
+	// tele turns into one that keeps the target's PATH.
+	if line := "\nexport PATH=/usr/local/bin:/usr/bin:/bin\n"; !strings.Contains(snap[len(snap)-1], line) {
+		t.Errorf("snapshot script lacks the line %q", strings.TrimSpace(line))
+	}
 }
 
 // TestClaudeCodeShellName pins docs/claude-code.md "CLAUDE_CODE_SHELL": a

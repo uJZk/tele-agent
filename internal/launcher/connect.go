@@ -12,6 +12,7 @@ import (
 	"github.com/ujzk/tele-agent/internal/endpoint"
 	"github.com/ujzk/tele-agent/internal/mux"
 	"github.com/ujzk/tele-agent/internal/proto"
+	"github.com/ujzk/tele-agent/internal/resume"
 )
 
 // handshakeTimeout bounds the Hello exchange once connected.
@@ -50,12 +51,14 @@ var ErrRejected = errors.New("server refused the session")
 
 // connect establishes a session with the server at ep (docs/cli.md "启动流程"
 // steps 1 and 2).
-func connect(ctx context.Context, ep endpoint.Endpoint, token []byte) (_ *remoteSession, err error) {
+func connect(ctx context.Context, ep endpoint.Endpoint, token []byte, cfg resume.Config) (_ *remoteSession, err error) {
 	sid, err := newSessionID()
 	if err != nil {
 		return nil, fmt.Errorf("session id: %w", err)
 	}
-	conn, err := ep.Dial(ctx)
+	// The session outlives its transport connections: it redials the
+	// endpoint whenever it loses one (docs/transport.md "可恢复会话层").
+	conn, err := resume.Dial(ctx, ep.Dial, cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -84,3 +84,35 @@ func FilterEnv(env, baseline []string) []string {
 	}
 	return out
 }
+
+// KeepRemotePath rewrites the PATH line of Claude's shell snapshot in s, a
+// command's argument: Claude writes its own PATH into every snapshot as
+// "export PATH=<value>" on a line of its own (docs/claude-code.md
+// "CLAUDE_CODE_SHELL"), which under tele is the shim directory, absent on
+// the target. The line becomes one that keeps the PATH the command
+// already has, the target's login PATH. claudePath is PATH as tele gave it
+// to Claude; it holds no characters Claude would quote.
+func KeepRemotePath(s, claudePath string) string {
+	if claudePath == "" {
+		return s
+	}
+	line := "export PATH=" + claudePath
+	var b strings.Builder
+	for {
+		i := strings.Index(s, line)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		end := i + len(line)
+		// Only a whole line: the value must not continue.
+		whole := (i == 0 || s[i-1] == '\n') && (end == len(s) || s[end] == '\n')
+		b.WriteString(s[:i])
+		if whole {
+			b.WriteString(`export PATH="$PATH"`)
+		} else {
+			b.WriteString(line)
+		}
+		s = s[end:]
+	}
+}

@@ -15,7 +15,10 @@ import (
 // chunkSize bounds the data of one output frame.
 const chunkSize = 32 << 10
 
-// pump forwards one output pipe (or the pty master) to the client.
+// pump forwards one output pipe (or the pty master) to the client. The
+// pipe is read into a spool as fast as the command writes, and a second
+// goroutine sends the spool, so that the command does not stall while the
+// session has no transport (docs/exec.md "进程与信号").
 //
 // It counts the bytes it read and sent so that flush can wait until
 // everything the main process wrote before exiting has been sent: the
@@ -25,6 +28,7 @@ type pump struct {
 	op  proto.ExecOp
 	f   *os.File
 	pty bool // EIO means EOF: Linux reports a pty whose slave side is closed so
+	sp  *spool
 
 	mu   sync.Mutex
 	cond *sync.Cond // signalled when sent or done changes
@@ -33,8 +37,10 @@ type pump struct {
 	done bool       // guarded by mu; run returned
 }
 
-func newPump(f *os.File, op proto.ExecOp, pty bool) *pump {
-	p := &pump{op: op, f: f, pty: pty}
+// newPump returns the pump of f; spoolDir holds the spool's file, if it
+// needs one.
+func newPump(f *os.File, op proto.ExecOp, pty bool, spoolDir string) *pump {
+	p := &pump{op: op, f: f, pty: pty, sp: newSpool(spoolDir)}
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
@@ -42,6 +48,34 @@ func newPump(f *os.File, op proto.ExecOp, pty bool) *pump {
 // run forwards output until EOF, a read error, a failed send, or close.
 func (p *pump) run(conn *proto.Conn) {
 	defer p.finish()
+	var fill sync.WaitGroup
+	fill.Go(p.fill)
+	buf := make([]byte, chunkSize)
+	for {
+		n, err := p.sp.Read(buf)
+		if n > 0 {
+			if conn.Send(&proto.ExecFrame{Op: p.op, Data: buf[:n]}) != nil {
+				break
+			}
+			p.mu.Lock()
+			p.sent += uint64(n)
+			p.cond.Broadcast()
+			p.mu.Unlock()
+		}
+		if err != nil {
+			break
+		}
+	}
+	// Nothing reaches the client any more: stop reading the pipe, which
+	// the command then finds closed.
+	_ = p.f.Close()
+	p.sp.abort()
+	fill.Wait()
+}
+
+// fill reads the pipe into the spool until EOF or a read error.
+func (p *pump) fill() {
+	defer p.sp.CloseWrite()
 	rc, err := p.f.SyscallConn()
 	if err != nil {
 		return
@@ -50,13 +84,9 @@ func (p *pump) run(conn *proto.Conn) {
 	for {
 		n, err := p.readChunk(rc, buf)
 		if n > 0 {
-			if conn.Send(&proto.ExecFrame{Op: p.op, Data: buf[:n]}) != nil {
+			if _, werr := p.sp.Write(buf[:n]); werr != nil {
 				return
 			}
-			p.mu.Lock()
-			p.sent += uint64(n)
-			p.cond.Broadcast()
-			p.mu.Unlock()
 		}
 		if err != nil {
 			return
@@ -129,7 +159,8 @@ func (p *pump) flush() {
 	}
 }
 
-// close stops run, which then closes the file.
+// close stops run.
 func (p *pump) close() {
 	_ = p.f.Close()
+	p.sp.abort()
 }
