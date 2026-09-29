@@ -58,15 +58,15 @@ func Run(ctx context.Context, argv []string, dir string, env []string, stdin, st
 	path, err := lookPath(argv[0], pathOf(env))
 	switch {
 	case errors.Is(err, unix.ENOENT):
-		return notStarted(err, "%s: command not found", argv[0])
+		return NotStarted(err, "%s: command not found", argv[0])
 	case err != nil:
-		return notStarted(err, "%s: %v", argv[0], err)
+		return NotStarted(err, "%s: %v", argv[0], err)
 	}
 	if dir != "" {
 		// os.StartProcess reports a failed chdir as a failed exec of the
 		// program; name the directory instead.
 		if _, err := os.Stat(dir); err != nil {
-			return notStarted(err, "%s: chdir %s: %v", argv[0], dir, errors.Unwrap(err))
+			return NotStarted(err, "%s: chdir %s: %v", argv[0], dir, errors.Unwrap(err))
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -87,7 +87,7 @@ func Run(ctx context.Context, argv []string, dir string, env []string, stdin, st
 	})
 	closeNull()
 	if err != nil {
-		return notStarted(err, "%s: %v", argv[0], err)
+		return NotStarted(err, "%s: %v", argv[0], err)
 	}
 	return wait(ctx, proc, sigs)
 }
@@ -219,9 +219,9 @@ func lookPath(file, pathList string) (string, error) {
 	return "", unix.ENOENT
 }
 
-// notStarted reports a program that could not be started, with the exit
-// code a shell would use for err.
-func notStarted(err error, format string, args ...any) proto.ShimStatus {
+// NotStarted reports a program that could not be run, with the exit code a
+// shell uses: 127 when err means it does not exist, 126 otherwise.
+func NotStarted(err error, format string, args ...any) proto.ShimStatus {
 	code := codeCannotExecute
 	if errors.Is(err, unix.ENOENT) {
 		code = codeNotFound

@@ -69,9 +69,7 @@ func bashTool(t *testing.T, command string, env ...string) (shell, tmpdir string
 		Args:   []string{"--allowedTools", "Bash"},
 		Env:    append([]string{"CLAUDE_CODE_SHELL=" + shell, "CLAUDE_CODE_TMPDIR=" + tmpdir}, env...),
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	res, ok := api.ToolResult(0)
 	if !ok || res.IsError {
 		t.Fatalf("Bash tool result %+v (%q)", res, res.ResultText())
@@ -129,9 +127,7 @@ func TestClaudeCodeShellName(t *testing.T) {
 		Args:   []string{"--allowedTools", "Bash"},
 		Env:    []string{"CLAUDE_CODE_SHELL=" + shell},
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	if res, ok := api.ToolResult(0); !ok || !strings.Contains(res.ResultText(), "tele-marker") {
 		t.Fatalf("Bash tool result %+v (%q), want the marker", res, res.ResultText())
 	}

@@ -51,9 +51,7 @@ func TestOwnExecs(t *testing.T) {
 			"USE_BUILTIN_RIPGREP=0",
 		},
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	seen := map[string]bool{}
 	started := map[int]bool{} // children whose first program was seen
 	for _, c := range tr.Calls(t) {

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,7 +29,7 @@ func NewTrace(t testing.TB, claude string, calls ...string) *Trace {
 	}
 	dir := t.TempDir()
 	tr := &Trace{out: filepath.Join(dir, "strace.txt")}
-	calls = append(calls, "execve", "clone", "clone3", "fork", "vfork")
+	calls = append(append(calls, "execve"), cloneCalls...)
 	tr.Claude = WriteScript(t, dir, "claude-strace",
 		`exec `+strace+` -f -s 4096 -o '`+tr.out+`' -e trace=`+strings.Join(calls, ",")+` '`+claude+`' "$@"`+"\n")
 	return tr
@@ -122,13 +123,11 @@ func parseLine(l string) (name string, pid int, rest string, resumed bool) {
 	return "", 0, "", false
 }
 
-func isClone(name string) bool {
-	switch name {
-	case "clone", "clone3", "fork", "vfork":
-		return true
-	}
-	return false
-}
+// cloneCalls create processes and threads; the trace follows them to
+// tell Claude's own children apart.
+var cloneCalls = []string{"clone", "clone3", "fork", "vfork"}
+
+func isClone(name string) bool { return slices.Contains(cloneCalls, name) }
 
 // Failed reports whether the call returned an error.
 func (c Call) Failed() bool {

@@ -2,68 +2,19 @@ package launcher
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"errors"
 	"io/fs"
 	"log/slog"
-	"math/big"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/ujzk/tele-agent/internal/cabundle"
 	"github.com/ujzk/tele-agent/internal/shimsrv"
+	"github.com/ujzk/tele-agent/internal/testutil/certtest"
 )
-
-func writeCAFile(t *testing.T, path, name string) {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: name},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// bundleNames returns the subject common names in a PEM bundle.
-func bundleNames(t *testing.T, data []byte) []string {
-	t.Helper()
-	var names []string
-	for {
-		var b *pem.Block
-		b, data = pem.Decode(data)
-		if b == nil {
-			return names
-		}
-		c, err := x509.ParseCertificate(b.Bytes)
-		if err != nil {
-			t.Fatal(err)
-		}
-		names = append(names, c.Subject.CommonName)
-	}
-}
 
 func TestCAExtras(t *testing.T) {
 	got := caExtras([]string{
@@ -82,7 +33,7 @@ func TestCAExtras(t *testing.T) {
 
 func TestPrepareSessionDir(t *testing.T) {
 	tmp := t.TempDir()
-	writeCAFile(t, filepath.Join(tmp, "corp.pem"), "tele test corp CA")
+	certtest.WriteCA(t, filepath.Join(tmp, "corp.pem"), "tele test corp CA")
 	dir := filepath.Join(tmp, "0123456789abcdef")
 	var warn bytes.Buffer
 	sd, err := prepareSessionDir(sessDirSpec{
@@ -129,7 +80,7 @@ func TestPrepareSessionDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if names := bundleNames(t, ca); !slices.Contains(names, "tele test corp CA") {
+	if names := certtest.Names(t, ca); !slices.Contains(names, "tele test corp CA") {
 		t.Errorf("CA bundle lacks NODE_EXTRA_CA_CERTS: %v", names)
 	}
 	// The unreadable SSL_CERT_FILE only warns, naming the variable, both to

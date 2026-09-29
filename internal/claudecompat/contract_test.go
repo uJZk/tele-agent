@@ -42,9 +42,7 @@ func TestAppendSystemPromptFile(t *testing.T) {
 	}
 	api := claudetest.NewAPI(t, claudetest.Say("ok"))
 	r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "hi", Args: []string{"--append-system-prompt-file", f}})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	reqs := api.AgentRequests()
 	if len(reqs) == 0 {
 		t.Fatal("no agent request")
@@ -65,9 +63,8 @@ func TestHookShellPrefix(t *testing.T) {
 	parentLog := filepath.Join(t.TempDir(), "parent")
 	// Also log the prefix's parent; its NUL-separated cmdline plus a
 	// newline is the log format of logArgv.
-	if err := os.WriteFile(prefix, []byte("#!/bin/sh\n{ cat /proc/$PPID/cmdline; printf '\\n'; } >> '"+parentLog+"'\n"+logArgv(log, `/bin/sh -c "$1"; exit`)+"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	claudetest.WriteScript(t, filepath.Dir(prefix), filepath.Base(prefix),
+		"{ cat /proc/$PPID/cmdline; printf '\\n'; } >> '"+parentLog+"'\n"+logArgv(log, `/bin/sh -c "$1"; exit`)+"\n")
 	marker := filepath.Join(t.TempDir(), "hook-ran")
 	settings := filepath.Join(t.TempDir(), "settings.json")
 	hookCmd := "touch " + marker
@@ -86,9 +83,7 @@ func TestHookShellPrefix(t *testing.T) {
 		Args:   []string{"--allowedTools", "Bash", "--settings", settings},
 		Env:    []string{"CLAUDE_CODE_SHELL_PREFIX=" + prefix},
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("hook did not run: %v", err)
 	}
@@ -122,9 +117,7 @@ func TestMCPShellPrefix(t *testing.T) {
 		Args:   []string{"--mcp-config", cfg, "--strict-mcp-config"},
 		Env:    []string{"CLAUDE_CODE_SHELL_PREFIX=" + prefix},
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	argv := commandInvocation(t, invocations(t, log), "/bin/echo")
 	t.Logf("MCP invocation: %q", argv)
 	if len(argv) != 2 {
@@ -167,9 +160,7 @@ func TestBuiltinRipgrepOff(t *testing.T) {
 		Args:   []string{"--allowedTools", "Grep"},
 		Env:    []string{"USE_BUILTIN_RIPGREP=0", "PATH=" + bin + ":/usr/bin:/bin"},
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	argvs := invocations(t, log)
 	t.Logf("rg invocations: %q", argvs)
 	if len(argvs) == 0 || filepath.Base(argvs[0][0]) != "rg" {
@@ -194,9 +185,7 @@ func TestOSVersionIsLocal(t *testing.T) {
 	claudetest.WriteScript(t, bin, "uname", logArgv(log, "/usr/bin/uname"))
 	api := claudetest.NewAPI(t, claudetest.Say("ok"))
 	r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "hi", Env: []string{"PATH=" + bin + ":/usr/bin:/bin"}})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	reqs := api.AgentRequests()
 	if len(reqs) == 0 {
 		t.Fatal("no agent request")

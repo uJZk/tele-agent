@@ -7,7 +7,6 @@ package relay
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -23,14 +22,9 @@ import (
 	"github.com/ujzk/tele-agent/internal/shimsrv"
 )
 
-// Exit codes the shim reproduces.
-const (
-	codeCannotExecute = 126
-	codeNotFound      = 127
-	// codeFailure is the shim's infrastructure failure code
-	// (docs/exec.md "shim").
-	codeFailure = 255
-)
+// codeFailure is the shim's infrastructure failure code (docs/exec.md
+// "shim").
+const codeFailure = 255
 
 // Config configures a Relay.
 type Config struct {
@@ -177,11 +171,8 @@ func forwardSignals(ctx context.Context, p *rexec.Process, sigs <-chan int) {
 // status converts a remote result into what the shim reproduces.
 func status(prog string, res rexec.Result) proto.ShimStatus {
 	if e := res.StartErr; e != nil {
-		code := codeCannotExecute
-		if errors.Is(e, unix.ENOENT) {
-			code = codeNotFound
-		}
-		return proto.ShimStatus{Code: code, Msg: fmt.Sprintf("%s: %v", prog, e)}
+		// Like a local program that cannot be run.
+		return localexec.NotStarted(e, "%s: %v", prog, e)
 	}
 	if res.Signal != 0 {
 		return proto.ShimStatus{Signal: res.Signal}

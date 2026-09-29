@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/ujzk/tele-agent/internal/testutil/certtest"
 )
 
 // Turn is one scripted assistant reply to an agent request.
@@ -78,21 +80,7 @@ type Block struct {
 }
 
 // ResultText returns the text of a tool_result block.
-func (b Block) ResultText() string {
-	var s string
-	if json.Unmarshal(b.Content, &s) == nil {
-		return s
-	}
-	var parts []Block
-	if json.Unmarshal(b.Content, &parts) != nil {
-		return ""
-	}
-	var out []string
-	for _, p := range parts {
-		out = append(out, p.Text)
-	}
-	return strings.Join(out, "\n")
-}
+func (b Block) ResultText() string { return flattenText(b.Content) }
 
 // API is the stand-in for the Anthropic API.
 type API struct {
@@ -127,7 +115,7 @@ func NewAPI(t testing.TB, script ...Turn) *API {
 func NewTLSAPI(t testing.TB, host string, script ...Turn) *API {
 	t.Helper()
 	a := &API{t: t, script: script, host: host}
-	cert, caPEM := selfSigned(t, host)
+	cert, caPEM := certtest.SelfSigned(t, siblings(host)...)
 	a.caFile = filepath.Join(t.TempDir(), "api-ca.pem")
 	if err := os.WriteFile(a.caFile, caPEM, 0o600); err != nil {
 		t.Fatal(err)
@@ -152,6 +140,12 @@ func (a *API) URL() string {
 
 // CAFile is the PEM file that makes a TLS API's certificate trusted.
 func (a *API) CAFile() string { return a.caFile }
+
+// TrustEnv returns the variables that make Claude trust a TLS API's
+// certificate, as tele points them at its CA bundle.
+func (a *API) TrustEnv() []string {
+	return []string{"SSL_CERT_FILE=" + a.caFile, "NODE_EXTRA_CA_CERTS=" + a.caFile}
+}
 
 // Addr is the address the API listens on.
 func (a *API) Addr() string { return a.srv.Listener.Addr().String() }
@@ -236,15 +230,15 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	req := Request{Agent: len(wr.Tools) > 0, System: systemText(wr.System), Raw: body}
+	req := Request{Agent: len(wr.Tools) > 0, System: flattenText(wr.System), Raw: body}
 	for _, tl := range wr.Tools {
 		req.Tools = append(req.Tools, tl.Name)
 	}
 	for _, m := range wr.Messages {
 		req.Messages = append(req.Messages, Message{Role: m.Role, Content: blocks(m.Content)})
 	}
-	turn := a.record(req)
-	msg := a.message(wr.Model, turn)
+	turn, toolID := a.record(req)
+	msg := message(wr.Model, turn, toolID)
 	if !wr.Stream {
 		writeJSON(w, msg)
 		return
@@ -252,84 +246,104 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 	stream(w, msg)
 }
 
-// record stores req and picks the reply.
-func (a *API) record(req Request) Turn {
+// record stores req and picks the reply, with the ID of its tool call.
+func (a *API) record(req Request) (Turn, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.requests = append(a.requests, req)
 	if !req.Agent {
-		return Say("ok")
+		return Say("ok"), ""
 	}
 	if a.next == len(a.script) {
 		a.t.Errorf("claudetest: agent request %d beyond the script of %d turns", a.next+1, len(a.script))
-		return Say("done")
+		return Say("done"), ""
 	}
 	turn := a.script[a.next]
 	a.next++
-	return turn
+	if turn.Tool == nil {
+		return turn, ""
+	}
+	a.toolID++
+	return turn, toolUseID(a.toolID)
 }
 
-// message builds the assistant message for turn.
-func (a *API) message(model string, turn Turn) map[string]any {
-	var content []map[string]any
-	if turn.Text != "" {
-		content = append(content, map[string]any{"type": "text", "text": turn.Text})
-	}
+// wireMessage is an assistant message of the Messages API.
+type wireMessage struct {
+	ID           string      `json:"id"`
+	Type         string      `json:"type"`
+	Role         string      `json:"role"`
+	Model        string      `json:"model"`
+	Content      []wireBlock `json:"content"`
+	StopReason   *string     `json:"stop_reason"`
+	StopSequence *string     `json:"stop_sequence"`
+	Usage        wireUsage   `json:"usage"`
+}
+
+type wireBlock struct {
+	Type  string          `json:"type"`
+	Text  *string         `json:"text,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
+
+type wireUsage struct {
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// message builds the assistant message for turn; toolID names its tool
+// call.
+func message(model string, turn Turn, toolID string) wireMessage {
+	msg := wireMessage{ID: "msg_tele", Type: "message", Role: "assistant", Model: model,
+		Content: []wireBlock{}, Usage: wireUsage{InputTokens: 1, OutputTokens: 1}}
 	stop := "end_turn"
+	if turn.Text != "" {
+		msg.Content = append(msg.Content, wireBlock{Type: "text", Text: &turn.Text})
+	}
 	if turn.Tool != nil {
-		a.mu.Lock()
-		a.toolID++
-		id := toolUseID(a.toolID)
-		a.mu.Unlock()
-		input := turn.Tool.Input
-		if input == nil {
-			input = map[string]any{}
+		input, _ := json.Marshal(turn.Tool.Input) // maps of plain values
+		if turn.Tool.Input == nil {
+			input = []byte("{}")
 		}
-		content = append(content, map[string]any{"type": "tool_use", "id": id, "name": turn.Tool.Name, "input": input})
+		msg.Content = append(msg.Content, wireBlock{Type: "tool_use", ID: toolID, Name: turn.Tool.Name, Input: input})
 		stop = "tool_use"
 	}
-	return map[string]any{
-		"id": "msg_tele", "type": "message", "role": "assistant", "model": model,
-		"content": content, "stop_reason": stop, "stop_sequence": nil,
-		"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
-	}
+	msg.StopReason = &stop
+	return msg
 }
 
 // stream writes msg as a Messages API event stream.
-func stream(w http.ResponseWriter, msg map[string]any) {
+func stream(w http.ResponseWriter, msg wireMessage) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
-	event := func(name string, data map[string]any) {
-		b, _ := json.Marshal(data) // plain maps and strings
+	event := func(name string, data any) {
+		b, _ := json.Marshal(data) // plain structs and maps
 		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
 	}
-	start := map[string]any{}
-	for k, v := range msg {
-		start[k] = v
-	}
-	start["content"] = []any{}
-	start["stop_reason"] = nil
+	start := msg
+	start.Content, start.StopReason = []wireBlock{}, nil
 	event("message_start", map[string]any{"type": "message_start", "message": start})
-	content, _ := msg["content"].([]map[string]any)
-	for i, c := range content {
-		switch c["type"] {
+	for i, c := range msg.Content {
+		// Blocks start empty and arrive as one delta.
+		switch c.Type {
 		case "text":
+			empty := ""
 			event("content_block_start", map[string]any{"type": "content_block_start", "index": i,
-				"content_block": map[string]any{"type": "text", "text": ""}})
+				"content_block": wireBlock{Type: "text", Text: &empty}})
 			event("content_block_delta", map[string]any{"type": "content_block_delta", "index": i,
-				"delta": map[string]any{"type": "text_delta", "text": c["text"]}})
+				"delta": map[string]any{"type": "text_delta", "text": *c.Text}})
 		case "tool_use":
 			event("content_block_start", map[string]any{"type": "content_block_start", "index": i,
-				"content_block": map[string]any{"type": "tool_use", "id": c["id"], "name": c["name"], "input": map[string]any{}}})
-			in, _ := json.Marshal(c["input"]) // plain maps and strings
+				"content_block": wireBlock{Type: "tool_use", ID: c.ID, Name: c.Name, Input: json.RawMessage("{}")}})
 			event("content_block_delta", map[string]any{"type": "content_block_delta", "index": i,
-				"delta": map[string]any{"type": "input_json_delta", "partial_json": string(in)}})
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": string(c.Input)}})
 		}
 		event("content_block_stop", map[string]any{"type": "content_block_stop", "index": i})
 	}
 	event("message_delta", map[string]any{"type": "message_delta",
-		"delta": map[string]any{"stop_reason": msg["stop_reason"], "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": 1}})
+		"delta": map[string]any{"stop_reason": msg.StopReason, "stop_sequence": nil},
+		"usage": wireUsage{OutputTokens: 1}})
 	event("message_stop", map[string]any{"type": "message_stop"})
 }
 
@@ -338,14 +352,15 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v) // the client going away is not the test's concern
 }
 
-// systemText flattens a system prompt given as a string or text blocks.
-func systemText(raw json.RawMessage) string {
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
+// flattenText returns content given as a string or as text blocks, such
+// as a system prompt or a tool result, as one string.
+func flattenText(raw json.RawMessage) string {
+	var str string
+	if json.Unmarshal(raw, &str) == nil {
+		return str
 	}
 	var parts []Block
-	_ = json.Unmarshal(raw, &parts) // absent or malformed: no system text
+	_ = json.Unmarshal(raw, &parts) // absent or malformed: no text
 	var out []string
 	for _, p := range parts {
 		out = append(out, p.Text)
@@ -362,4 +377,13 @@ func blocks(raw json.RawMessage) []Block {
 	var out []Block
 	_ = json.Unmarshal(raw, &out) // malformed content: no blocks
 	return out
+}
+
+// siblings returns host and a wildcard for its parent domain, so that one
+// certificate also covers other names there, such as a page for WebFetch.
+func siblings(host string) []string {
+	if _, parent, ok := strings.Cut(host, "."); ok && strings.Contains(parent, ".") {
+		return []string{host, "*." + parent}
+	}
+	return []string{host}
 }

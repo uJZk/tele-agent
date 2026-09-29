@@ -8,39 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/ujzk/tele-agent/internal/endpoint"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/rexec"
-	"github.com/ujzk/tele-agent/internal/server"
+	"github.com/ujzk/tele-agent/internal/testutil/servertest"
 )
-
-// startServer runs tele server on a unix socket, serving root as "/".
-func startServer(t *testing.T, token string, target *proto.TargetInfo) (endpoint.Endpoint, string) {
-	t.Helper()
-	root := t.TempDir()
-	sock := filepath.Join(t.TempDir(), "tele.sock")
-	ep, err := endpoint.Parse("unix:" + sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln, err := ep.Listen(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := server.New(server.Config{Token: []byte(token), FSRoot: root, Target: target})
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Go(func() { _ = srv.Serve(ctx, ln) })
-	t.Cleanup(func() {
-		cancel()
-		wg.Wait()
-	})
-	return ep, root
-}
 
 func testTarget(t *testing.T) *proto.TargetInfo {
 	return &proto.TargetInfo{
@@ -51,7 +26,7 @@ func testTarget(t *testing.T) *proto.TargetInfo {
 
 func TestConnect(t *testing.T) {
 	target := testTarget(t)
-	ep, root := startServer(t, "s3cret", target)
+	ep, root := servertest.Start(t, "s3cret", target)
 	s, err := connect(t.Context(), ep, []byte("s3cret"))
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +81,7 @@ func TestConnect(t *testing.T) {
 }
 
 func TestConnectRejected(t *testing.T) {
-	ep, _ := startServer(t, "s3cret", testTarget(t))
+	ep, _ := servertest.Start(t, "s3cret", testTarget(t))
 	_, err := connect(t.Context(), ep, []byte("wrong"))
 	if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("connect with a wrong token = %v, want the server's refusal", err)

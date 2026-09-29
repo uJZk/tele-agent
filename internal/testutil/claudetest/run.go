@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +62,14 @@ type Result struct {
 	}
 }
 
+// Must fails t unless claude exited with status 0, showing its stderr.
+func (r Result) Must(t testing.TB) {
+	t.Helper()
+	if r.Err != nil {
+		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
+	}
+}
+
 // Run runs claude -p against api with a minimal environment that holds
 // nothing from the test's own, so that the user's configuration, proxy
 // and credentials never leak into a test.
@@ -91,7 +98,7 @@ func Run(t testing.TB, claude string, api *API, o Options) Result {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, claude, args...)
 	cmd.Dir = o.Dir
-	cmd.Env = dedupEnv(env)
+	cmd.Env = env // os/exec keeps the last value of a repeated variable
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
@@ -101,24 +108,6 @@ func Run(t testing.TB, claude string, api *API, o Options) Result {
 	r := Result{Stdout: stdout.String(), Stderr: stderr.String(), Err: err}
 	_ = json.Unmarshal(stdout.Bytes(), &r.Output) // not JSON: Output stays empty
 	return r
-}
-
-// dedupEnv keeps the last entry of each variable, as later settings
-// override earlier ones.
-func dedupEnv(env []string) []string {
-	last := map[string]int{}
-	for i, kv := range env {
-		k, _, _ := strings.Cut(kv, "=")
-		last[k] = i
-	}
-	var out []string
-	for i, kv := range env {
-		k, _, _ := strings.Cut(kv, "=")
-		if last[k] == i {
-			out = append(out, kv)
-		}
-	}
-	return out
 }
 
 // WriteScript writes an executable shell script to dir/name and returns

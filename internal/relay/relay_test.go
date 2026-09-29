@@ -14,13 +14,11 @@ import (
 	"go.uber.org/goleak"
 	"golang.org/x/sys/unix"
 
-	"github.com/ujzk/tele-agent/internal/endpoint"
-	"github.com/ujzk/tele-agent/internal/mux"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/rexec"
 	"github.com/ujzk/tele-agent/internal/scratch"
-	"github.com/ujzk/tele-agent/internal/server"
 	"github.com/ujzk/tele-agent/internal/shimsrv"
+	"github.com/ujzk/tele-agent/internal/testutil/servertest"
 )
 
 func TestMain(m *testing.M) {
@@ -41,41 +39,10 @@ type env struct {
 // a session with it.
 func newEnv(t *testing.T, loginPath string) *env {
 	t.Helper()
-	home := t.TempDir()
-	sock := filepath.Join(t.TempDir(), "s")
-	ep, _ := endpoint.Parse("unix:" + sock)
-	ln, err := ep.Listen(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv := server.New(server.Config{Token: []byte("t"), FSRoot: t.TempDir(), Target: &proto.TargetInfo{
-		User: "bob", Home: home, Shell: "/bin/sh", LoginPath: loginPath,
-	}})
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Go(func() { _ = srv.Serve(ctx, ln) })
-
-	conn, err := ep.Dial(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := mux.Client(conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := m.Open(proto.StreamControl)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := proto.NewConn(st, proto.MaxControlFrame)
-	var reply proto.HelloReply
-	if err := c.Send(&proto.Hello{Version: proto.Version, Token: []byte("t"), SessionID: sid}); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Recv(&reply); err != nil || reply.Err != nil {
-		t.Fatalf("hello: %v %v", err, reply.Err)
-	}
-
+	ep, _ := servertest.Start(t, "t", &proto.TargetInfo{
+		User: "bob", Home: t.TempDir(), Shell: "/bin/sh", LoginPath: loginPath,
+	})
+	m, reply := servertest.Hello(t, ep, "t", sid)
 	e := &env{localTmp: t.TempDir()}
 	sm, err := scratch.New([]scratch.Area{{
 		ID: proto.ScratchTmp, ClaudePath: sessDir + "/tmp", LocalPath: e.localTmp, RemotePath: filepath.Join(reply.ScratchDir, "tmp"),
@@ -90,13 +57,9 @@ func newEnv(t *testing.T, loginPath string) *env {
 		Exec:       &rexec.Client{Opener: m},
 		Scratch:    sm,
 	})
-	t.Cleanup(func() {
-		e.relay.Wait()
-		_ = st.Close()
-		_ = m.Close()
-		cancel()
-		wg.Wait()
-	})
+	// Registered after Hello's cleanup, so it runs first, while the
+	// session is still open.
+	t.Cleanup(e.relay.Wait)
 	return e
 }
 
@@ -187,26 +150,32 @@ func TestSignalForwarded(t *testing.T) {
 	}
 }
 
-// waitFile waits until p exists.
-func waitFile(t *testing.T, p string) {
+// eventually waits until cond holds.
+func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(p); err == nil {
-			return
-		}
+	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s did not appear", p)
+			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// waitFile waits until p exists.
+func waitFile(t *testing.T, p string) {
+	t.Helper()
+	eventually(t, p, func() bool {
+		_, err := os.Stat(p)
+		return err == nil
+	})
 }
 
 func TestRemoteNotFound(t *testing.T) {
 	e := newEnv(t, "/nonexistent")
 	c := newCall(t, "rg", "x")
 	st := c.run(t.Context(), e.relay, nil)
-	if st.Code != codeNotFound || !strings.Contains(st.Msg, "rg") {
+	if st.Code != 127 || !strings.Contains(st.Msg, "rg") {
 		t.Fatalf("status %+v, want 127 naming rg", st)
 	}
 }
@@ -221,24 +190,14 @@ func TestShimKilled(t *testing.T) {
 	done := make(chan proto.ShimStatus, 1)
 	go func() { done <- c.run(ctx, e.relay, nil) }()
 	var pid int
-	deadline := time.Now().Add(10 * time.Second)
-	for pid == 0 {
-		if b, err := os.ReadFile(pidFile); err == nil {
-			pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("command did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	eventually(t, "the command to start", func() bool {
+		b, err := os.ReadFile(pidFile)
+		pid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+		return err == nil && pid != 0
+	})
 	cancel()
 	<-done
-	for unix.Kill(pid, 0) == nil {
-		if time.Now().After(deadline) {
-			t.Fatalf("remote process %d still running", pid)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	eventually(t, "the remote process to end", func() bool { return unix.Kill(pid, 0) != nil })
 }
 
 func TestLocalProxy(t *testing.T) {

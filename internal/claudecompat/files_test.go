@@ -32,9 +32,7 @@ func TestSessionEnvFile(t *testing.T) {
 	}})
 	api := claudetest.NewAPI(t, claudetest.Say("ok"))
 	r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "hi", Home: home, Args: []string{"--settings", settings}})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	b, err := os.ReadFile(report)
 	if err != nil {
 		t.Fatalf("SessionStart hook did not run: %v", err)
@@ -66,9 +64,7 @@ func TestBackgroundTaskOutput(t *testing.T) {
 		Args:   []string{"--allowedTools", "Bash"},
 		Env:    []string{"CLAUDE_CODE_TMPDIR=" + tmp},
 	})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	var outputs []string
 	err := filepath.WalkDir(tmp, func(p string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() && strings.HasSuffix(p, ".output") {
@@ -105,9 +101,7 @@ func TestClaudeJSONWrite(t *testing.T) {
 	}
 	api := claudetest.NewAPI(t, claudetest.Say("ok"))
 	r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "hi", Home: home})
-	if r.Err != nil {
-		t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-	}
+	r.Must(t)
 	events := readInotify(t, fd)
 	var tmpRenamed, lockDir bool
 	for _, e := range events {

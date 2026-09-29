@@ -21,13 +21,10 @@ func TestProxyAndCABundle(t *testing.T) {
 	claude := claudetest.Require(t)
 	const host = "api.tele-compat.invalid"
 	api := claudetest.NewTLSAPI(t, host, claudetest.Say("through the proxy"))
-	proxy := claudetest.NewProxy(t, api.Addr())
+	proxy := claudetest.NewProxy(t, api.Addr(), "")
 	r := claudetest.Run(t, claude, api, claudetest.Options{
 		Prompt: "hi",
-		Env: []string{
-			"HTTPS_PROXY=" + proxy.URL(), "https_proxy=" + proxy.URL(),
-			"SSL_CERT_FILE=" + api.CAFile(), "NODE_EXTRA_CA_CERTS=" + api.CAFile(),
-		},
+		Env:    append([]string{"HTTPS_PROXY=" + proxy.URL(), "https_proxy=" + proxy.URL()}, api.TrustEnv()...),
 	})
 	if r.Err != nil || r.Output.Result != "through the proxy" {
 		t.Fatalf("claude: %v, result %q\nstdout: %s\nstderr: %s", r.Err, r.Output.Result, r.Stdout, r.Stderr)
@@ -43,7 +40,7 @@ func TestProxyAndCABundle(t *testing.T) {
 func TestUntrustedCA(t *testing.T) {
 	claude := claudetest.Require(t)
 	api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", claudetest.Say("must not arrive"))
-	proxy := claudetest.NewProxy(t, api.Addr())
+	proxy := claudetest.NewProxy(t, api.Addr(), "")
 	r := claudetest.Run(t, claude, api, claudetest.Options{
 		Prompt: "hi",
 		Args:   []string{"--max-turns", "1"},
@@ -65,7 +62,7 @@ func TestWebFetchThroughProxy(t *testing.T) {
 	const page = "docs.tele-compat.invalid"
 	fetch := claudetest.Use("WebFetch", map[string]any{"url": "https://" + page + "/page", "prompt": "summarize"})
 	env := func(api *claudetest.API, proxy *claudetest.Proxy) []string {
-		return []string{"HTTPS_PROXY=" + proxy.URL(), "SSL_CERT_FILE=" + api.CAFile(), "NODE_EXTRA_CA_CERTS=" + api.CAFile()}
+		return append([]string{"HTTPS_PROXY=" + proxy.URL()}, api.TrustEnv()...)
 	}
 
 	t.Run("preflight", func(t *testing.T) {
@@ -73,11 +70,9 @@ func TestWebFetchThroughProxy(t *testing.T) {
 		// to the stand-in, whose certificate does not cover it: the check
 		// fails, but only after the proxy saw it.
 		api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", fetch, claudetest.Say("done"))
-		proxy := claudetest.NewProxy(t, api.Addr())
+		proxy := claudetest.NewProxy(t, api.Addr(), "")
 		r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "fetch", Args: []string{"--allowedTools", "WebFetch"}, Env: env(api, proxy)})
-		if r.Err != nil {
-			t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-		}
+		r.Must(t)
 		if !slices.Contains(proxy.Targets(), "api.anthropic.com:443") {
 			t.Errorf("proxy saw %q, want the domain check to api.anthropic.com:443", proxy.Targets())
 		}
@@ -85,7 +80,7 @@ func TestWebFetchThroughProxy(t *testing.T) {
 
 	t.Run("fetch", func(t *testing.T) {
 		api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", fetch, claudetest.Say("done"))
-		proxy := claudetest.NewProxy(t, api.Addr())
+		proxy := claudetest.NewProxy(t, api.Addr(), "")
 		settings := filepath.Join(t.TempDir(), "settings.json")
 		writeJSON(t, settings, map[string]any{"skipWebFetchPreflight": true})
 		r := claudetest.Run(t, claude, api, claudetest.Options{
@@ -93,9 +88,7 @@ func TestWebFetchThroughProxy(t *testing.T) {
 			Args:   []string{"--allowedTools", "WebFetch", "--settings", settings},
 			Env:    env(api, proxy),
 		})
-		if r.Err != nil {
-			t.Fatalf("claude: %v\nstderr: %s", r.Err, r.Stderr)
-		}
+		r.Must(t)
 		if !slices.Contains(proxy.Targets(), page+":443") || !slices.Contains(api.Pages(), page+"/page") {
 			t.Errorf("proxy saw %q, pages %q; want the fetch of %s through the proxy", proxy.Targets(), api.Pages(), page)
 		}
@@ -109,14 +102,13 @@ func TestNoDirectConnections(t *testing.T) {
 	claude := claudetest.Require(t)
 	tr := claudetest.NewTrace(t, claude, "connect", "sendto", "sendmmsg")
 	api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", claudetest.Say("done"))
-	proxy := claudetest.NewProxy(t, api.Addr())
+	proxy := claudetest.NewProxy(t, api.Addr(), "")
 	r := claudetest.Run(t, tr.Claude, api, claudetest.Options{
 		Prompt: "hi",
-		Env: []string{
+		Env: append([]string{
 			"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=", "DISABLE_AUTOUPDATER=",
 			"HTTPS_PROXY=" + proxy.URL(), "HTTP_PROXY=" + proxy.URL(),
-			"SSL_CERT_FILE=" + api.CAFile(), "NODE_EXTRA_CA_CERTS=" + api.CAFile(),
-		},
+		}, api.TrustEnv()...),
 	})
 	if r.Err != nil || r.Output.Result != "done" {
 		t.Fatalf("claude: %v, result %q\nstderr: %s", r.Err, r.Output.Result, r.Stderr)

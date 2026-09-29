@@ -1,88 +1,65 @@
 package claudetest
 
 import (
-	"io"
+	"context"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/ujzk/tele-agent/internal/connectproxy"
 )
 
-// Proxy is an HTTP CONNECT proxy that tunnels every request to one
-// address, whatever host the client names, and records the hosts.
+// Proxy is tele's CONNECT proxy with every connection sent to one
+// address, whatever host the client names, recording the hosts.
 type Proxy struct {
-	srv *httptest.Server
-	to  string
+	addr string // where the proxy listens
 
 	mu      sync.Mutex // guards targets
 	targets []string
-
-	wg sync.WaitGroup // tunnels
 }
 
-// NewProxy starts a proxy that tunnels to addr.
-func NewProxy(t testing.TB, addr string) *Proxy {
+// NewProxy starts a proxy that sends every connection to addr. A
+// non-empty token is required as the password of Proxy-Authorization.
+func NewProxy(t testing.TB, addr, token string) *Proxy {
 	t.Helper()
-	p := &Proxy{to: addr}
-	p.srv = httptest.NewServer(http.HandlerFunc(p.serve))
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Proxy{addr: ln.Addr().String()}
+	srv := &connectproxy.Server{
+		Token: token,
+		Dial: func(ctx context.Context, network, target string) (net.Conn, error) {
+			p.mu.Lock()
+			p.targets = append(p.targets, target)
+			p.mu.Unlock()
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ctx, ln)
+	}()
 	t.Cleanup(func() {
-		p.srv.Close()
-		p.wg.Wait()
+		cancel()
+		<-done
 	})
 	return p
 }
 
-// URL is the proxy URL to pass as HTTPS_PROXY.
-func (p *Proxy) URL() string { return p.srv.URL }
+// URL is the proxy URL to pass as HTTPS_PROXY, without credentials.
+func (p *Proxy) URL() string { return "http://" + p.addr }
 
-// Targets returns the host:port of every CONNECT request so far.
+// Addr is the address the proxy listens on.
+func (p *Proxy) Addr() string { return p.addr }
+
+// Targets returns the host:port of every connection the proxy made.
 func (p *Proxy) Targets() []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]string(nil), p.targets...)
-}
-
-func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
-	p.mu.Lock()
-	p.targets = append(p.targets, r.Host)
-	p.mu.Unlock()
-	if r.Method != http.MethodConnect {
-		http.Error(w, "only CONNECT", http.StatusMethodNotAllowed)
-		return
-	}
-	d := net.Dialer{Timeout: 10 * time.Second}
-	up, err := d.DialContext(r.Context(), "tcp", p.to)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		_ = up.Close()
-		http.Error(w, "no hijacking", http.StatusInternalServerError)
-		return
-	}
-	down, rw, err := hj.Hijack()
-	if err != nil {
-		_ = up.Close()
-		return
-	}
-	if _, err := io.WriteString(down, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
-		_ = up.Close()
-		_ = down.Close()
-		return
-	}
-	p.wg.Add(2)
-	go func() {
-		defer p.wg.Done()
-		_, _ = io.Copy(up, rw) // ends when either side closes
-		_ = up.Close()
-	}()
-	go func() {
-		defer p.wg.Done()
-		_, _ = io.Copy(down, up)
-		_ = down.Close()
-	}()
 }
