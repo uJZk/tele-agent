@@ -60,7 +60,7 @@ func backlog(t *testing.T, e *env) (*Process, int) {
 		fed <- err
 	}()
 	deadline := time.Now().Add(testTimeout)
-	for p.credit.available() != 0 {
+	for p.credit.available() >= chunkSize {
 		if time.Now().After(deadline) {
 			t.Fatalf("stdin window not used up: %d bytes left", p.credit.available())
 		}

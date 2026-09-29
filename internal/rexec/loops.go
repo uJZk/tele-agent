@@ -134,13 +134,16 @@ func (p *Process) stdinLoop() {
 	}
 }
 
-// waitCredit waits until the stdin window has room and returns it. It
-// returns false when stdin forwarding ends first: the command exited, was
-// abandoned, or the stream ended. While the window is full, local input
-// stays unread.
+// waitCredit waits until the stdin window has room for a full chunk and
+// returns the room. Waiting for a full chunk rather than any room avoids
+// trickling tiny frames while the window refills; the server acknowledges
+// everything once it has handed its queue to the command, so the room
+// comes. It returns false when stdin forwarding ends first: the command
+// exited, was abandoned, or the stream ended. While the window is full,
+// local input stays unread.
 func (p *Process) waitCredit() (int, bool) {
 	for {
-		if n := p.credit.available(); n > 0 {
+		if n := p.credit.available(); n >= chunkSize {
 			return n, true
 		}
 		select {

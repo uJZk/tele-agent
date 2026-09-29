@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"path"
 	"time"
 
 	"github.com/ujzk/tele-agent/internal/endpoint"
@@ -74,15 +73,13 @@ func connect(ctx context.Context, ep endpoint.Endpoint, token []byte) (_ *remote
 	if err != nil {
 		return nil, fmt.Errorf("open control stream: %w", err)
 	}
-	deadline := time.Now().Add(handshakeTimeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	stop := context.AfterFunc(ctx, func() { _ = st.SetDeadline(time.Now()) })
-	defer stop()
-	if err := st.SetDeadline(deadline); err != nil {
+	if err := st.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
 		return nil, err
 	}
+	// Ending ctx, at its deadline too, ends the exchange at once. Set
+	// after the timeout, so that a ctx already done is not overridden.
+	stop := context.AfterFunc(ctx, func() { _ = st.SetDeadline(time.Now()) })
+	defer stop()
 	c := proto.NewConn(st, proto.MaxControlFrame)
 	if err := c.Send(&proto.Hello{Version: proto.Version, Token: token, SessionID: sid}); err != nil {
 		return nil, fmt.Errorf("send hello: %w", err)
@@ -111,7 +108,7 @@ func connect(ctx context.Context, ep endpoint.Endpoint, token []byte) (_ *remote
 // not trusted (docs/security.md "远端返回的数据").
 func checkTarget(r *proto.HelloReply) error {
 	for name, p := range map[string]string{"home directory": r.Target.Home, "scratch directory": r.ScratchDir} {
-		if err := proto.CheckPath(p); err != nil || path.Clean(p) != p || p == "/" {
+		if err := proto.CheckPath(p); err != nil || p == "/" {
 			return fmt.Errorf("server reported an invalid %s %q", name, p)
 		}
 	}

@@ -24,7 +24,7 @@ func newStdinCredit() *stdinCredit {
 func (c *stdinCredit) add(n int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if n < 0 || c.n+n > proto.ExecStdinWindow {
+	if c.n+n > proto.ExecStdinWindow {
 		return fmt.Errorf("rexec: server acknowledged %d bytes of stdin beyond what was sent", n)
 	}
 	c.n += n

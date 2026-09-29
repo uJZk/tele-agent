@@ -81,21 +81,30 @@ type Command struct {
 	Scratch []proto.ScratchFile
 }
 
-// scratchFieldMax bounds what the Scratch field adds to an ExecStart
-// besides the files themselves: its key and the array header.
-const scratchFieldMax = 16
+// Bounds of the CBOR encoding of an ExecStart besides its strings: a
+// string or array header takes at most 9 bytes, and the map header, keys
+// and TTY field fit in startOverhead.
+const (
+	headerMax     = 9
+	startOverhead = 64
+)
 
 // ScratchBudget returns how many bytes of encoded scratch files fit into
 // the ExecStart of cmd next to its argv, directory and environment
 // (scratch.Mapper.Uploads takes it as its budget). proto.MaxExecStart
 // leaves room for proto.ScratchTotalMax next to any command line a shim
-// can send, so only a larger one reduces it.
+// can send, so only a larger one reduces it. The size of the rest is
+// bounded from the string lengths rather than measured, which would
+// encode a command line of up to proto.MaxShimRequest twice.
 func ScratchBudget(cmd Command) int {
-	b, err := proto.Marshal(&proto.ExecStart{Argv: cmd.Argv, Dir: cmd.Dir, Env: cmd.Env, TTY: cmd.TTY})
-	if err != nil {
-		return 0
+	n := startOverhead + 3*headerMax + len(cmd.Dir)
+	for _, s := range cmd.Argv {
+		n += headerMax + len(s)
 	}
-	return max(0, proto.MaxExecStart-len(b)-scratchFieldMax)
+	for _, s := range cmd.Env {
+		n += headerMax + len(s)
+	}
+	return max(0, proto.MaxExecStart-n)
 }
 
 // Result is how a remote command ended.

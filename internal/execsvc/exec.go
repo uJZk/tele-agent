@@ -20,6 +20,10 @@ import (
 // maxSignal is the highest Linux signal number (SIGRTMAX).
 const maxSignal = 64
 
+// ackBatch is the most stdin written to the command before it is
+// acknowledged while more is queued.
+const ackBatch = proto.ExecStdinWindow / 4
+
 // execution is one exec stream and the command it runs.
 type execution struct {
 	svc  *Service
@@ -74,10 +78,9 @@ func (e *execution) markMainDone() {
 
 func (e *execution) run() error {
 	defer e.markMainDone()
-	// ExecStart has a larger limit than the frames after it; conn does
-	// not buffer, so reading it directly is safe.
+	// ExecStart has a larger limit than the frames after it.
 	var start proto.ExecStart
-	if err := proto.ReadFrame(e.raw, &start, proto.MaxExecStart); err != nil {
+	if err := e.conn.RecvLimit(&start, proto.MaxExecStart); err != nil {
 		_ = e.raw.Close()
 		return fmt.Errorf("execsvc: read exec start: %w", err)
 	}
@@ -349,6 +352,7 @@ func (e *execution) handle(f *proto.ExecFrame) error {
 // client ends its input, the command stops reading (EPIPE), or the main
 // process exits.
 func (e *execution) stdinLoop() {
+	unacked := 0
 	for {
 		data, eof, ok := e.stdinQ.next()
 		if !ok {
@@ -368,10 +372,17 @@ func (e *execution) stdinLoop() {
 			}
 			return
 		}
-		if err := e.conn.Send(&proto.ExecFrame{Op: proto.ExecStdinAck, Ack: uint32(len(data))}); err != nil {
+		// Acknowledgements are batched: one per burst of input, or per
+		// quarter window of a long one, rather than one per chunk.
+		unacked += len(data)
+		if unacked < ackBatch && !e.stdinQ.empty() {
+			continue
+		}
+		if err := e.conn.Send(&proto.ExecFrame{Op: proto.ExecStdinAck, Ack: uint32(unacked)}); err != nil {
 			e.abort()
 			return
 		}
+		unacked = 0
 	}
 }
 

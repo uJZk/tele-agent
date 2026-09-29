@@ -69,6 +69,13 @@ func (q *stdinQueue) close() {
 	q.cond.Broadcast()
 }
 
+// empty reports whether no chunk is queued.
+func (q *stdinQueue) empty() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.chunks) == 0
+}
+
 // next waits for the next chunk. ok is false once the queue was closed,
 // or drained after end; eof tells the two apart.
 func (q *stdinQueue) next() (data []byte, eof, ok bool) {

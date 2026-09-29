@@ -7,10 +7,6 @@ package proto
 // in that order. Everything after that byte is frames: one ShimRequest from
 // the shim, then ShimFrames in both directions.
 
-import (
-	"bytes"
-)
-
 // MaxShimRequest bounds the ShimRequest frame. The request carries the
 // shim's argv and environment, which execve(2) accepts up to a quarter of
 // RLIMIT_STACK, capped at 6 MiB including one pointer per string. CBOR
@@ -23,11 +19,7 @@ const MaxShimRequest = 8 << 20
 // MaxShimRequest, which session main would refuse, fails with a
 // *FrameTooLargeError.
 func EncodeShimRequest(req *ShimRequest) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := WriteFrameLimit(&buf, req, MaxShimRequest); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return encodeFrame(req, MaxShimRequest)
 }
 
 // ShimRequest describes one invocation of a shim. Classification (which

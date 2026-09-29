@@ -11,6 +11,7 @@
 package proto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -108,18 +109,30 @@ func WriteFrame(w io.Writer, v any) error {
 // than MaxDataFrame, such as ExecStart (MaxExecStart). Nothing is written
 // when the frame exceeds limit.
 func WriteFrameLimit(w io.Writer, v any, limit int) error {
-	payload, err := Marshal(v)
+	frame, err := encodeFrame(v, limit)
 	if err != nil {
 		return err
 	}
-	if len(payload) > limit {
-		return &FrameTooLargeError{Size: uint64(len(payload)), Limit: limit}
-	}
-	buf := make([]byte, frameHeaderLen+len(payload))
-	binary.BigEndian.PutUint32(buf, uint32(len(payload)))
-	copy(buf[frameHeaderLen:], payload)
-	_, err = w.Write(buf)
+	_, err = w.Write(frame)
 	return err
+}
+
+// encodeFrame returns v as a complete frame, encoding it straight behind
+// the header: frames may be tens of MiB (MaxExecStart), so the payload is
+// never copied.
+func encodeFrame(v any, limit int) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, frameHeaderLen))
+	if err := encMode.NewEncoder(&buf).Encode(v); err != nil {
+		return nil, fmt.Errorf("proto: encode %T: %w", v, err)
+	}
+	frame := buf.Bytes()
+	n := len(frame) - frameHeaderLen
+	if n > limit {
+		return nil, &FrameTooLargeError{Size: uint64(n), Limit: limit}
+	}
+	binary.BigEndian.PutUint32(frame, uint32(n))
+	return frame, nil
 }
 
 // ReadFrame reads one frame and decodes it into v. It returns io.EOF only
@@ -167,6 +180,12 @@ func (c *Conn) Send(v any) error {
 // Recv reads the next frame into v.
 func (c *Conn) Recv(v any) error {
 	return ReadFrame(c.rw, v, c.limit)
+}
+
+// RecvLimit reads the next frame into v with limit in place of the
+// Conn's, for a frame its stream allows to be larger (ExecStart).
+func (c *Conn) RecvLimit(v any, limit int) error {
+	return ReadFrame(c.rw, v, limit)
 }
 
 // Close closes the underlying stream.
