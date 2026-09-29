@@ -93,7 +93,7 @@
 - **分层**：
   1. **单元测试**：不需要特权和网络，`go test ./...` 必须能以普通用户身份在任何 Linux 上通过。
   2. **特权集成测试**（userns、FUSE、`pivot_root`）：先检测环境能力，不满足时 `t.Skip` 并写明原因。设置 `TELE_TEST_REQUIRE_PRIV=1`（`make test-priv`）时改为直接失败，避免 CI 中的测试被静默跳过。
-  3. **Claude 兼容性测试**：用模拟的 Anthropic API 按脚本驱动真实的 `claude -p`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用。它用来验证 [claude-code.md](claude-code.md) 中的每一条契约。
+  3. **Claude 兼容性测试**：用模拟的 Anthropic API 按脚本驱动真实的 `claude -p`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用。它用来验证 [claude-code.md](claude-code.md) 中的每一条契约。辅助代码在 `internal/testutil/claudetest`（模拟 API、CONNECT 代理、strace 包装）。这一层是可选启用的：没有设置变量时跳过，`TELE_TEST_REQUIRE_PRIV` 不影响它。
   4. **故障注入**：会话层在 `net.Conn` 这一层注入断线、延迟、半开连接和乱序重连；端到端测试用 `tc netem`、toxiproxy 和网络命名空间切换，模拟丢包、断流和 IP 变化。
 - 新功能和 bug 修复都必须带测试。修 bug 时，先写一个能复现问题的失败测试。
 - 处理外部输入的函数（协议解码、路径改写、命令行解析）要有 fuzz 测试。

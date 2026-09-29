@@ -13,7 +13,7 @@ make test-priv    # 特权集成测试（userns、FUSE）：设置 TELE_TEST_REQ
 go test ./internal/<pkg> -run TestName   # 运行单个测试
 ```
 
-`TELE_TEST_CLAUDE=<claude 路径>` 启用 Claude 兼容性测试（见 [docs/claude-code.md](docs/claude-code.md#验证方法)）。
+`TELE_TEST_CLAUDE=<claude 路径>` 启用 Claude 兼容性测试和端到端测试（见 [docs/claude-code.md](docs/claude-code.md#验证方法)），部分测试还需要 `strace`。新的 Claude Code 版本通过全部兼容性测试后，才能加入 `claudever.Verified`。
 
 ## 文档
 

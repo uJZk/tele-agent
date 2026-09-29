@@ -141,8 +141,8 @@ This session operates on the remote host "{{alias}}" via tele.
 
 ## 验证方法
 
-- **兼容性测试**：用模拟的 Anthropic API 返回事先编排好的 tool_use，驱动真实的 `claude -p`，逐条检查本文的契约。测试在 `internal/claudecompat`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用；测试注释按小节标题指向本文，契约和测试要一起修改。
-- **每个新的 Claude Code 版本**在加入已验证列表之前都要重新验证：运行兼容性测试；用 `strace -f` 对切换视图之后的文件访问和 exec 做差异比对。新出现的 dlopen、运行时文件，以及按名字或按绝对路径启动的程序，都要在预加载列表、本地集合或 shim 列表中处理。telefs 在 debug 日志中记录 Claude 进程对疑似运行时文件（`*.so*`、`/etc/ssl` 下的路径）的访问，用来排查这类回归。
+- **兼容性测试**：用模拟的 Anthropic API 返回事先编排好的 tool_use，驱动真实的 `claude -p`，逐条检查本文的契约。测试在 `internal/claudecompat`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用；测试注释按小节标题指向本文，契约和测试要一起修改。其中观察系统调用的测试（Claude 自己启动了哪些程序、网络连接指向哪里）需要 `strace`，没有时跳过。`internal/launcher` 中还有用同一个变量启用的端到端测试：不切换视图，让真实的 Claude 经 shim、relay 和 tele server 走完整条 exec 链路，以及经 tele 自己的 CONNECT 代理访问 API。
+- **每个新的 Claude Code 版本**在加入已验证列表之前都要重新验证：运行兼容性测试（最后一条检查被测版本已列入 `claudever.Verified`）；用 `strace -f` 对切换视图之后的文件访问和 exec 做差异比对（切换视图之前的 exec 和网络连接已由兼容性测试覆盖）。新出现的 dlopen、运行时文件，以及按名字或按绝对路径启动的程序，都要在预加载列表、本地集合或 shim 列表中处理。telefs 在 debug 日志中记录 Claude 进程对疑似运行时文件（`*.so*`、`/etc/ssl` 下的路径）的访问，用来排查这类回归。
 - **逆向**：Claude Code 是 bun 编译的单文件二进制，内嵌压缩过的 JS。在二进制中搜索 `CLAUDE_CODE_SHELL_PREFIX`、`USE_BUILTIN_RIPGREP` 等字符串，就能找到相关实现。
 - **文件访问**：用 `strace -f -e trace=%file,execve claude -p …` 观察 Claude 在启动、加载配置、发起一次 API 请求期间访问的路径。
 
