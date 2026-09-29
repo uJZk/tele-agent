@@ -100,7 +100,7 @@ LD_PRELOAD=<sess>/lib/teleswitch.so               # 与 TELE_SWITCH_FD、TELE_SW
 - 值总是取下一个参数，即使它以 `-` 开头；缺少值是错误；
 - `--` 之后的内容都不是选项。
 
-tele 不模拟 Claude 其它选项的参数个数，所以恰好等于这两个选项名的参数一律按选项处理，即使 Claude 会把它当作前一个选项的值：例如参数以 `-p "--append-system-prompt"` 结尾时，tele 报告这个选项缺少值，而不是把它当作提示词。只是包含选项名文字的参数（例如提到它的提示词）不受影响。
+tele 不模拟 Claude 其它选项的参数个数，所以恰好等于这两个选项名的参数一律按选项处理。对不带值的选项，这与 Claude 一致：`-p "--append-system-prompt"` 在 Claude 中同样报「缺少值」，因为 `-p` 不带值，提示词是位置参数。只有紧跟在**带值**选项后面时两者才不同：`--system-prompt "--append-system-prompt"` 在 Claude 中是 `--system-prompt` 的值，tele 却会把它当作选项。只是包含选项名文字的参数（例如提到它的提示词）不受影响。
 
 内容**只写目标主机的信息**，取值来自建立会话时从服务端获取的信息：
 

@@ -184,7 +184,7 @@ func TestSplitAppendArgs(t *testing.T) {
 			prompts: []string{"--"},
 			file:    []string{"f"},
 		},
-		{name: "missing prompt value", args: []string{"-p", "--append-system-prompt"}, wantErr: true},
+		{name: "missing prompt value, as in claude: -p takes no value", args: []string{"-p", "--append-system-prompt"}, wantErr: true},
 		{name: "missing file value", args: []string{"--append-system-prompt-file"}, wantErr: true},
 	}
 	for _, tt := range tests {
