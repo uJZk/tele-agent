@@ -82,6 +82,7 @@ teleswitch 是一个用 C 写的小共享库。Go 运行时是多线程的，而
 | 以 root 运行时，子进程在 exec 后又获得全部 capability | uid 0 在 exec 时会重新获得 capability，清空 ambient 集合对它无效 | 测试要以普通用户运行，才能验证无特权语义 |
 | bind 挂载落到了本地路径上 | 挂载目标路径上的绝对符号链接（例如远端的 `/bin` → `/usr/bin`）在 `pivot_root` 之前按本地的根解析 | 在远端根内解析挂载目标（`openat2` 的 `RESOLVE_IN_ROOT`），再挂载到解析出的 fd 上 |
 | 预加载库无法映射 | 会话目录位于 `noexec` 的文件系统上（有的系统的 `/tmp`、`/run/user/<uid>`），动态链接器无法以可执行权限映射库 | 会话目录选在允许执行的文件系统上 |
+| teleswitch 根本没有运行，Claude 却照常启动 | glibc 的动态链接器加载不了 `LD_PRELOAD` 中的库时（文件缺失、架构不符、无法映射），只打印 `cannot be preloaded … ignored`，然后照常运行程序。teleswitch 自身的失败关闭覆盖不到这种情况，Claude 会在本地视图中运行 | 不能只依赖 teleswitch 失败关闭：Claude 被 exec 时所处的视图本身必须无害，例如只包含 Claude 的二进制和动态库的只读最小视图，预加载失败时它碰不到本地的用户文件和凭证 |
 | 远端视图中的 bind 挂载被意外卸下（待验证） | FUSE 的 entry 失效通知会对 dentry 调用 `d_invalidate`，而 `d_invalidate` 会卸下挂在该 dentry 及其子孙上的所有挂载 | telefs 不对本地集合的挂载点及其祖先目录发送 entry 失效；这些节点的 LOOKUP 必须始终返回同一个 inode（见[变更监视](telefs.md#变更监视)） |
 
 **兼容性**：Ubuntu 23.10 及以后的版本默认 `kernel.apparmor_restrict_unprivileged_userns=1`，需要随包附带一个授予 `userns,` 的 AppArmor profile；`user.max_user_namespaces=0` 的系统无法使用 tele。两者都由 `tele doctor` 检查（见[预检与修复策略](cli.md#预检与修复策略)）。
