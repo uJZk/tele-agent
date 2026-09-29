@@ -10,7 +10,8 @@
 //
 // A command's local side goes like this: Hold its output files, take
 // Uploads with the budget of its ExecStart, start it with the Upload's
-// files, Commit the Upload once it started (Rollback if it did not),
+// files, Commit the Upload once the target wrote them (Rollback if it did
+// not),
 // Apply the files its exit status reports, and release the output files
 // once all output was written.
 //

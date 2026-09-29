@@ -507,6 +507,10 @@ func TestLookup(t *testing.T) {
 		if o.pid != 0 {
 			t.Errorf("%v: ExecStarted for a command that did not start", tt.argv)
 		}
+		// The uploads are written before the start is tried.
+		if !o.exit.ScratchWritten {
+			t.Errorf("%v: ScratchWritten unset after a failed start", tt.argv)
+		}
 	}
 }
 
@@ -530,6 +534,9 @@ func TestInvalidStart(t *testing.T) {
 		o := s.collect()
 		if !errors.Is(o.exit.Err, unix.EINVAL) {
 			t.Errorf("%s: exit %+v, want EINVAL", tt.name, o.exit)
+		}
+		if o.exit.ScratchWritten {
+			t.Errorf("%s: ScratchWritten for a rejected request", tt.name)
 		}
 	}
 }

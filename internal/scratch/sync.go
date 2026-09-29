@@ -102,7 +102,7 @@ func (m *Mapper) isHeld(st fileState) bool {
 }
 
 // Upload is the set of local changes sent with one command. The target has
-// them only once the command started, so the baseline changes only on
+// them only once it reported writing them, so the baseline changes only on
 // Commit. Until Commit or Rollback, later Uploads leave its files alone,
 // so that two versions of one file are never on their way to the target
 // at once; after Rollback they are offered again. Exactly one of Commit
@@ -118,8 +118,9 @@ type Upload struct {
 	once  sync.Once
 }
 
-// Commit records that the target wrote the files: the command started
-// (rexec.Process.Started is closed, or rexec.Result.StartErr is nil).
+// Commit records that the target wrote the files: its exit status says so
+// (rexec.Result.ScratchWritten), or the command started
+// (rexec.Process.Started is closed).
 func (u *Upload) Commit() { u.finish(true) }
 
 // Rollback releases the files of an Upload that did not reach the target,

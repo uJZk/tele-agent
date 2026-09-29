@@ -85,7 +85,7 @@ func (e *execution) run() error {
 		return fmt.Errorf("execsvc: read exec start: %w", err)
 	}
 	if err := checkStart(&start); err != nil {
-		e.fail(&proto.Error{Errno: uint32(unix.EINVAL), Msg: err.Error()})
+		e.fail(&proto.Error{Errno: uint32(unix.EINVAL), Msg: err.Error()}, false)
 		return fmt.Errorf("execsvc: %w", err)
 	}
 	roots := e.svc.openAreas()
@@ -95,7 +95,7 @@ func (e *execution) run() error {
 	before := scan(roots)
 	roots.close()
 	if perr := e.start(&start); perr != nil {
-		e.fail(perr)
+		e.fail(perr, true)
 		return nil
 	}
 	e.supervise(before)
@@ -103,8 +103,9 @@ func (e *execution) run() error {
 }
 
 // fail reports a command that could not be started and ends the stream.
-func (e *execution) fail(perr *proto.Error) {
-	_ = e.conn.Send(&proto.ExecFrame{Op: proto.ExecExit, Exit: &proto.ExecStatus{Err: perr}})
+// written tells whether the request's scratch files were written.
+func (e *execution) fail(perr *proto.Error, written bool) {
+	_ = e.conn.Send(&proto.ExecFrame{Op: proto.ExecExit, Exit: &proto.ExecStatus{Err: perr, ScratchWritten: written}})
 	_ = e.raw.Close()
 }
 
@@ -267,7 +268,7 @@ func (e *execution) waitExit() (*os.ProcessState, error) {
 // reportExit sends ExecExit once everything the main process wrote before
 // it exited has been sent.
 func (e *execution) reportExit(ps *os.ProcessState, before *snapshot) {
-	st := &proto.ExecStatus{}
+	st := &proto.ExecStatus{ScratchWritten: true}
 	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 		st.Signal = int(ws.Signal())
 	} else {

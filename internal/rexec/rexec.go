@@ -118,6 +118,9 @@ type Result struct {
 	// StartErr is set when the command could not be started; the other
 	// fields are then meaningless.
 	StartErr *proto.Error
+	// ScratchWritten reports that the server wrote Command.Scratch, even
+	// if the command then failed to start.
+	ScratchWritten bool
 }
 
 // Process is a started remote command.
@@ -312,7 +315,7 @@ func (p *Process) Wait(ctx context.Context) (Result, error) {
 			return Result{}, fmt.Errorf("rexec: exec barrier: %w", err)
 		}
 	}
-	return Result{Code: st.Code, Signal: st.Signal, Scratch: st.Scratch, StartErr: st.Err}, nil
+	return Result{Code: st.Code, Signal: st.Signal, Scratch: st.Scratch, StartErr: st.Err, ScratchWritten: st.ScratchWritten}, nil
 }
 
 // Started is closed when the server reports that the command started,

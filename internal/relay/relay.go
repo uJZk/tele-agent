@@ -122,7 +122,7 @@ func (r *Relay) remote(ctx context.Context, req *shimsrv.Request, argv []string,
 	res, err := p.Wait(ctx)
 	stopSigs()
 	fwd.Wait()
-	finishUpload(up, p)
+	finishUpload(up, p, res.ScratchWritten)
 	switch {
 	case ctx.Err() != nil:
 		// The shim was killed: kill the command with it.
@@ -139,10 +139,17 @@ func (r *Relay) remote(ctx context.Context, req *shimsrv.Request, argv []string,
 	return status(argv[0], res)
 }
 
-// finishUpload commits the upload if the command started, which is when
-// the server has written the files (scratch.Upload). Once Wait returned,
-// Started is final: the server reports the start before the exit.
-func finishUpload(up *scratch.Upload, p *rexec.Process) {
+// finishUpload commits the upload once the server has written the files
+// (scratch.Upload): its exit status says so, even for a command that failed
+// to start. Without an exit status (the stream was lost, or the shim was
+// killed first) a started command still proves it, because the server
+// writes the files before starting the command; once Wait returned,
+// Started is final, as the server reports the start before the exit.
+func finishUpload(up *scratch.Upload, p *rexec.Process, written bool) {
+	if written {
+		up.Commit()
+		return
+	}
 	select {
 	case <-p.Started():
 		up.Commit()

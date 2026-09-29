@@ -108,6 +108,12 @@ type ExecStatus struct {
 	// Err is set when the command could not be started (for example
 	// ENOENT for a missing program); Code and Signal are then meaningless.
 	Err *Error `cbor:"5,keyasint,omitempty"`
+	// ScratchWritten reports that the server applied ExecStart.Scratch,
+	// which it does before trying to start the command: only a request
+	// it rejected outright leaves it unset. The client commits the upload
+	// on it, so that a command that failed to start does not make the
+	// next one upload the same files again.
+	ScratchWritten bool `cbor:"6,keyasint,omitempty"`
 }
 
 // ScratchArea identifies one of the scratch prefixes (docs/exec.md

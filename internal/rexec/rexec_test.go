@@ -235,6 +235,9 @@ func TestStartErr(t *testing.T) {
 	if r.res.StartErr == nil || !errors.Is(r.res.StartErr, unix.ENOENT) {
 		t.Fatalf("StartErr = %v, want ENOENT", r.res.StartErr)
 	}
+	if !r.res.ScratchWritten {
+		t.Error("ScratchWritten unset for a command that failed to start")
+	}
 	if _, err := e.client.Start(t.Context(), Command{}); err == nil {
 		t.Fatal("Start accepted an empty command")
 	}

@@ -180,6 +180,25 @@ func TestRemoteNotFound(t *testing.T) {
 	}
 }
 
+// TestUploadCommittedOnFailedStart checks that a command that fails to
+// start still completes the upload that went with it: the server wrote the
+// files first and says so (docs/exec.md "scratch 路径改写与回传").
+func TestUploadCommittedOnFailedStart(t *testing.T) {
+	e := newEnv(t, "/nonexistent")
+	if err := os.WriteFile(filepath.Join(e.localTmp, "in"), []byte("uploaded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := newCall(t, "rg", "x")
+	if st := c.run(t.Context(), e.relay, nil); st.Code != 127 {
+		t.Fatalf("status %+v, want 127", st)
+	}
+	up := e.relay.cfg.Scratch.Uploads(proto.MaxExecStart)
+	defer up.Rollback()
+	if len(up.Files) != 0 {
+		t.Fatalf("next upload carries %d files again, want none", len(up.Files))
+	}
+}
+
 func TestShimKilled(t *testing.T) {
 	// A shim killed by Claude's timeout ends its connection; the command
 	// is killed with it.
