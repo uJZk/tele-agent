@@ -184,7 +184,8 @@ func TestSharedAreasOnlyOwnFiles(t *testing.T) {
 func TestClaimedEmptyDirectory(t *testing.T) {
 	// Claude creates CLAUDE_ENV_FILE's directory but not the file before
 	// the SessionStart hook runs (docs/claude-code.md "scratch 文件"): the
-	// empty directory must reach the target, once.
+	// empty directory reaches the target with every command, so that one
+	// a command removed comes back.
 	env := filepath.Join(t.TempDir(), "session-env")
 	m, err := New([]Area{{ID: proto.ScratchSessionEnv, ClaudePath: "/h/.claude/session-env", LocalPath: env, RemotePath: "/r/e"}})
 	if err != nil {
@@ -198,19 +199,10 @@ func TestClaimedEmptyDirectory(t *testing.T) {
 	}
 	m.Rewrite("CLAUDE_ENV_FILE=/h/.claude/session-env/sid/sessionstart-hook-0.sh")
 
-	u := m.Uploads(proto.MaxDataFrame)
-	if got := paths(u.Files); got != "sid/" {
-		t.Fatalf("Uploads = %s, want the claimed directory only", got)
-	}
-	// Not committed: offered again.
-	u.Rollback()
-	u = m.Uploads(proto.MaxDataFrame)
-	if got := paths(u.Files); got != "sid/" {
-		t.Fatalf("Uploads after Rollback = %s", got)
-	}
-	u.Commit()
-	if files := upload(m); len(files) != 0 {
-		t.Fatalf("Uploads after Commit = %s", paths(files))
+	for i := range 2 {
+		if got := paths(upload(m)); got != "sid/" {
+			t.Fatalf("Uploads %d = %s, want the claimed directory only", i, got)
+		}
 	}
 }
 

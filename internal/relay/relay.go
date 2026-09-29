@@ -122,28 +122,23 @@ func (r *Relay) remote(ctx context.Context, req *shimsrv.Request, argv []string,
 		closeAll(req)
 	})
 
-	fwdDone := make(chan struct{})
-	stopFwd := make(chan struct{})
-	go func() {
-		defer close(fwdDone)
-		forwardSignals(ctx, p, sigs, stopFwd)
-	}()
+	sigCtx, stopSigs := context.WithCancel(ctx)
+	var fwd sync.WaitGroup
+	fwd.Go(func() { forwardSignals(sigCtx, p, sigs) })
 	res, err := p.Wait(ctx)
-	close(stopFwd)
-	<-fwdDone
+	stopSigs()
+	fwd.Wait()
+	finishUpload(up, p)
 	switch {
 	case ctx.Err() != nil:
 		// The shim was killed: kill the command with it.
 		p.Abandon()
-		finishUpload(up, p, false)
 		return proto.ShimStatus{Code: codeFailure, Msg: "interrupted"}
 	case err != nil:
 		p.Abandon()
-		finishUpload(up, p, false)
 		r.log.Warn("relay: remote command", "err", err)
 		return proto.ShimStatus{Code: codeFailure, Msg: fmt.Sprintf("lost the remote command: %v", err)}
 	}
-	finishUpload(up, p, res.StartErr == nil)
 	if err := m.Apply(res.Scratch); err != nil {
 		r.log.Warn("relay: apply scratch files", "err", err)
 	}
@@ -151,28 +146,23 @@ func (r *Relay) remote(ctx context.Context, req *shimsrv.Request, argv []string,
 }
 
 // finishUpload commits the upload if the command started, which is when
-// the server has written the files (scratch.Upload).
-func finishUpload(up *scratch.Upload, p *rexec.Process, started bool) {
-	if !started {
-		select {
-		case <-p.Started():
-			started = true
-		default:
-		}
-	}
-	if started {
+// the server has written the files (scratch.Upload). Once Wait returned,
+// Started is final: the server reports the start before the exit.
+func finishUpload(up *scratch.Upload, p *rexec.Process) {
+	select {
+	case <-p.Started():
 		up.Commit()
-	} else {
+	default:
 		up.Rollback()
 	}
 }
 
 // forwardSignals delivers the shim's signals to the remote command until
-// stop is closed.
-func forwardSignals(ctx context.Context, p *rexec.Process, sigs <-chan int, stop <-chan struct{}) {
+// ctx is done.
+func forwardSignals(ctx context.Context, p *rexec.Process, sigs <-chan int) {
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
 			return
 		case sig, ok := <-sigs:
 			if !ok {

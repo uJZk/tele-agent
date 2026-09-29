@@ -115,7 +115,6 @@ type Upload struct {
 	id    uint64
 	gen   uint64            // applyGen when the scan started
 	items map[fileKey]entry // what Files carry: a state, or gone for a removal
-	dirs  []fileKey         // the claimed directories Files create
 	once  sync.Once
 }
 
@@ -133,11 +132,6 @@ func (u *Upload) finish(commit bool) {
 		m := u.m
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if commit {
-			for _, k := range u.dirs {
-				m.dirs[k] = true
-			}
-		}
 		for k, it := range u.items {
 			if m.pending[k] == u.id {
 				delete(m.pending, k)
@@ -169,11 +163,13 @@ func (u *Upload) finish(commit bool) {
 // again; files beyond the budget, proto.ScratchTotalMax or
 // maxUploadEntries wait for the next call.
 //
-// A claimed entry that is a local directory is also created on the target,
-// once, even while it is empty: a command given a path in it, such as a
-// SessionStart hook given CLAUDE_ENV_FILE, may create its first file there
-// (docs/claude-code.md "scratch 文件"). Rewrite claims entries, so it must
-// see a command before Uploads prepares that command's files.
+// Every claimed entry that is a local directory is also sent as a
+// directory to create, even while it is empty: a command given a path in
+// it, such as a SessionStart hook given CLAUDE_ENV_FILE, may create its
+// first file there (docs/claude-code.md "scratch 文件"). Sending it with
+// every command keeps no state and recreates a directory a command
+// removed; claimed entries are few. Rewrite claims entries, so it must see
+// a command before Uploads prepares that command's files.
 func (m *Mapper) Uploads(budget int) *Upload {
 	m.mu.Lock()
 	gen := m.applyGen
@@ -198,13 +194,12 @@ func (m *Mapper) Uploads(budget int) *Upload {
 		u.Files = append(u.Files, proto.ScratchFile{Area: k.area, Path: k.path, Deleted: true})
 		u.items[k] = entry{gone: true}
 	}
-	for _, k := range m.newDirs(cur) {
+	for _, k := range cur.dirs {
 		if !b.take(len(k.path), 0) {
 			deferred++
 			continue
 		}
 		u.Files = append(u.Files, proto.ScratchFile{Area: k.area, Path: k.path, Dir: true})
-		u.dirs = append(u.dirs, k)
 	}
 	for _, k := range changed {
 		data, st, err := readFile(roots[k.area], k.path)
@@ -230,21 +225,6 @@ func (m *Mapper) Uploads(budget int) *Upload {
 	}
 	m.register(u, tooLarge)
 	return u
-}
-
-// newDirs returns the claimed directories of the scan that no committed
-// Upload created on the target yet.
-func (m *Mapper) newDirs(cur *scanResult) []fileKey {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []fileKey
-	for k := range cur.dirs {
-		if !m.dirs[k] {
-			out = append(out, k)
-		}
-	}
-	slices.SortFunc(out, compareKeys)
-	return out
 }
 
 // register makes u pending and records the files that are too large.
@@ -429,11 +409,7 @@ func (m *Mapper) Apply(files []proto.ScratchFile) error {
 		}
 		k := fileKey{f.Area, f.Path}
 		if f.Dir {
-			// The target sends only files, but a directory is harmless.
-			if err := root.MkdirAll(f.Path, 0o700); err != nil {
-				errs = append(errs, fmt.Errorf("scratch: apply to %s: %w", f.Area.Dir(), err))
-			}
-			continue
+			continue // only uploads carry directories
 		}
 		if f.Deleted {
 			err = removeFile(root, f.Path)
@@ -572,8 +548,8 @@ type scanResult struct {
 	// seen holds what the scan covered completely: whole areas (path
 	// "."), claimed directories, and single files, present or not.
 	seen map[fileKey]struct{}
-	// dirs holds the claimed entries that are directories.
-	dirs map[fileKey]struct{}
+	// dirs lists the claimed entries that are directories, sorted.
+	dirs []fileKey
 	// unknown holds the directories and files that could not be read.
 	// What is at or below them is neither new nor removed: reporting it as
 	// removed would delete the target's copies.
@@ -604,7 +580,6 @@ func (m *Mapper) scan(tracked, claimed []fileKey) (*scanResult, areaRoots) {
 	res := &scanResult{
 		files:   make(map[fileKey]fileState),
 		seen:    make(map[fileKey]struct{}),
-		dirs:    make(map[fileKey]struct{}),
 		unknown: make(map[fileKey]struct{}),
 	}
 	roots := make(areaRoots, len(m.areas))
@@ -625,11 +600,7 @@ func (m *Mapper) scan(tracked, claimed []fileKey) (*scanResult, areaRoots) {
 			walkDir(root, a.ID, ".", 0, res)
 		}
 	}
-	isClaimed := make(map[fileKey]bool, len(claimed))
-	for _, k := range claimed {
-		isClaimed[k] = true
-	}
-	for _, k := range append(tracked, claimed...) {
+	for i, k := range append(tracked, claimed...) {
 		root := roots[k.area]
 		if root == nil {
 			continue // area missing (seen) or unknown
@@ -642,13 +613,14 @@ func (m *Mapper) scan(tracked, claimed []fileKey) (*scanResult, areaRoots) {
 		case err == nil && fi.Mode().IsRegular():
 			res.files[k] = stateOf(fi)
 		case err == nil && fi.IsDir():
-			if isClaimed[k] {
-				res.dirs[k] = struct{}{}
+			if i >= len(tracked) {
+				res.dirs = append(res.dirs, k)
 			}
 			walkDir(root, k.area, k.path, 1, res)
 		}
 		res.seen[k] = struct{}{}
 	}
+	slices.SortFunc(res.dirs, compareKeys)
 	return res, roots
 }
 

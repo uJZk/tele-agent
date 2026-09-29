@@ -76,9 +76,6 @@ type Mapper struct {
 	// claimed holds the entries of shared areas (their first path
 	// component) that Rewrite saw in this session's commands.
 	claimed map[fileKey]bool // guarded by mu
-	// dirs holds the claimed directories an Upload created on the target
-	// (proto.ScratchFile.Dir), so that they are sent once.
-	dirs map[fileKey]bool // guarded by mu
 }
 
 type fileKey struct {
@@ -108,7 +105,6 @@ func New(areas []Area) (*Mapper, error) {
 		pending:  make(map[fileKey]uint64),
 		held:     make(map[fileID]int),
 		claimed:  make(map[fileKey]bool),
-		dirs:     make(map[fileKey]bool),
 	}
 	claude := make(map[string]bool, len(areas))
 	for _, a := range areas {
