@@ -57,7 +57,8 @@ func claudeEnv(s claudeEnvSpec) []string {
 		}
 		env = append(env, kv)
 	}
-	bin := s.SessDir + "/bin"
+	bin := s.SessDir + "/" + binDir
+	ca := s.SessDir + "/" + caBundleFile
 	env = append(env,
 		"PATH="+bin,
 		"HOME="+s.Home,
@@ -67,13 +68,13 @@ func claudeEnv(s claudeEnvSpec) []string {
 		"SHELL="+bin+"/bash",
 		"CLAUDE_CODE_SHELL="+bin+"/bash",
 		"CLAUDE_CODE_SHELL_PREFIX="+bin+"/tele-exec",
-		"CLAUDE_CODE_TMPDIR="+s.SessDir+"/tmp",
+		"CLAUDE_CODE_TMPDIR="+s.SessDir+"/"+tmpDir,
 		"USE_BUILTIN_RIPGREP=0",
 		"HTTPS_PROXY="+s.ProxyURL, "https_proxy="+s.ProxyURL,
 		"HTTP_PROXY="+s.ProxyURL, "http_proxy="+s.ProxyURL,
 		"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1",
-		"SSL_CERT_FILE="+s.SessDir+"/ca-bundle.pem",
-		"NODE_EXTRA_CA_CERTS="+s.SessDir+"/ca-bundle.pem",
+		"SSL_CERT_FILE="+ca,
+		"NODE_EXTRA_CA_CERTS="+ca,
 		"TELE_SESSION="+s.SessDir,
 	)
 	return append(env, s.Switch...)
