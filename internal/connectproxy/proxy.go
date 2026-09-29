@@ -5,13 +5,13 @@
 // the remote host's, so it must not resolve names itself. Session main sets
 // HTTPS_PROXY and HTTP_PROXY to this proxy, which runs in session main and
 // therefore resolves and connects in the local view; the user's own proxy,
-// if any, is chained behind it (docs/filesystem.md section 2,
-// docs/claude-code.md section 6).
+// if any, is chained behind it (docs/filesystem.md "本地集合",
+// docs/claude-code.md "注入的环境").
 //
 // The proxy serves CONNECT tunnels and absolute-form http:// requests.
 // Targets on the loopback interface are always reached directly: through an
 // upstream proxy they would land on the proxy's host (docs/exec.md
-// section 7).
+// "端口转发").
 //
 // Every forwarded request carries a Via entry whose pseudonym is unique to
 // one Serve call. A request that arrives with it has looped back, typically

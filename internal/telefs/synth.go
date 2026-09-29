@@ -142,7 +142,7 @@ func (f *FS) resolve(p string) string {
 // synthAttr returns the attributes of a synthetic node. It never fails:
 // a failing GETATTR or LOOKUP of an ancestor would make the kernel
 // invalidate its dentry and detach the mounts below (docs/filesystem.md
-// section 6).
+// "已知陷阱").
 func (f *FS) synthAttr(n *node) fuse.Attr {
 	var remote *proto.Attr
 	if n.kind == kindAncestor {

@@ -112,7 +112,7 @@ func (n *pinned) utimes(ts *[2]unix.Timespec) error {
 // access checks n for access(2) mode mask as the server's user. The x/sys
 // Faccessat wrapper is not used: when faccessat2 is missing or refused it
 // emulates the check from the mode bits, ignoring ACLs, immutable files and
-// read-only mounts (docs/coding-standards.md section 4). The fallback here is
+// read-only mounts (docs/coding-standards.md "错误处理"). The fallback here is
 // the kernel's own faccessat on the magic link.
 func (n *pinned) access(mask uint32) error {
 	err := ignoringEINTR(func() error {

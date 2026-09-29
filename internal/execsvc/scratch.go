@@ -19,7 +19,7 @@ import (
 
 // The file helpers below mirror internal/scratch on purpose: the server
 // must not depend on session main's packages (docs/coding-standards.md
-// section 2).
+// "目录与包").
 
 // tempPrefix names temporary files that writeFile renames into place.
 // Scans skip them so that a concurrent command never reports a
@@ -153,7 +153,7 @@ func (s *Service) openAreas() areaRoots {
 }
 
 // logFileErr logs a failed file operation. Paths are logged only at debug
-// level (docs/coding-standards.md section 10).
+// level (docs/coding-standards.md "日志与输出").
 func (s *Service) logFileErr(op string, area proto.ScratchArea, name string, err error) {
 	attrs := []any{"op", op, "err", withoutPath(err)}
 	if area != 0 {
@@ -178,7 +178,7 @@ func withoutPath(err error) string {
 }
 
 // writeScratch applies files uploaded by the client (docs/exec.md
-// section 5) and records them for changedScratch. Paths were validated
+// "scratch 路径改写与回传") and records them for changedScratch. Paths were validated
 // with proto.CheckScratch; os.Root keeps symlinks from leading out of an
 // area.
 //

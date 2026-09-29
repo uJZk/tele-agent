@@ -80,11 +80,11 @@ func TestRootOwnedWritable(t *testing.T) {
 const userNSUID = 1000
 
 // TestUserNSOwner mounts telefs in a user namespace where uid 0 is
-// unmapped, like session main does (docs/filesystem.md section 4), and
+// unmapped, like session main does (docs/filesystem.md "命名空间的构建"), and
 // checks the owner contract: nodes presented with the caller's uid are
 // writable; nodes presented with an unmapped owner are not (the kernel's
 // HAS_UNMAPPED_ID check); and the root inode is writable only after the
-// mount point was stat'ed once (docs/filesystem.md section 6).
+// mount point was stat'ed once (docs/filesystem.md "已知陷阱").
 func TestUserNSOwner(t *testing.T) {
 	privtest.RequireRoot(t)
 	privtest.RequireFUSE(t)

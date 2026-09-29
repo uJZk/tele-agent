@@ -20,7 +20,7 @@ import (
 )
 
 // watchMask selects the inotify events that invalidate client caches
-// (docs/telefs.md section 4). Symlinks are followed on purpose: a client
+// (docs/telefs.md "变更监视"). Symlinks are followed on purpose: a client
 // directory reached through a symlinked ancestor is watched at its target.
 // IN_EXCL_UNLINK drops events of files that were unlinked but stay open,
 // which no client can see any more.
@@ -485,7 +485,7 @@ func (s *Service) publishLocked() {
 // with the pending changes as one WatchEvent, and returns the sequence
 // number of the last published event. It is the exec barrier: every change
 // made before the call is covered by events with Seq <= the result
-// (docs/exec.md section 6).
+// (docs/exec.md "exec 屏障").
 func (s *Service) Sync() uint64 {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()

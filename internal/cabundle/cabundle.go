@@ -7,7 +7,7 @@
 // missing or stale. The bundle therefore merges the local system roots with
 // the user's own extra CA files; session main writes it into the session
 // directory and points SSL_CERT_FILE and NODE_EXTRA_CA_CERTS at it
-// (docs/filesystem.md section 2).
+// (docs/filesystem.md "本地集合").
 package cabundle
 
 import (

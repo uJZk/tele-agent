@@ -37,7 +37,7 @@ func checkStart(s *proto.ExecStart) error {
 // lookPath resolves the program to run. A name with a slash is used as
 // given, relative to dir; any other name is looked up in the login PATH,
 // because tele server's own PATH is usually minimal (docs/exec.md
-// section 1). Like a shell, it prefers an executable later in PATH to a
+// "shim"). Like a shell, it prefers an executable later in PATH to a
 // non-executable file earlier, and reports EACCES only when nothing
 // executable was found but something was.
 func lookPath(name, loginPath, dir string) (string, *proto.Error) {

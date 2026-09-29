@@ -3,7 +3,7 @@
 // main: every FUSE request becomes one proto.FSRequest on its own mux
 // stream, and the changes the server pushes on the watch stream drive
 // kernel cache invalidation, which is what allows long entry and attribute
-// TTLs (docs/telefs.md section 3).
+// TTLs (docs/telefs.md "一致性").
 //
 // Kernel contracts that shape the implementation:
 //
@@ -13,12 +13,12 @@
 //     user, so the mount does not use default_permissions (FSAccess
 //     answers access(2)). After mounting, the mount point is stat'ed once
 //     so that the kernel replaces the root inode's initial owner, uid 0
-//     (docs/filesystem.md section 6).
+//     (docs/filesystem.md "已知陷阱").
 //   - Placeholders, the mount points of the local set, and their ancestors
 //     never receive entry invalidations and always look up to the same
 //     inode, even when the server is unreachable: an entry invalidation or
 //     a failed revalidation runs d_invalidate, which detaches every mount
-//     on or below the dentry (docs/filesystem.md section 6).
+//     on or below the dentry (docs/filesystem.md "已知陷阱").
 //   - FUSE passthrough is never used: BACKING_OPEN needs CAP_SYS_ADMIN in
 //     the initial user namespace.
 //
@@ -59,7 +59,7 @@ type Opener interface {
 }
 
 // Placeholder is a mount point of the local set (docs/filesystem.md
-// section 2): an empty directory or file synthesized at Path whatever the
+// "本地集合"): an empty directory or file synthesized at Path whatever the
 // server has there, so that session main can bind-mount a local path onto
 // it. Its missing ancestors are synthesized too.
 type Placeholder struct {
@@ -184,7 +184,7 @@ func mount(mountpoint string, cfg Config, refreshRoot bool) (*FS, error) {
 		<-f.serveDone
 		return nil, fmt.Errorf("telefs: mount %s: %w", mountpoint, err)
 	}
-	// docs/filesystem.md section 6: the kernel initializes the root inode
+	// docs/filesystem.md "已知陷阱": the kernel initializes the root inode
 	// with uid 0, which is unmapped in a user namespace; a GETATTR makes
 	// it take the presented owner.
 	if refreshRoot {

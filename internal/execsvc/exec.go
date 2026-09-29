@@ -268,7 +268,7 @@ func (e *execution) reportExit(ps *os.ProcessState, before *snapshot) {
 		st.Code = ps.ExitCode()
 	}
 	// The process was reaped, so every file change it made is already
-	// queued as an inotify event (docs/exec.md section 6).
+	// queued as an inotify event (docs/exec.md "exec 屏障").
 	if e.svc.syncer != nil {
 		st.WatchSeq = e.svc.syncer.Sync()
 	}

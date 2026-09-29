@@ -498,7 +498,7 @@ func TestReaddirTypeOnlyEntries(t *testing.T) {
 
 // TestCloseSyncsWrites checks that close(2) of a file written through the
 // mount confirms that the remote host has the data on disk (docs/telefs.md
-// section 3) and reports a failure to put it there, while a close without
+// "一致性") and reports a failure to put it there, while a close without
 // writes costs no round trip.
 func TestCloseSyncsWrites(t *testing.T) {
 	h := newHarness(t, harnessOpts{})

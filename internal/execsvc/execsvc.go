@@ -1,5 +1,6 @@
 // Package execsvc runs remote commands for tele server, one command per
-// exec stream (docs/exec.md sections 4 to 6).
+// exec stream (docs/exec.md "进程与信号", "scratch 路径改写与回传"
+// and "exec 屏障").
 //
 // A command runs as the server's user in its own process group, or as the
 // leader of a new session on a pseudo-terminal when the client asks for
@@ -11,7 +12,7 @@
 // The client ending the stream before the exit status was sent means the
 // shim was killed, so the whole process group is killed with it. After
 // the exit status only the pipes are closed, which leaves background
-// children running as they would locally (docs/exec.md section 2).
+// children running as they would locally (docs/exec.md "shim 与会话主进程").
 //
 // Signals travel in the exec stream behind stdin data, and the stream has
 // no flow control for stdin of its own. The server therefore queues stdin
@@ -20,10 +21,10 @@
 // or the client's end of the stream wait until the command reads its
 // input or exits.
 //
-// TODO(session layer): docs/exec.md section 4 asks for output to be
-// buffered while the session is disconnected (bounded, spilling to disk).
-// Nothing here buffers beyond the stream window, so a command blocks once
-// its output pipe is full until the session resumes.
+// TODO(session layer): docs/exec.md "进程与信号" has the session layer
+// buffer output while the session is disconnected (bounded, spilling to
+// disk). Nothing here buffers beyond the stream window, so a command
+// blocks once its output pipe is full until the session resumes.
 package execsvc
 
 import (
@@ -47,7 +48,7 @@ const DefaultPath = "/usr/local/bin:/usr/bin:/bin"
 // ErrClosed is returned by Serve after Close or Terminate.
 var ErrClosed = errors.New("execsvc: service closed")
 
-// Syncer provides the exec barrier (docs/exec.md section 6).
+// Syncer provides the exec barrier (docs/exec.md "exec 屏障").
 type Syncer interface {
 	// Sync numbers every pending file change event and returns the
 	// sequence number of the last WatchEvent.
@@ -170,7 +171,7 @@ func (s *Service) Close() error {
 }
 
 // Terminate ends the session's commands the way an expired session lease
-// requires (docs/transport.md section 3): SIGTERM to the process group of
+// requires (docs/transport.md "断线语义"): SIGTERM to the process group of
 // every command whose main process still runs, then, once those main
 // processes exited and their exit status was sent, or grace elapsed,
 // Close, which kills the rest with SIGKILL. Commands that have not started

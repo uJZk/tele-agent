@@ -1,5 +1,5 @@
 // Package cli parses the target argument of the tele command line,
-// "<alias>[:<dir>]" (docs/cli.md section 1).
+// "<alias>[:<dir>]" (docs/cli.md "命令形式").
 //
 // The alias is split off at the first ':' in scp/rsync style, so an alias can
 // never contain ':' while the directory may. The directory is a path on the

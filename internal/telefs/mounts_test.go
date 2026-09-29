@@ -61,11 +61,11 @@ func mkdirAll(t *testing.T, p string) {
 }
 
 // TestEntryInvalidationDetachesMounts records the kernel behavior that
-// makes placeholders necessary (docs/filesystem.md section 6): a FUSE entry
+// makes placeholders necessary (docs/filesystem.md "已知陷阱"): a FUSE entry
 // invalidation (FUSE_NOTIFY_INVAL_ENTRY, go-fuse NotifyEntry) runs
 // d_invalidate, which detaches every mount on the dentry or below it. If
 // this test starts failing, the kernel changed and the restriction in
-// docs/telefs.md section 4 may be lifted.
+// docs/telefs.md "变更监视" may be lifted.
 func TestEntryInvalidationDetachesMounts(t *testing.T) {
 	h := newHarness(t, harnessOpts{})
 	mkdirAll(t, h.b("a/b"))

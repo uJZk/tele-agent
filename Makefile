@@ -6,7 +6,7 @@ GOLANGCI_LINT ?= $(GO) tool -modfile=tools/go.mod golangci-lint
 BIN           := bin/tele
 TELESWITCH_SO := internal/teleswitch/lib/teleswitch-$(GOARCH).so
 # teleswitch runs inside the Claude process before main: no libc, no
-# DT_NEEDED, raw syscalls only (docs/coding-standards.md section 9).
+# DT_NEEDED, raw syscalls only (docs/coding-standards.md "C 代码（teleswitch）").
 TELESWITCH_CFLAGS := -std=c11 -O2 -fPIC -shared -nostdlib -ffreestanding \
 	-fno-stack-protector -fno-builtin -Wall -Wextra -Werror -Wl,-z,now
 

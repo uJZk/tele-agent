@@ -1,9 +1,9 @@
 // Package scratch is session main's side of the scratch areas
-// (docs/exec.md section 5).
+// (docs/exec.md "scratch 路径改写与回传").
 //
 // Claude opens a few files locally that remote commands also use: the cwd
 // file in CLAUDE_CODE_TMPDIR, shell snapshots, and CLAUDE_ENV_FILE
-// (docs/claude-code.md section 4). A Mapper rewrites their path prefixes
+// (docs/claude-code.md "scratch 文件"). A Mapper rewrites their path prefixes
 // in everything session main sends to the target, collects local changes
 // to upload before a command, and applies the files the target reports as
 // changed afterwards.
@@ -22,7 +22,7 @@
 // to other sessions, possibly to other hosts, and may hold credentials a
 // SessionStart hook wrote.
 //
-// The target is not trusted (docs/security.md section 4): Apply writes only
+// The target is not trusted (docs/security.md "远端返回的数据"): Apply writes only
 // below the local area directories, through os.Root, so neither ".."
 // components nor symbolic links can make it touch any other local file.
 package scratch
@@ -134,7 +134,7 @@ func New(areas []Area) (*Mapper, error) {
 // shared reports whether other local Claude sessions write the area's
 // directory too: shell-snapshots and session-env are in Claude's config
 // directory, while CLAUDE_CODE_TMPDIR is per session (docs/claude-code.md
-// section 6).
+// "注入的环境").
 func (a Area) shared() bool {
 	return a.ID != proto.ScratchTmp
 }

@@ -69,7 +69,7 @@ const (
 	// server stops watching it. No response is expected; the server closes
 	// the stream once the watch is gone.
 	//
-	// The server starts watching a directory (docs/telefs.md section 4)
+	// The server starts watching a directory (docs/telefs.md "变更监视")
 	// when a request names it as the directory to look up, create, remove
 	// or rename entries in: Path of FSLookup, FSCreate, FSMkdir, FSMknod,
 	// FSUnlink, FSRmdir, FSSymlink and FSRename, Path2 of FSRename and
@@ -100,7 +100,7 @@ type FSRequest struct {
 	// another object now, for example after a rename replaced it, the
 	// request fails with ESTALE instead of acting on that object; for a
 	// path-based system call the kernel then repeats the lookup and the
-	// call once (docs/telefs.md section 3).
+	// call once (docs/telefs.md "对象标识").
 	Node *NodeID `cbor:"16,keyasint,omitempty"`
 }
 
@@ -127,7 +127,8 @@ type FSResponse struct {
 	// Unwatched reports that the server could not watch the directory the
 	// request named (for example EACCES or the inotify watch limit), so no
 	// change to it will be pushed and the client must cache what this
-	// response returns only briefly (docs/telefs.md sections 3 and 4).
+	// response returns only briefly (docs/telefs.md "一致性" and
+	// "变更监视").
 	Unwatched bool `cbor:"11,keyasint,omitempty"`
 }
 

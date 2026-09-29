@@ -189,7 +189,7 @@ func (p *Process) sendLoop() {
 
 // abandonLoop carries out Abandon: it ends the stream, which also ends
 // readLoop. The server kills the process group when the stream ends
-// before the exit status (docs/exec.md section 2). The FIN is sent at
+// before the exit status (docs/exec.md "shim 与会话主进程"). The FIN is sent at
 // once, even while a stdin frame waits for the stream window.
 func (p *Process) abandonLoop() {
 	select {

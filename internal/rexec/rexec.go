@@ -2,7 +2,7 @@
 // exec stream per command (docs/exec.md).
 //
 // A command's stdio are file descriptors that session main received from a
-// shim (docs/exec.md section 2). Their open file descriptions are shared
+// shim (docs/exec.md "shim 与会话主进程"). Their open file descriptions are shared
 // with Claude and possibly other processes, so rexec never changes their
 // flags: it waits with poll(2), reads no more than is available, and uses
 // non-blocking socket calls, instead of setting O_NONBLOCK. This also lets
@@ -43,7 +43,7 @@ type Opener interface {
 }
 
 // Barrier waits until the file-change events up to a sequence number
-// have been applied locally (docs/exec.md section 6).
+// have been applied locally (docs/exec.md "exec 屏障").
 type Barrier interface {
 	WaitApplied(ctx context.Context, seq uint64) error
 }
@@ -54,7 +54,7 @@ type Client struct {
 	// Barrier is waited on before Wait reports an exit; nil means none.
 	Barrier Barrier
 	// Logger receives diagnostics; nil discards them. It must not write
-	// to any shim's stdio (docs/coding-standards.md section 10).
+	// to any shim's stdio (docs/coding-standards.md "日志与输出").
 	Logger *slog.Logger
 }
 

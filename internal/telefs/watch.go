@@ -18,7 +18,7 @@ import (
 const forgetWorkers = 4
 
 // registry records which nodes asked the server to watch which remote
-// directory paths (docs/telefs.md section 4). The server watches by path,
+// directory paths (docs/telefs.md "变更监视"). The server watches by path,
 // so a path is forgotten only when no live node needs it any more, and a
 // forget that was sent is ordered before any later request that watches
 // the same path again: otherwise the server could process the new watch
@@ -27,7 +27,7 @@ const forgetWorkers = 4
 // relies on.
 //
 // A forget is bounded by the transport like every request (docs/telefs.md
-// section 5), not by a timeout of its own: once sent, its outcome is
+// "断线与恢复"), not by a timeout of its own: once sent, its outcome is
 // unknown until the server confirms it, and a request that watches the
 // path again must not overtake it.
 type registry struct {
@@ -322,7 +322,7 @@ func (f *FS) wakeLocked() {
 
 // WaitApplied waits until the watch event with sequence number seq has been
 // applied, so that the kernel no longer serves anything it invalidated. It
-// is the local half of the exec barrier (docs/exec.md section 6). It fails
+// is the local half of the exec barrier (docs/exec.md "exec 屏障"). It fails
 // with ErrWatchStopped if the watch stream ended first.
 func (f *FS) WaitApplied(ctx context.Context, seq uint64) error {
 	for {
@@ -382,7 +382,7 @@ func (f *FS) applyChange(ch proto.Change) {
 
 // invalEntry invalidates entry name of d, unless it is a placeholder or an
 // ancestor of one: an entry invalidation detaches every mount on or below
-// the dentry (docs/filesystem.md section 6), so those only get their
+// the dentry (docs/filesystem.md "已知陷阱"), so those only get their
 // attributes invalidated.
 func (f *FS) invalEntry(d *node, name string) {
 	if c := d.synth[name]; c != nil {

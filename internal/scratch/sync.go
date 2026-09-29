@@ -67,8 +67,8 @@ func (st fileState) id() fileID { return fileID{st.dev, st.ino} }
 //
 // Session main holds the files a command writes its output to while it
 // writes them. A background task's output file, which Claude opens
-// locally and hands to the shim as stdout (docs/claude-code.md section
-// 4), may lie in CLAUDE_CODE_TMPDIR: uploading the partial file before
+// locally and hands to the shim as stdout (docs/claude-code.md
+// "scratch 文件"), may lie in CLAUDE_CODE_TMPDIR: uploading the partial file before
 // every command wastes the link, and an Apply renaming a copy over it
 // would leave the output being written in an unlinked file.
 func (m *Mapper) Hold(f *os.File) (release func(), err error) {
@@ -639,7 +639,7 @@ func walkDir(root *os.Root, area proto.ScratchArea, dir string, depth int, res *
 
 // withoutPath returns err's message without the path a *fs.PathError
 // carries; paths are logged only at debug level
-// (docs/coding-standards.md section 10).
+// (docs/coding-standards.md "日志与输出").
 func withoutPath(err error) string {
 	var pe *fs.PathError
 	if errors.As(err, &pe) {

@@ -91,7 +91,7 @@ func (h *fileHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadR
 
 // Write implements fs.FileWriter. Writes go straight to the server: there
 // is no writeback cache, so remote commands see them at once
-// (docs/telefs.md section 3).
+// (docs/telefs.md "一致性").
 func (h *fileHandle) Write(_ context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	var written uint32
 	for len(data) > 0 {
@@ -123,7 +123,7 @@ func (h *fileHandle) Fsync(_ context.Context, flags uint32) syscall.Errno {
 // Flush implements fs.FileFlusher. The kernel flushes on every close(2).
 // Writes reach the remote file at once, but close also confirms that the
 // data written through this handle is on the remote disk, and reports a
-// failure to put it there (docs/telefs.md section 3), as NFS does.
+// failure to put it there (docs/telefs.md "一致性"), as NFS does.
 func (h *fileHandle) Flush(_ context.Context) syscall.Errno {
 	if !h.dirty.Swap(false) {
 		return 0

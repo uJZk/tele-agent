@@ -16,7 +16,7 @@
 // object than the node it named.
 //
 // Errors are returned as the exact errno of the failing system call
-// (docs/coding-standards.md section 4).
+// (docs/coding-standards.md "错误处理").
 package fssvc
 
 import (
@@ -70,7 +70,7 @@ type Service struct {
 
 	// readMu serializes reading the inotify descriptor: holding it across
 	// a drain lets Sync publish every event queued before it returns
-	// (docs/exec.md section 6). Nothing that resolves a path runs under
+	// (docs/exec.md "exec 屏障"). Nothing that resolves a path runs under
 	// it: see watch.
 	readMu sync.Mutex
 	evBuf  []byte // guarded by readMu
@@ -252,7 +252,7 @@ func errnoOf(err error) uint32 {
 }
 
 // logDebug logs at debug level; paths are logged only at this level
-// (docs/coding-standards.md section 10).
+// (docs/coding-standards.md "日志与输出").
 func (s *Service) logDebug(msg string, args ...any) {
 	s.log.Debug(msg, args...)
 }

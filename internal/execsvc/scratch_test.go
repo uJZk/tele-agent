@@ -185,7 +185,7 @@ func TestUploadFailureDoesNotFailCommand(t *testing.T) {
 
 // unprivileged runs fn on a thread whose filesystem uid is nobody's when
 // the test runs as root, so that permission bits apply to it. The thread
-// ends with fn (docs/coding-standards.md section 6).
+// ends with fn (docs/coding-standards.md "系统调用、命名空间与进程").
 func unprivileged(t *testing.T, fn func()) {
 	t.Helper()
 	done := make(chan error, 1)

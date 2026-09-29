@@ -180,7 +180,7 @@ func (n *node) opPath() (string, syscall.Errno) {
 
 // isProtected reports whether entry name of n is a placeholder or an
 // ancestor of one. Such entries never get entry invalidations and cannot
-// be removed or replaced (docs/filesystem.md section 6).
+// be removed or replaced (docs/filesystem.md "已知陷阱").
 func (n *node) isProtected(name string) bool {
 	return n.synth[name] != nil
 }
@@ -646,7 +646,7 @@ func (n *node) Removexattr(_ context.Context, attr string) syscall.Errno {
 }
 
 // OnForget implements fs.NodeOnForgetter: once the kernel dropped a
-// directory, the server stops watching it (docs/telefs.md section 4).
+// directory, the server stops watching it (docs/telefs.md "变更监视").
 func (n *node) OnForget() {
 	if n.kind == kindRemote {
 		n.fsys.releaseWatches(n)

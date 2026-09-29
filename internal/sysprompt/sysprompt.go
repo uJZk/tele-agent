@@ -1,5 +1,5 @@
 // Package sysprompt builds the text tele appends to Claude's system prompt
-// (docs/claude-code.md section 7) and merges it with the user's own
+// (docs/claude-code.md "附加系统提示词") and merges it with the user's own
 // --append-system-prompt and --append-system-prompt-file arguments, because
 // tele passes a single --append-system-prompt-file and must not drop what
 // the user asked for.
@@ -24,7 +24,7 @@ import (
 const maxValueLen = 4096
 
 // Render returns the appended system prompt for the target host. Its shape
-// is the template in docs/claude-code.md section 7; compatibility tests
+// is the template in docs/claude-code.md "附加系统提示词"; compatibility tests
 // check that Claude answers questions about the host from it.
 func Render(alias string, t proto.TargetInfo, workdir string) string {
 	var b strings.Builder
@@ -90,7 +90,7 @@ const (
 // original order, the prompt texts, and the file paths as given.
 //
 // Matching follows commander.js, which parses Claude's command line
-// (docs/claude-code.md section 7): a flag with a required value takes the
+// (docs/claude-code.md "附加系统提示词"): a flag with a required value takes the
 // next argument even if it starts with '-', a missing value is an error, and
 // nothing after "--" is an option.
 //
