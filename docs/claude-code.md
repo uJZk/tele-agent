@@ -49,6 +49,7 @@ Claude 自己也调用 `rg`：启动时先执行 `rg --version`，并用 `rg --f
 - 代理 URL 中的用户名和密码，Claude 作为 Basic `Proxy-Authorization` 发送，所以 tele 把 CONNECT 代理的随机密码放在 `HTTPS_PROXY` 的 userinfo 中。
 - `SSL_CERT_FILE` 或 `NODE_EXTRA_CA_CERTS` 任意一个指向的 CA 都会被信任。tele 两个都设置，指向同一个 bundle。
 - 证书不受信任时，Claude 报 API 错误后退出，不会绕过代理直连。
+- OAuth 访问令牌过期后的刷新（令牌端点在 `platform.claude.com`）同样经过代理，刷新得到的新令牌随后用于 API 请求。
 - WebFetch 的域名预检（向 `api.anthropic.com` 询问域名是否可以抓取）和抓取本身都经过代理；抓回的页面交给模型摘要时走 API。
 - 打开非必要流量（tele 不设 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`）时，Claude 的全部 TCP 连接都指向代理，它自己不做任何 DNS 查询。
 
@@ -155,6 +156,5 @@ This session operates on the remote host "{{alias}}" via tele.
 | 在 `main` 之前，bun 仍然是单线程的（`setns(CLONE_NEWNS)` 要求进程不与其它线程共享文件系统信息） | 回到「bind 挂载动态库和 DNS 文件」的做法，本地例外变多 |
 | 切换之后，Claude 不再 dlopen 或打开其它本地运行时文件 | 在切换前预先加载；实在不行，加入本地集合 |
 | 本地 uid 在远端的 `/etc/passwd` 中可能不存在，但 `os.userInfo()` 等调用不受影响，或者 `USER`、`HOME` 足以兜底。另外，glibc 的 NSS 会按远端的 `nsswitch.conf` dlopen 远端的 `libnss_*.so`，远端 glibc 版本不同时可能崩溃 | 切换前预先加载本地的 NSS 模块，或在远端视图中合成 passwd 条目 |
-| OAuth 令牌的刷新也遵循代理（其它出站连接见[代理与 CA](#代理与-ca)）。不走代理的连接会在远端视图中做 DNS 解析，从而失败 | 把本地的 DNS 配置文件加入本地集合 |
 | bun 信任 `<sess>/ca-bundle.pem`（见[代理与 CA](#代理与-ca)）之后，不再依赖系统证书目录；切换到远端视图后，`/etc/ssl` 是远端的 | 把本地证书目录 bind 到 `/etc/ssl` 等路径，多一个本地例外 |
 | 兼容性测试覆盖的功能中，Claude 自己按绝对路径启动的只有 `/bin/sh`，其余都按 PATH 查找。没有覆盖的功能（打开浏览器、剪贴板、通知等）启动的程序同样可以逐个列出并处理（见 [shim](exec.md#shim)） | 无 |

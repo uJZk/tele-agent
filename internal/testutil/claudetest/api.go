@@ -57,6 +57,8 @@ type Request struct {
 	Tools    []string
 	Messages []Message
 	Raw      json.RawMessage
+	// Auth is the Authorization header.
+	Auth string
 }
 
 // Message is one message of a request.
@@ -206,7 +208,21 @@ type wireRequest struct {
 	} `json:"messages"`
 }
 
+// RefreshedToken is the access token the stand-in hands out for an OAuth
+// token refresh.
+const RefreshedToken = "sk-ant-oat01-tele-refreshed" //nolint:gosec // a fake token for the stand-in
+
 func (a *API) serve(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost && r.URL.Path == "/v1/oauth/token" {
+		a.mu.Lock()
+		a.pages = append(a.pages, r.Host+r.URL.Path)
+		a.mu.Unlock()
+		writeJSON(w, map[string]any{ //nolint:gosec // fake tokens for the stand-in
+			"access_token": RefreshedToken, "refresh_token": "tele-refresh-2",
+			"expires_in": 3600, "token_type": "Bearer", "scope": "user:inference user:profile",
+		})
+		return
+	}
 	if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/v1/messages") {
 		// Connectivity checks, and pages for WebFetch.
 		a.mu.Lock()
@@ -230,7 +246,7 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	req := Request{Agent: len(wr.Tools) > 0, System: flattenText(wr.System), Raw: body}
+	req := Request{Agent: len(wr.Tools) > 0, System: flattenText(wr.System), Raw: body, Auth: r.Header.Get("Authorization")}
 	for _, tl := range wr.Tools {
 		req.Tools = append(req.Tools, tl.Name)
 	}
