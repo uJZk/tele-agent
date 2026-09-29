@@ -1,18 +1,18 @@
 package execsvc
 
-import "sync"
+import (
+	"fmt"
+	"sync"
 
-// stdinQueueMax bounds the stdin data queued for a command that does not
-// read it. The exec stream has no flow control for stdin apart from the
-// stream window, and signals and the client's end of the stream arrive
-// behind stdin data, so the reader must not wait for the command to read
-// its input. Up to this much it does not: it covers the JSON a hook
-// receives on stdin, which holds whole file contents for Write and Edit.
-// Beyond it the reader waits until the command reads or exits.
-const stdinQueueMax = 8 << 20
+	"github.com/ujzk/tele-agent/internal/proto"
+)
 
 // stdinQueue passes stdin data from the frame reader to the goroutine
-// that writes it to the command.
+// that writes it to the command. The client keeps at most
+// proto.ExecStdinWindow of stdin unacknowledged, so the queue is bounded
+// without the reader ever waiting: signals and the end of the stream,
+// which arrive behind stdin data, are handled at once however slowly the
+// command reads (docs/exec.md "进程与信号").
 type stdinQueue struct {
 	mu     sync.Mutex
 	cond   *sync.Cond // signalled whenever a field below changes
@@ -28,24 +28,26 @@ func newStdinQueue() *stdinQueue {
 	return q
 }
 
-// put queues data, waiting while the queue is full. Data that arrives
-// after end or close is dropped.
-func (q *stdinQueue) put(data []byte) {
+// put queues data. Data that arrives after end or close is dropped. Data
+// beyond the window is a protocol violation: the chunk the writer took
+// last is not acknowledged yet either, so a client within its window
+// never fills the queue beyond it.
+func (q *stdinQueue) put(data []byte) error {
 	if len(data) == 0 {
-		return
+		return nil
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	// An empty queue takes any chunk, so that no frame waits forever.
-	for !q.closed && q.size > 0 && q.size+len(data) > stdinQueueMax {
-		q.cond.Wait()
-	}
 	if q.closed || q.eof {
-		return
+		return nil
+	}
+	if q.size+len(data) > proto.ExecStdinWindow {
+		return fmt.Errorf("stdin beyond the window of %d bytes", proto.ExecStdinWindow)
 	}
 	q.chunks = append(q.chunks, data)
 	q.size += len(data)
 	q.cond.Broadcast()
+	return nil
 }
 
 // end records the end of the client's input, after the data queued so
@@ -57,8 +59,8 @@ func (q *stdinQueue) end() {
 	q.cond.Broadcast()
 }
 
-// close stops forwarding: queued and later data is dropped, and put and
-// next return at once.
+// close stops forwarding: queued and later data is dropped, and next
+// returns at once.
 func (q *stdinQueue) close() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -85,6 +87,5 @@ func (q *stdinQueue) next() (data []byte, eof, ok bool) {
 	q.chunks[0] = nil
 	q.chunks = q.chunks[1:]
 	q.size -= len(data)
-	q.cond.Broadcast()
 	return data, false, true
 }

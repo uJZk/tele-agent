@@ -46,6 +46,11 @@ func (p *Process) readLoop() {
 			p.write(&p.stdout, f.Data)
 		case proto.ExecStderr:
 			p.write(&p.stderr, f.Data)
+		case proto.ExecStdinAck:
+			if err := p.credit.add(int(f.Ack)); err != nil {
+				p.setExit(nil, err)
+				return
+			}
 		case proto.ExecExit:
 			if f.Exit == nil {
 				p.setExit(nil, errors.New("rexec: exit frame without status"))
@@ -105,11 +110,16 @@ func (p *Process) stdinLoop() {
 	}
 	buf := make([]byte, chunkSize)
 	for {
-		n, err := readSome(p.stdin, buf, p.stopStdin)
+		avail, ok := p.waitCredit()
+		if !ok {
+			return
+		}
+		n, err := readSome(p.stdin, buf[:min(avail, len(buf))], p.stopStdin)
 		if errors.Is(err, errStopped) {
 			return
 		}
 		if n > 0 {
+			p.credit.spend(n)
 			if p.sendInput(&proto.ExecFrame{Op: proto.ExecStdin, Data: buf[:n]}) != nil {
 				return
 			}
@@ -121,6 +131,27 @@ func (p *Process) stdinLoop() {
 		}
 		p.sendStdinEOF()
 		return
+	}
+}
+
+// waitCredit waits until the stdin window has room and returns it. It
+// returns false when stdin forwarding ends first: the command exited, was
+// abandoned, or the stream ended. While the window is full, local input
+// stays unread.
+func (p *Process) waitCredit() (int, bool) {
+	for {
+		if n := p.credit.available(); n > 0 {
+			return n, true
+		}
+		select {
+		case <-p.credit.wake:
+		case <-p.exited:
+			return 0, false
+		case <-p.abandon:
+			return 0, false
+		case <-p.readerDone:
+			return 0, false
+		}
 	}
 }
 

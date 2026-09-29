@@ -21,9 +21,9 @@ import (
 )
 
 // backlog starts `echo $$; exec sleep 1000`, which never reads its stdin,
-// and feeds it size bytes of stdin. It returns once the local pipe took
-// all of them, which means rexec forwarded all but a pipe's worth.
-func backlog(t *testing.T, e *env, size int) (*Process, int) {
+// and feeds it more stdin than the window. It returns once rexec used up
+// the window, and checks that the rest stays unread in the local pipe.
+func backlog(t *testing.T, e *env) (*Process, int) {
 	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -34,14 +34,18 @@ func backlog(t *testing.T, e *env, size int) (*Process, int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = in.Close(); _ = feed.Close() })
 	p, err := e.client.Start(t.Context(), Command{Argv: sh("echo $$; exec sleep 1000"), Dir: "/", Stdin: in, Stdout: w})
 	if err != nil {
 		t.Fatal(err)
 	}
+	fed := make(chan error, 1)
 	t.Cleanup(func() {
 		p.Abandon()
 		<-p.Done()
+		// Ends the write below with EPIPE.
+		_ = in.Close()
+		<-fed
+		_ = feed.Close()
 	})
 	line, err := bufio.NewReader(r).ReadString('\n')
 	if err != nil {
@@ -51,29 +55,28 @@ func backlog(t *testing.T, e *env, size int) (*Process, int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fed := make(chan error, 1)
 	go func() {
-		_, err := feed.Write(make([]byte, size))
+		_, err := feed.Write(make([]byte, 4*proto.ExecStdinWindow))
 		fed <- err
 	}()
+	deadline := time.Now().Add(testTimeout)
+	for p.credit.available() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stdin window not used up: %d bytes left", p.credit.available())
+		}
+		time.Sleep(time.Millisecond)
+	}
 	select {
 	case err := <-fed:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(testTimeout):
-		t.Fatal("stdin not forwarded")
+		t.Fatalf("all stdin was read although the command reads none: %v", err)
+	default:
 	}
 	return p, pid
 }
 
-// backlogSize is far beyond the pipes and the stream window, but within
-// what the server queues for a command that does not read.
-const backlogSize = 4 << 20
-
 func TestSignalWithStdinBacklog(t *testing.T) {
 	e := newEnv(t, nil)
-	p, _ := backlog(t, e, backlogSize)
+	p, _ := backlog(t, e)
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
 	if err := p.Signal(ctx, int(unix.SIGTERM)); err != nil {
@@ -87,7 +90,7 @@ func TestSignalWithStdinBacklog(t *testing.T) {
 
 func TestAbandonWithStdinBacklog(t *testing.T) {
 	e := newEnv(t, nil)
-	p, pid := backlog(t, e, backlogSize)
+	p, pid := backlog(t, e)
 	p.Abandon()
 	waitDone(t, p)
 	waitGone(t, pid)
@@ -203,27 +206,30 @@ func TestScratchBudget(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cmd := Command{Argv: []string{"sh", "-c", strings.Repeat("x", 512<<10)}, Dir: "/", Env: []string{"BIG=" + strings.Repeat("y", 256<<10)}}
-	total := 0
-	for range 3 {
-		up := m.Uploads(ScratchBudget(cmd))
-		cmd.Scratch = up.Files
-		b, err := proto.Marshal(&proto.ExecStart{Argv: cmd.Argv, Dir: cmd.Dir, Env: cmd.Env, Scratch: cmd.Scratch})
-		if err != nil || len(b) > proto.MaxDataFrame {
-			t.Fatalf("ExecStart of %d bytes, %v", len(b), err)
-		}
-		p, err := e.client.Start(t.Context(), cmd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		p.Abandon()
-		waitDone(t, p)
-		up.Commit()
-		total += len(up.Files)
+	// A command line of several MiB, as a shim may send, leaves the
+	// uploads their full limit.
+	cmd := Command{Argv: []string{"sh", "-c", strings.Repeat("x", 4<<20)}, Dir: "/", Env: []string{"BIG=" + strings.Repeat("y", 2<<20)}}
+	up := m.Uploads(ScratchBudget(cmd))
+	cmd.Scratch = up.Files
+	b, err := proto.Marshal(&proto.ExecStart{Argv: cmd.Argv, Dir: cmd.Dir, Env: cmd.Env, Scratch: cmd.Scratch})
+	if err != nil || len(b) > proto.MaxExecStart {
+		t.Fatalf("ExecStart of %d bytes, %v", len(b), err)
 	}
-	if total != n {
-		t.Fatalf("uploaded %d files in three commands, want %d", total, n)
+	if len(up.Files) != n {
+		t.Fatalf("uploaded %d files next to a large command line, want %d", len(up.Files), n)
 	}
+	p, err := e.client.Start(t.Context(), cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The start is accepted: the kernel, not the stream, refuses a command
+	// line this large.
+	res, err := p.Wait(t.Context())
+	if err != nil || res.StartErr == nil || res.StartErr.Errno != uint32(unix.E2BIG) {
+		t.Fatalf("Wait = %+v, %v; want start error E2BIG", res, err)
+	}
+	waitDone(t, p)
+	up.Commit()
 }
 
 func TestBackgroundOutputNotReplaced(t *testing.T) {

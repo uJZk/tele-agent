@@ -146,6 +146,10 @@ type outcome struct {
 	exit           *proto.ExecStatus
 	// Output bytes received when ExecExit arrived.
 	stdoutAtExit, stderrAtExit int
+	// acked is the stdin the server acknowledged; onAck, if set, sees
+	// every acknowledgement.
+	acked int
+	onAck func(n int)
 }
 
 // next reads one frame into o; it returns false at the end of the stream.
@@ -165,6 +169,11 @@ func (s *stream) next(o *outcome) bool {
 		o.stdout.Write(f.Data)
 	case proto.ExecStderr:
 		o.stderr.Write(f.Data)
+	case proto.ExecStdinAck:
+		o.acked += int(f.Ack)
+		if o.onAck != nil {
+			o.onAck(int(f.Ack))
+		}
 	case proto.ExecExit:
 		if o.exit != nil {
 			s.t.Fatal("second ExecExit")
@@ -282,17 +291,14 @@ func TestSignal(t *testing.T) {
 func TestStdin(t *testing.T) {
 	h := newHarness(t, nil)
 	s := h.start(t, &proto.ExecStart{Argv: []string{"cat"}})
-	want := make([]byte, 1<<20+123)
+	want := make([]byte, 3*proto.ExecStdinWindow+123)
 	_, _ = rand.Read(want)
-	for rest := want; len(rest) > 0; {
-		n := min(len(rest), 40000)
-		s.send(&proto.ExecFrame{Op: proto.ExecStdin, Data: rest[:n]})
-		rest = rest[n:]
-	}
-	s.send(&proto.ExecFrame{Op: proto.ExecStdinEOF})
-	o := s.collect()
+	o := s.feed(want)
 	if o.exit.Code != 0 || !bytes.Equal(o.stdout.Bytes(), want) {
 		t.Fatalf("exit %+v, stdout %d bytes equal=%v", o.exit, o.stdout.Len(), bytes.Equal(o.stdout.Bytes(), want))
+	}
+	if o.acked != len(want) {
+		t.Fatalf("acknowledged %d bytes of stdin, want %d", o.acked, len(want))
 	}
 }
 

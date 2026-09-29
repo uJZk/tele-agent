@@ -87,13 +87,15 @@ const scratchFieldMax = 16
 
 // ScratchBudget returns how many bytes of encoded scratch files fit into
 // the ExecStart of cmd next to its argv, directory and environment
-// (scratch.Mapper.Uploads takes it as its budget).
+// (scratch.Mapper.Uploads takes it as its budget). proto.MaxExecStart
+// leaves room for proto.ScratchTotalMax next to any command line a shim
+// can send, so only a larger one reduces it.
 func ScratchBudget(cmd Command) int {
 	b, err := proto.Marshal(&proto.ExecStart{Argv: cmd.Argv, Dir: cmd.Dir, Env: cmd.Env, TTY: cmd.TTY})
 	if err != nil {
 		return 0
 	}
-	return max(0, proto.MaxDataFrame-len(b)-scratchFieldMax)
+	return max(0, proto.MaxExecStart-len(b)-scratchFieldMax)
 }
 
 // Result is how a remote command ended.
@@ -121,6 +123,10 @@ type Process struct {
 
 	stopStdin *wakeFD // signalled when the command exited or was abandoned
 	stopOut   *wakeFD // signalled when the command was abandoned
+
+	// credit is the stdin window left: readLoop adds what the server
+	// acknowledges, stdinLoop spends what it sends.
+	credit *stdinCredit
 
 	// Frames for sendLoop, which writes every frame. Control frames go
 	// first, so that a signal waits for at most the stdin frame being
@@ -181,6 +187,7 @@ func (c *Client) Start(ctx context.Context, cmd Command) (*Process, error) {
 		stderr:     sink{f: cmd.Stderr},
 		stopStdin:  stopStdin,
 		stopOut:    stopOut,
+		credit:     newStdinCredit(),
 		control:    make(chan sendRequest),
 		input:      make(chan sendRequest),
 		started:    make(chan struct{}),
@@ -211,13 +218,13 @@ func (c *Client) startStream(ctx context.Context, cmd *Command) (net.Conn, error
 	// ExecStart may carry megabytes of scratch files; closing the stream
 	// interrupts a send stalled by flow control.
 	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
-	err = proto.WriteFrame(raw, &proto.ExecStart{
+	err = proto.WriteFrameLimit(raw, &proto.ExecStart{
 		Argv:    cmd.Argv,
 		Dir:     cmd.Dir,
 		Env:     cmd.Env,
 		TTY:     cmd.TTY,
 		Scratch: cmd.Scratch,
-	})
+	}, proto.MaxExecStart)
 	if !stop() {
 		err = ctx.Err()
 	}
@@ -232,10 +239,9 @@ func (c *Client) startStream(ctx context.Context, cmd *Command) (net.Conn, error
 // request was written to the stream, or when ctx is done; a request that
 // was being written when ctx ended may still arrive.
 //
-// Signals travel behind stdin data. The server queues a large amount of
-// stdin for a command that does not read it, but beyond that a signal
-// waits until the command reads its input or exits (see
-// internal/execsvc).
+// Signals travel behind stdin data, but never wait for the command to
+// read it: the stdin window bounds what the server holds for the command
+// (proto.ExecStdinWindow), so it always reads on to the signal.
 func (p *Process) Signal(ctx context.Context, sig int) error {
 	if sig < 1 || sig > maxSignal {
 		return fmt.Errorf("rexec: invalid signal %d", sig)

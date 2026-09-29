@@ -9,7 +9,6 @@ package proto
 
 import (
 	"bytes"
-	"errors"
 )
 
 // MaxShimRequest bounds the ShimRequest frame. The request carries the
@@ -25,14 +24,8 @@ const MaxShimRequest = 8 << 20
 // *FrameTooLargeError.
 func EncodeShimRequest(req *ShimRequest) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := WriteFrame(&buf, req); err != nil {
-		if tooLarge := (*FrameTooLargeError)(nil); errors.As(err, &tooLarge) {
-			tooLarge.Limit = MaxShimRequest
-		}
+	if err := WriteFrameLimit(&buf, req, MaxShimRequest); err != nil {
 		return nil, err
-	}
-	if n := buf.Len() - frameHeaderLen; n > MaxShimRequest {
-		return nil, &FrameTooLargeError{Size: uint64(n), Limit: MaxShimRequest}
 	}
 	return buf.Bytes(), nil
 }

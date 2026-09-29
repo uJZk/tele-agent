@@ -14,12 +14,12 @@
 // the exit status only the pipes are closed, which leaves background
 // children running as they would locally (docs/exec.md "shim 与会话主进程").
 //
-// Signals travel in the exec stream behind stdin data, and the stream has
-// no flow control for stdin of its own. The server therefore queues stdin
-// for a command that does not read it (up to stdinQueueMax) and keeps
-// handling the client's frames meanwhile; only beyond that does a signal
-// or the client's end of the stream wait until the command reads its
-// input or exits.
+// Signals travel in the exec stream behind stdin data. Stdin has a window
+// of its own (proto.ExecStdinWindow): the server acknowledges input once
+// the command has been handed it, and queues at most a window of input
+// the command has not read yet, so it always keeps handling the client's
+// frames and a signal or the end of the stream never waits for the
+// command to read.
 //
 // TODO(session layer): docs/exec.md "进程与信号" has the session layer
 // buffer output while the session is disconnected (bounded, spilling to

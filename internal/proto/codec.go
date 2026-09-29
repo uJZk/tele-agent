@@ -22,7 +22,7 @@ import (
 
 // Version is exchanged in Hello. Bump it for any change an older peer cannot
 // safely ignore.
-const Version = 1
+const Version = 2
 
 // Frame size limits. Every Recv names the limit that applies to its stream.
 const (
@@ -31,6 +31,11 @@ const (
 	// MaxDataFrame bounds frames that may carry file contents or stream
 	// data. It leaves room for ScratchTotalMax plus metadata.
 	MaxDataFrame = ScratchTotalMax + MaxControlFrame
+	// MaxExecStart bounds the ExecStart frame. Its argv and environment
+	// come from a shim request and may take up to MaxShimRequest, so the
+	// frame has room for those, ScratchTotalMax of uploads and metadata:
+	// a large command line never crowds out the uploads it carries.
+	MaxExecStart = MaxShimRequest + MaxDataFrame
 )
 
 const frameHeaderLen = 4
@@ -93,14 +98,22 @@ func Unmarshal(b []byte, v any) error {
 
 // WriteFrame encodes v and writes it as one frame with a single Write call,
 // so that it is not interleaved with frames written concurrently on
-// connections whose Write is atomic (net.Conn, yamux streams).
+// connections whose Write is atomic (net.Conn, yamux streams). Frames
+// larger than MaxDataFrame are refused.
 func WriteFrame(w io.Writer, v any) error {
+	return WriteFrameLimit(w, v, MaxDataFrame)
+}
+
+// WriteFrameLimit is WriteFrame for the frames whose stream accepts more
+// than MaxDataFrame, such as ExecStart (MaxExecStart). Nothing is written
+// when the frame exceeds limit.
+func WriteFrameLimit(w io.Writer, v any, limit int) error {
 	payload, err := Marshal(v)
 	if err != nil {
 		return err
 	}
-	if len(payload) > MaxDataFrame {
-		return &FrameTooLargeError{Size: uint64(len(payload)), Limit: MaxDataFrame}
+	if len(payload) > limit {
+		return &FrameTooLargeError{Size: uint64(len(payload)), Limit: limit}
 	}
 	buf := make([]byte, frameHeaderLen+len(payload))
 	binary.BigEndian.PutUint32(buf, uint32(len(payload)))

@@ -158,7 +158,7 @@ func (u *Upload) finish(commit bool) {
 // all.
 //
 // budget bounds the encoded size of the files, so that the ExecStart that
-// carries them stays within proto.MaxDataFrame (rexec.ScratchBudget).
+// carries them stays within proto.MaxExecStart (rexec.ScratchBudget).
 // Files larger than proto.ScratchFileMax are skipped until they change
 // again; files beyond the budget, proto.ScratchTotalMax or
 // maxUploadEntries wait for the next call.

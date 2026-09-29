@@ -10,8 +10,18 @@ const (
 	ScratchTotalMax = 8 << 20
 )
 
+// ExecStdinWindow bounds the stdin data a client may have sent on an exec
+// stream that the server has not acknowledged with ExecStdinAck yet
+// (docs/exec.md "进程与信号"). The server never holds more unread stdin than
+// this, so its frame reader never waits for the command to read, and
+// signals and the end of the stream, which travel behind stdin data, are
+// always handled at once. A client that exceeds the window violates the
+// protocol and the server ends the command.
+const ExecStdinWindow = 1 << 20
+
 // ExecStart is the first frame a client sends on an exec stream, after
-// the StreamHeader.
+// the StreamHeader. Its limit is MaxExecStart; every later frame of the
+// stream is bounded by MaxDataFrame.
 type ExecStart struct {
 	// Argv is the command to run. An Argv[0] without a slash is looked up
 	// in TargetInfo.LoginPath.
@@ -61,6 +71,12 @@ const (
 	// keep the output pipes open, as they would for a local command; the
 	// server closes the stream once the pipes reach EOF.
 	ExecExit ExecOp = 19
+	// ExecStdinAck returns Ack bytes of stdin window to the client once
+	// the command has been handed that much of its input. Input dropped
+	// because the command closed its stdin is never acknowledged: the
+	// client then stops reading its local stdin, leaving the rest to
+	// whoever reads it next.
+	ExecStdinAck ExecOp = 20
 )
 
 // ExecFrame is every frame after ExecStart, in both directions.
@@ -74,6 +90,7 @@ type ExecFrame struct {
 	TTY    *TTYSize    `cbor:"4,keyasint,omitempty"`
 	PID    int         `cbor:"5,keyasint,omitempty"`
 	Exit   *ExecStatus `cbor:"6,keyasint,omitempty"`
+	Ack    uint32      `cbor:"7,keyasint,omitempty"`
 }
 
 // ExecStatus reports how a remote command ended.

@@ -33,7 +33,8 @@ type execution struct {
 	pty   bool
 
 	// stdinQ carries stdin data from readLoop to stdinLoop, so that
-	// readLoop never waits for the command to read its input.
+	// readLoop never waits for the command to read its input; the stdin
+	// window bounds it.
 	stdinQ *stdinQueue
 
 	// finishing is set when the server itself ends the stream, so that
@@ -73,8 +74,10 @@ func (e *execution) markMainDone() {
 
 func (e *execution) run() error {
 	defer e.markMainDone()
+	// ExecStart has a larger limit than the frames after it; conn does
+	// not buffer, so reading it directly is safe.
 	var start proto.ExecStart
-	if err := e.conn.Recv(&start); err != nil {
+	if err := proto.ReadFrame(e.raw, &start, proto.MaxExecStart); err != nil {
 		_ = e.raw.Close()
 		return fmt.Errorf("execsvc: read exec start: %w", err)
 	}
@@ -319,7 +322,7 @@ func (e *execution) readLoop() {
 func (e *execution) handle(f *proto.ExecFrame) error {
 	switch f.Op {
 	case proto.ExecStdin:
-		e.stdinQ.put(f.Data)
+		return e.stdinQ.put(f.Data)
 	case proto.ExecStdinEOF:
 		e.stdinQ.end()
 	case proto.ExecSignal:
@@ -356,11 +359,17 @@ func (e *execution) stdinLoop() {
 		}
 		if _, err := e.stdin.Write(data); err != nil {
 			// EPIPE: the command closed its stdin. Closed or past the
-			// deadline: the main process exited (endStdin).
+			// deadline: the main process exited (endStdin). Nothing is
+			// acknowledged any more, so the client stops reading input
+			// that is not for this command.
 			e.stdinQ.close()
 			if !errors.Is(err, unix.EPIPE) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrDeadlineExceeded) {
 				e.log.Debug("execsvc: write stdin", "err", err)
 			}
+			return
+		}
+		if err := e.conn.Send(&proto.ExecFrame{Op: proto.ExecStdinAck, Ack: uint32(len(data))}); err != nil {
+			e.abort()
 			return
 		}
 	}
@@ -427,7 +436,7 @@ func (e *execution) abort() {
 	pumps := e.pumps
 	e.mu.Unlock()
 
-	// readLoop may wait for room in the queue.
+	// stdinLoop may wait for data.
 	e.stdinQ.close()
 	for _, p := range pumps {
 		p.close()
