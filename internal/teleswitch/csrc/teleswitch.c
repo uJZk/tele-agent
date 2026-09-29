@@ -140,15 +140,16 @@ static long ts_parse_fd(const char *s) {
 }
 
 /* ts_scrub removes LD_PRELOAD and the TELE_SWITCH_ variables from env in
- * place, so that nothing Claude starts inherits them. */
+ * place, so that nothing Claude starts inherits them. Their slots become
+ * empty strings, which no lookup matches and which are not variables,
+ * instead of being compacted away: the array must keep its length,
+ * because runtimes find the auxiliary vector by walking past the
+ * environment's terminating NULL on the initial stack. */
 static void ts_scrub(char **env) {
-	char **out = env;
 	for (char **p = env; *p; p++) {
 		if (ts_has_prefix(*p, "LD_PRELOAD=") || ts_has_prefix(*p, TS_ENV_PREFIX))
-			continue;
-		*out++ = *p;
+			*p += ts_strlen(*p);
 	}
-	*out = 0;
 }
 
 static void ts_switch(char **env) {

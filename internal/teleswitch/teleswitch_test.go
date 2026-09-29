@@ -175,7 +175,7 @@ func switchHelper(args []string) int {
 	defer func() { _ = ns.Close() }()
 
 	sh := exec.CommandContext(ctx, "/bin/sh", "-c", script)
-	sh.Env = append([]string{"PATH=/usr/bin:/bin", EnvCheck + "=" + dir + "/sess"}, Env(lib, 3, dir)...)
+	sh.Env = append([]string{"PATH=/usr/bin:/bin", "LD_PRELOAD=" + lib, EnvCheck + "=" + dir + "/sess"}, Env(3, dir)...)
 	if extra != "" {
 		sh.Env = append(sh.Env, extra) // os/exec keeps the last value
 	}

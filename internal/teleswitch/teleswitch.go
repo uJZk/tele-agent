@@ -57,13 +57,12 @@ func Library() ([]byte, error) {
 	return b, nil
 }
 
-// Env returns the variables that make a process switch: the library at
-// lib preloaded, the mount namespace at descriptor fd, and dir as the
-// working directory there. The process's environment must also hold
-// EnvCheck.
-func Env(lib string, fd int, dir string) []string {
+// Env returns the variables that tell the library where to switch to: the
+// mount namespace at descriptor fd, and dir as the working directory
+// there. The process must also have the library preloaded and EnvCheck in
+// its environment.
+func Env(fd int, dir string) []string {
 	return []string{
-		"LD_PRELOAD=" + lib,
 		EnvFD + "=" + strconv.Itoa(fd),
 		EnvDir + "=" + dir,
 	}
