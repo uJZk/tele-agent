@@ -284,14 +284,16 @@ func (s *Service) flushDeadline() time.Time {
 // waitReadable blocks until the inotify descriptor is readable, the read
 // deadline passes, or the descriptor is closed. It reads nothing itself:
 // reading happens under readMu so that Sync sees a consistent queue.
+//
+// The callback must look at the queue instead of assuming it empty:
+// RawConn.Read resets the poller's readiness before the first call, so an
+// event that arrived while this goroutine was busy has already used up its
+// edge notification. Parking without checking would then wait for the next
+// event, or forever with no deadline set.
 func (s *Service) waitReadable() error {
-	polled := false
-	return s.rawIn.Read(func(uintptr) bool {
-		if polled {
-			return true
-		}
-		polled = true
-		return false
+	return s.rawIn.Read(func(fd uintptr) bool {
+		n, err := unix.IoctlGetInt(int(fd), unix.TIOCINQ) // FIONREAD
+		return err != nil || n > 0                        // an error is left to drainLocked
 	})
 }
 
