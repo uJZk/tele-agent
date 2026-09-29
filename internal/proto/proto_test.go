@@ -232,3 +232,25 @@ func FuzzReadFrame(f *testing.F) {
 		}
 	})
 }
+
+// FuzzSessionFrame decodes arbitrary frames of the resumable session
+// layer; decoding and Check must never panic, and a frame Check accepts
+// must fit the limits.
+func FuzzSessionFrame(f *testing.F) {
+	for _, fr := range []SessionFrame{{Kind: SessionData, Data: []byte("x")}, {Kind: SessionAck, Ack: 7}, {Kind: SessionFin}} {
+		b, err := Marshal(&fr)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(b)
+	}
+	f.Fuzz(func(t *testing.T, b []byte) {
+		var fr SessionFrame
+		if Unmarshal(b, &fr) != nil {
+			return
+		}
+		if fr.Check() == nil && (len(fr.Data) > MaxSessionData || fr.Kind < SessionData || fr.Kind > SessionFin) {
+			t.Fatalf("Check accepted %+v", fr)
+		}
+	})
+}
