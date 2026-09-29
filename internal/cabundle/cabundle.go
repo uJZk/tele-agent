@@ -26,10 +26,10 @@ import (
 
 // systemFiles and systemDirs are the places crypto/x509 looks for system
 // roots on Linux (certFiles and certDirectories in
-// src/crypto/x509/root_linux.go). Build does not trust exactly what Go
-// does: Go reads every file in the directories in addition to the first
-// file, and SSL_CERT_FILE and SSL_CERT_DIR replace its lists, whereas Build
-// reads the directories only when no file is readable (see Build).
+// src/crypto/x509/root_linux.go). Like Go, Build reads the first readable
+// file and every certificate file in the directories; unlike Go, the user's
+// SSL_CERT_FILE and SSL_CERT_DIR are added to these roots instead of
+// replacing them (see Build).
 var (
 	systemFiles = []string{
 		"/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Gentoo, Arch
@@ -66,45 +66,48 @@ type Extra struct {
 // Build returns a PEM bundle of the local system roots and the certificates
 // in extra, deduplicated, in the order found.
 //
-// The system roots come from the first readable file in the list
-// crypto/x509 uses; the per-certificate directories are read only when no
-// such file exists, since on common distributions they duplicate the file.
-// Certificates present only in a directory are therefore missed on hosts
-// that also have a bundle file.
+// The system roots are the first readable file in the list crypto/x509 uses
+// plus every certificate file in the per-certificate directories. Claude's
+// runtime reads those directories too, so a CA installed there without
+// regenerating the bundle file is trusted by plain claude and must be
+// trusted under tele as well; duplicates of the file are dropped.
 //
 // From a directory in extra, files named *.pem, *.crt or OpenSSL's
 // <hash>.<n> are read and unreadable entries skipped. Entries with an empty
-// Path are ignored so that unset variables can be passed as they are; any
-// other entry that cannot be read is an error naming its variable, because
-// silently dropping a CA the user configured would surface later as an
-// opaque TLS failure.
+// Path are ignored so that unset variables can be passed as they are. An
+// entry that cannot be read is skipped and reported in skipped, naming its
+// variable, the way Claude itself only warns about an unreadable
+// NODE_EXTRA_CA_CERTS: a stale variable must not stop tele where plain
+// claude would start. The caller shows the warnings; if the CA was needed,
+// the TLS error that follows is explained by them.
 //
 // Only CERTIFICATE blocks that parse as X.509 are kept; anything else in
 // the input is ignored.
-func Build(extra []Extra) ([]byte, error) {
+func Build(extra []Extra) (pemBundle []byte, skipped []error, err error) {
 	return build(systemFiles, systemDirs, extra)
 }
 
-func build(sysFiles, sysDirs []string, extra []Extra) ([]byte, error) {
+func build(sysFiles, sysDirs []string, extra []Extra) ([]byte, []error, error) {
 	b := bundle{seen: make(map[string]struct{})}
-	if !b.addFirstFile(sysFiles) {
-		for _, d := range sysDirs {
-			_ = b.addDir(d) // best effort, like crypto/x509
-		}
+	b.addFirstFile(sysFiles)
+	for _, d := range sysDirs {
+		_ = b.addDir(d) // best effort, like crypto/x509
 	}
+	var skipped []error
 	for _, e := range extra {
 		if e.Path == "" {
 			continue
 		}
 		if err := b.addPath(e.Path); err != nil {
-			return nil, fmt.Errorf("cabundle: read CA certificates named by %s: %w; fix or unset %s",
-				e.Var, err, e.Var)
+			skipped = append(skipped, fmt.Errorf(
+				"cabundle: ignoring CA certificates named by %s: %w; fix or unset %s",
+				e.Var, err, e.Var))
 		}
 	}
 	if b.out.Len() == 0 {
-		return nil, ErrNoCertificates
+		return nil, skipped, ErrNoCertificates
 	}
-	return b.out.Bytes(), nil
+	return b.out.Bytes(), skipped, nil
 }
 
 type bundle struct {
@@ -112,18 +115,16 @@ type bundle struct {
 	seen map[string]struct{} // DER of every certificate in out
 }
 
-// addFirstFile adds the first readable file in paths and reports whether
-// one was found.
-func (b *bundle) addFirstFile(paths []string) bool {
+// addFirstFile adds the first readable file in paths.
+func (b *bundle) addFirstFile(paths []string) {
 	for _, p := range paths {
 		data, isDir, err := readFile(p)
 		if err != nil || isDir {
 			continue
 		}
 		b.addPEM(data)
-		return true
+		return
 	}
-	return false
 }
 
 // addPath adds a file, or the certificate files in a directory. Errors name

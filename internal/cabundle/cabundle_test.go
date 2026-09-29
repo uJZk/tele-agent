@@ -107,6 +107,9 @@ func TestBuild(t *testing.T) {
 	sysDir := filepath.Join(dir, "sysdir")
 	write(t, filepath.Join(sysDir, "s.pem"), pemOf(d))
 	missing := filepath.Join(dir, "missing")
+	dupDir := filepath.Join(dir, "dupdir") // repeats a from sys1, adds e
+	write(t, filepath.Join(dupDir, "x.pem"), pemOf(a))
+	write(t, filepath.Join(dupDir, "y.pem"), pemOf(e))
 
 	userFile := write(t, filepath.Join(dir, "user.pem"), append(pemOf(b), pemOf(e)...)) // b duplicates a system cert
 	userDir := filepath.Join(dir, "userdir")
@@ -128,7 +131,8 @@ func TestBuild(t *testing.T) {
 		extra    []string
 		want     []string
 	}{
-		{name: "first readable system file", sysFiles: []string{missing, sysDir, sys1, sys2}, sysDirs: []string{sysDir}, want: []string{"a", "b"}},
+		{name: "first readable system file plus dirs", sysFiles: []string{missing, sysDir, sys1, sys2}, sysDirs: []string{sysDir}, want: []string{"a", "b", "d"}},
+		{name: "dir duplicating the file", sysFiles: []string{sys1}, sysDirs: []string{dupDir}, want: []string{"a", "b", "e"}},
 		{name: "system dirs when no file", sysFiles: []string{missing}, sysDirs: []string{missing, sysDir}, want: []string{"d"}},
 		{name: "extra file dedups", sysFiles: []string{sys1}, extra: []string{userFile, userFile}, want: []string{"a", "b", "e"}},
 		{name: "extra dir", sysFiles: []string{sys2}, extra: []string{"", userDir}, want: []string{"c", "d"}},
@@ -136,9 +140,9 @@ func TestBuild(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := build(tt.sysFiles, tt.sysDirs, extras(tt.extra...))
-			if err != nil {
-				t.Fatal(err)
+			got, skipped, err := build(tt.sysFiles, tt.sysDirs, extras(tt.extra...))
+			if err != nil || skipped != nil {
+				t.Fatalf("build: skipped %v, err %v", skipped, err)
 			}
 			if n := names(t, got); !slices.Equal(n, tt.want) {
 				t.Fatalf("bundle = %v, want %v", n, tt.want)
@@ -159,7 +163,7 @@ func TestBuildGarbage(t *testing.T) {
 	in.WriteString("-----BEGIN CERTIFICATE-----\ntruncated")
 	f := write(t, filepath.Join(dir, "mixed.pem"), in.Bytes())
 
-	got, err := build(nil, nil, extras(f))
+	got, _, err := build(nil, nil, extras(f))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,15 +172,18 @@ func TestBuildGarbage(t *testing.T) {
 	}
 
 	junk := write(t, filepath.Join(dir, "junk.pem"), []byte("\x00\xff no pem here"))
-	if _, err := build([]string{junk}, nil, extras(junk)); !errors.Is(err, ErrNoCertificates) {
+	if _, _, err := build([]string{junk}, nil, extras(junk)); !errors.Is(err, ErrNoCertificates) {
 		t.Fatalf("build of garbage = %v, want ErrNoCertificates", err)
 	}
-	if _, err := build(nil, nil, nil); !errors.Is(err, ErrNoCertificates) {
+	if _, _, err := build(nil, nil, nil); !errors.Is(err, ErrNoCertificates) {
 		t.Fatalf("build of nothing = %v, want ErrNoCertificates", err)
 	}
 }
 
-func TestBuildExtraErrors(t *testing.T) {
+// TestBuildExtraSkipped checks that an unreadable user CA path is skipped
+// with a warning naming the setting, as plain claude does, and the rest of
+// the bundle is still built.
+func TestBuildExtraSkipped(t *testing.T) {
 	dir := t.TempDir()
 	sys := write(t, filepath.Join(dir, "sys.crt"), pemOf(newCert(t, "sys")))
 	fifo := filepath.Join(dir, "fifo")
@@ -192,20 +199,31 @@ func TestBuildExtraErrors(t *testing.T) {
 		{Var: "SSL_CERT_FILE", Path: big},
 		{Var: "SSL_CERT_DIR", Path: missingDir},
 	} {
-		_, err := build([]string{sys}, nil, []Extra{e})
-		if err == nil {
-			t.Errorf("build with %s=%s succeeded", e.Var, filepath.Base(e.Path))
+		got, skipped, err := build([]string{sys}, nil, []Extra{e})
+		if err != nil {
+			t.Errorf("build with %s=%s: %v", e.Var, filepath.Base(e.Path), err)
+			continue
+		}
+		if n := names(t, got); !slices.Equal(n, []string{"sys"}) {
+			t.Errorf("build with %s=%s: bundle = %v, want [sys]", e.Var, filepath.Base(e.Path), n)
+		}
+		if len(skipped) != 1 {
+			t.Errorf("build with %s=%s: skipped = %v, want one warning", e.Var, filepath.Base(e.Path), skipped)
 			continue
 		}
 		// The user must learn which setting to fix.
 		for _, want := range []string{e.Path, e.Var, "unset " + e.Var} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("error %q does not name %q", err, want)
+			if !strings.Contains(skipped[0].Error(), want) {
+				t.Errorf("warning %q does not name %q", skipped[0], want)
 			}
 		}
 	}
+	// A skipped extra does not hide ErrNoCertificates when nothing is left.
+	if _, skipped, err := build(nil, nil, []Extra{{Var: "SSL_CERT_FILE", Path: fifo}}); !errors.Is(err, ErrNoCertificates) || len(skipped) != 1 {
+		t.Errorf("build with only an unreadable extra = %v, skipped %v; want ErrNoCertificates and one warning", err, skipped)
+	}
 	// A FIFO or oversized file among the system candidates is skipped.
-	got, err := build([]string{fifo, big, sys}, nil, nil)
+	got, _, err := build([]string{fifo, big, sys}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +256,7 @@ func TestBuildSystem(t *testing.T) {
 	if !found {
 		t.Skip("no system CA store on this host")
 	}
-	got, err := Build(nil)
+	got, _, err := Build(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
