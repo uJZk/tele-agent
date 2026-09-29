@@ -248,6 +248,8 @@ func (ss *session) serveStream(ctx context.Context, st net.Conn, log *slog.Logge
 		err = ss.fs.ServeRequest(ctx, st)
 	case proto.StreamWatch:
 		err = ss.fs.ServeWatch(ctx, st)
+	case proto.StreamForward:
+		err = serveForward(ctx, st)
 	case proto.StreamControl:
 		err = errors.New("unexpected second control stream")
 	}

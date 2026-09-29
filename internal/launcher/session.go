@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/ujzk/tele-agent/internal/cli"
 	"github.com/ujzk/tele-agent/internal/connectproxy"
 	"github.com/ujzk/tele-agent/internal/fssvc"
+	"github.com/ujzk/tele-agent/internal/portfwd"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/relay"
 	"github.com/ujzk/tele-agent/internal/resume"
@@ -142,6 +144,7 @@ func (s *session) run(sigs <-chan os.Signal) (*os.ProcessState, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.forwardMCPPorts(ctx, rs, p)
 	proxyAddr, proxyToken, err := s.startProxy(ctx)
 	if err != nil {
 		return nil, err
@@ -163,6 +166,39 @@ func (s *session) run(sigs <-chan os.Signal) (*os.ProcessState, error) {
 		return nil, err
 	}
 	return s.runClaude(env, args, ns, sigs)
+}
+
+// forwardMCPPorts forwards the loopback ports of the HTTP and SSE MCP
+// servers in the project's .mcp.json to the target (docs/exec.md
+// "端口转发"). It reads the file through the telefs mount, so it sees the
+// target's copy. Problems are warnings: Claude still runs, only those MCP
+// servers stay unreachable.
+func (s *session) forwardMCPPorts(ctx context.Context, rs *remoteSession, p paths) {
+	b, err := os.ReadFile(filepath.Join(p.mnt, p.workdir, ".mcp.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		s.log.Warn("read .mcp.json", "err", err)
+		return
+	}
+	ports, err := portfwd.MCPPorts(b)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tele: %v; its HTTP MCP servers are not forwarded\n", err)
+		return
+	}
+	if len(ports) == 0 {
+		return
+	}
+	f := &portfwd.Forwarder{Opener: rs.Mux, Logger: s.log.With("svc", "portfwd")}
+	s.onExit(func() { _ = f.Close() })
+	for _, port := range ports {
+		if err := f.Forward(ctx, port); err != nil {
+			fmt.Fprintf(os.Stderr, "tele: cannot forward port %d for an MCP server in .mcp.json: %v; something local may be using it\n", port, err)
+			continue
+		}
+		s.log.Info("forwarding MCP port", "port", port)
+	}
 }
 
 // layout works out the session's paths and checks the working directory.

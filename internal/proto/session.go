@@ -21,11 +21,15 @@ const (
 	StreamFS StreamKind = 3
 	// StreamWatch carries WatchEvents from the server for the whole session.
 	StreamWatch StreamKind = 4
+	// StreamForward carries one forwarded TCP connection: ForwardOpen,
+	// ForwardReply, then the connection's bytes in both directions
+	// (docs/exec.md "端口转发").
+	StreamForward StreamKind = 5
 )
 
 // Valid reports whether k is a known stream kind.
 func (k StreamKind) Valid() bool {
-	return k >= StreamControl && k <= StreamWatch
+	return k >= StreamControl && k <= StreamForward
 }
 
 func (k StreamKind) String() string {
@@ -38,6 +42,8 @@ func (k StreamKind) String() string {
 		return "fs"
 	case StreamWatch:
 		return "watch"
+	case StreamForward:
+		return "forward"
 	default:
 		return fmt.Sprintf("StreamKind(%d)", uint8(k))
 	}
@@ -56,6 +62,18 @@ type Hello struct {
 	Token []byte `cbor:"2,keyasint,omitempty"`
 	// SessionID is chosen by session main; see CheckSessionID.
 	SessionID string `cbor:"3,keyasint"`
+}
+
+// ForwardOpen asks the server to connect a forwarded stream to a loopback
+// TCP port on the target host.
+type ForwardOpen struct {
+	Port uint16 `cbor:"1,keyasint"`
+}
+
+// ForwardReply answers ForwardOpen. When Err is set the server closes the
+// stream; otherwise the stream carries the connection's bytes.
+type ForwardReply struct {
+	Err *Error `cbor:"1,keyasint,omitempty"`
 }
 
 // HelloReply answers Hello. When Err is set the server closes the session.
