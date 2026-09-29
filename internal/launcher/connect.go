@@ -81,11 +81,15 @@ func connect(ctx context.Context, ep endpoint.Endpoint, token []byte) (_ *remote
 	stop := context.AfterFunc(ctx, func() { _ = st.SetDeadline(time.Now()) })
 	defer stop()
 	c := proto.NewConn(st, proto.MaxControlFrame)
-	if err := c.Send(&proto.Hello{Version: proto.Version, Token: token, SessionID: sid}); err != nil {
-		return nil, fmt.Errorf("send hello: %w", err)
-	}
+	// A server that refuses the session answers and closes it at once,
+	// which can make the Hello write report the closed session although
+	// the Hello went out; the refusal is read even then.
+	sendErr := c.Send(&proto.Hello{Version: proto.Version, Token: token, SessionID: sid})
 	var reply proto.HelloReply
 	if err := c.Recv(&reply); err != nil {
+		if sendErr != nil {
+			return nil, fmt.Errorf("send hello: %w", sendErr)
+		}
 		return nil, fmt.Errorf("read hello reply: %w", err)
 	}
 	if reply.Err != nil {
