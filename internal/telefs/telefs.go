@@ -86,13 +86,27 @@ type Config struct {
 // directories the server could not watch.
 const shortTTL = time.Second
 
+// backend is a file service that nodes' requests go to: the target host,
+// or the local HOME of a LocalNames rule.
+type backend struct {
+	opener Opener
+	// local marks a LocalNames backend. Other local processes (a plain
+	// claude, for one) change its files behind the mount's back and
+	// nothing pushes their changes, so the kernel caches none of its
+	// entries and attributes, and its directories are never watched.
+	local bool
+	// rootDev is the device of the remote "/", which anchors inode
+	// numbering (ino); set for the remote backend only.
+	rootDev uint64
+}
+
 // FS is a mounted telefs.
 type FS struct {
-	cfg     Config
-	log     *slog.Logger
-	rootDev uint64 // remote device of "/", see mapIno
-	born    time.Time
-	root    *node
+	cfg    Config
+	log    *slog.Logger
+	remote *backend
+	born   time.Time
+	root   *node
 
 	server    *fuse.Server
 	serveDone chan struct{}
@@ -140,6 +154,7 @@ func mount(mountpoint string, cfg Config, refreshRoot bool) (*FS, error) {
 	}
 	f := &FS{
 		cfg:         cfg,
+		remote:      &backend{opener: cfg.Opener},
 		log:         cfg.Logger,
 		born:        time.Now(),
 		appliedWake: make(chan struct{}),
@@ -150,12 +165,12 @@ func mount(mountpoint string, cfg Config, refreshRoot bool) (*FS, error) {
 	}
 	f.reg.init()
 
-	// The remote identity of "/" anchors inode numbering (mapIno).
+	// The remote identity of "/" anchors inode numbering (backend.ino).
 	resp, errno := f.call(&proto.FSRequest{Op: proto.FSGetattr, Path: "/"})
 	if errno != 0 {
 		return nil, fmt.Errorf("telefs: stat remote root: %w", errno)
 	}
-	f.rootDev = resp.Attr.Dev
+	f.remote.rootDev = resp.Attr.Dev
 	f.root = f.newSynthTree(spec)
 	f.resolveAncestors(f.root)
 
@@ -219,17 +234,22 @@ func (f *FS) Unmount() error {
 	return nil
 }
 
-// call sends one request on its own stream and waits for the response. A
-// non-zero errno comes either from the server (the remote errno) or from
-// the transport (EIO); the response is returned in both cases when there
-// is one, because error responses still carry Unwatched.
+// call sends req to the remote backend (callOn).
+func (f *FS) call(req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
+	return f.callOn(f.remote, req)
+}
+
+// callOn sends one request to backend b on its own stream and waits for the
+// response. A non-zero errno comes either from the server (its errno) or
+// from the transport (EIO); the response is returned in both cases when
+// there is one, because error responses still carry Unwatched.
 //
 // FUSE interrupts do not cancel the request: the server may already have
 // performed it, and reporting EINTR for an operation that took effect
 // would make callers retry non-idempotent operations. The transport bounds
 // the wait instead.
-func (f *FS) call(req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
-	c, err := f.cfg.Opener.Open(proto.StreamFS)
+func (f *FS) callOn(b *backend, req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
+	c, err := b.opener.Open(proto.StreamFS)
 	if err != nil {
 		f.log.Warn("telefs: open fs stream", "op", req.Op, "err", err)
 		return nil, syscall.EIO
@@ -334,31 +354,39 @@ func (r negativeEntries) Lookup(cancel <-chan struct{}, header *fuse.InHeader, n
 	return st
 }
 
-// ttls returns the entry and attribute TTLs for a reply to a request that
-// started when invalGen was gen.
-func (f *FS) ttls(gen uint64, unwatched bool) (entry, attr time.Duration) {
+// ttls returns the entry and attribute TTLs for a reply from backend b to a
+// request that started when invalGen was gen.
+func (f *FS) ttls(b *backend, gen uint64, unwatched bool) (entry, attr time.Duration) {
+	if b.local {
+		return 0, 0
+	}
 	if unwatched || !f.healthy.Load() || f.invalGen.Load() != gen {
 		return shortTTL, shortTTL
 	}
 	return f.cfg.EntryTimeout, f.cfg.AttrTimeout
 }
 
-// Synthetic inode numbers have the top bit set; numbers derived from the
-// remote never do (mapIno).
+// Synthetic inode numbers have the top bit set and are small offsets from
+// synthIno; numbers derived from the remote never have the top bit, and
+// those of local backends have the two top bits set (backend.ino).
 const (
 	synthIno = 1 << 63
 	rootIno  = synthIno
+	localTag = 3 << 62
 )
 
-// mapIno derives the local inode number of a remote object from its device
-// and inode, like go-fuse's loopback: objects on the device of "/" keep
-// their inode numbers, others mix their device into the high half. Distinct
-// remote objects collide only across devices whose inode numbers exceed 32
-// bits in a matching pattern; a table would avoid that at the cost of
-// unbounded memory.
-func (f *FS) mapIno(dev, ino uint64) uint64 {
+// ino derives the inode number the kernel sees for an object of b from its
+// device and inode, like go-fuse's loopback: remote objects on the device
+// of "/" keep their inode numbers, others mix their device into the high
+// half. Distinct objects collide only across devices whose inode numbers
+// exceed 32 bits in a matching pattern; a table would avoid that at the
+// cost of unbounded memory.
+func (b *backend) ino(dev, ino uint64) uint64 {
 	swap := func(d uint64) uint64 { return d<<32 | d>>32 }
-	return (swap(dev) ^ swap(f.rootDev) ^ ino) &^ synthIno
+	if b.local {
+		return localTag | (swap(dev)^ino)&^localTag
+	}
+	return (swap(dev) ^ swap(b.rootDev) ^ ino) &^ synthIno
 }
 
 // fuseAttr converts remote attributes for the kernel, presenting the

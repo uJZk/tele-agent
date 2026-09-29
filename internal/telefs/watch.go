@@ -47,8 +47,12 @@ func (r *registry) init() {
 }
 
 // watchDir records that n is about to send a request that makes the server
-// watch remote directory p. It must be called before the request is sent.
-func (f *FS) watchDir(n *node, p string) {
+// of backend b watch directory p. It must be called before the request is
+// sent. Local backends watch nothing.
+func (f *FS) watchDir(n *node, b *backend, p string) {
+	if b.local {
+		return
+	}
 	r := &f.reg
 	r.mu.Lock()
 	for {

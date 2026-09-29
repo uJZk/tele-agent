@@ -3,7 +3,6 @@ package telefs
 import (
 	"context"
 	"maps"
-	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -11,54 +10,63 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/proto"
 )
 
-// openHandles records the server handles open on each remote object, so
-// that operations on a node can use one (node.callNode). It is keyed by the
-// remote identity rather than by node, because go-fuse may replace the
-// node a request created by an existing one of the same identity.
+// openHandles records the server handles open on each object, so that
+// operations on a node can use one (node.callNode). It is keyed by the
+// backend and the identity there rather than by node, because go-fuse may
+// replace the node a request created by an existing one of the same
+// identity.
 type openHandles struct {
 	mu sync.Mutex // guards m
-	m  map[proto.NodeID]map[uint64]struct{}
+	m  map[objectKey]map[uint64]struct{}
 }
 
-func (o *openHandles) add(node proto.NodeID, h uint64) {
+// objectKey identifies an object of a backend.
+type objectKey struct {
+	be *backend
+	id proto.NodeID
+}
+
+func (o *openHandles) add(b *backend, node proto.NodeID, h uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	k := objectKey{b, node}
 	if o.m == nil {
-		o.m = make(map[proto.NodeID]map[uint64]struct{})
+		o.m = make(map[objectKey]map[uint64]struct{})
 	}
-	if o.m[node] == nil {
-		o.m[node] = make(map[uint64]struct{})
+	if o.m[k] == nil {
+		o.m[k] = make(map[uint64]struct{})
 	}
-	o.m[node][h] = struct{}{}
+	o.m[k][h] = struct{}{}
 }
 
-func (o *openHandles) drop(node proto.NodeID, h uint64) {
+func (o *openHandles) drop(b *backend, node proto.NodeID, h uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	delete(o.m[node], h)
-	if len(o.m[node]) == 0 {
-		delete(o.m, node)
+	k := objectKey{b, node}
+	delete(o.m[k], h)
+	if len(o.m[k]) == 0 {
+		delete(o.m, k)
 	}
 }
 
-// any returns one of the handles open on node, or 0.
-func (o *openHandles) any(node proto.NodeID) uint64 {
+// any returns one of the handles open on node of backend b, or 0.
+func (o *openHandles) any(b *backend, node proto.NodeID) uint64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for h := range o.m[node] {
+	for h := range o.m[objectKey{b, node}] {
 		return h
 	}
 	return 0
 }
 
-// fileHandle is a file opened on the server.
+// fileHandle is a file opened on the server of backend be.
 type fileHandle struct {
 	fsys *FS
+	be   *backend
 	node proto.NodeID
 	id   uint64
 	// dirty is set by a write and cleared by the flush that makes it
@@ -66,11 +74,16 @@ type fileHandle struct {
 	dirty atomic.Bool
 }
 
-// newFileHandle returns the handle for server handle id of remote object
-// node, recording it as open.
-func (f *FS) newFileHandle(node proto.NodeID, id uint64) *fileHandle {
-	f.open.add(node, id)
-	return &fileHandle{fsys: f, node: node, id: id}
+// newFileHandle returns the handle for server handle id of object node of
+// backend b, recording it as open.
+func (f *FS) newFileHandle(b *backend, node proto.NodeID, id uint64) *fileHandle {
+	f.open.add(b, node, id)
+	return &fileHandle{fsys: f, be: b, node: node, id: id}
+}
+
+// call sends req to the handle's backend.
+func (h *fileHandle) call(req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
+	return h.fsys.callOn(h.be, req)
 }
 
 var (
@@ -84,7 +97,7 @@ var (
 // Read implements fs.FileReader.
 func (h *fileHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	size := min(len(dest), proto.MaxIO)
-	resp, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSRead, Handle: h.id, Offset: off, Size: uint32(size)})
+	resp, errno := h.call(&proto.FSRequest{Op: proto.FSRead, Handle: h.id, Offset: off, Size: uint32(size)})
 	if errno != 0 {
 		return nil, errno
 	}
@@ -98,7 +111,7 @@ func (h *fileHandle) Write(_ context.Context, data []byte, off int64) (uint32, s
 	var written uint32
 	for len(data) > 0 {
 		chunk := data[:min(len(data), proto.MaxIO)]
-		resp, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSWrite, Handle: h.id, Offset: off, Data: chunk})
+		resp, errno := h.call(&proto.FSRequest{Op: proto.FSWrite, Handle: h.id, Offset: off, Data: chunk})
 		if errno != 0 {
 			if written > 0 {
 				return written, 0
@@ -118,7 +131,7 @@ func (h *fileHandle) Write(_ context.Context, data []byte, off int64) (uint32, s
 
 // Fsync implements fs.FileFsyncer.
 func (h *fileHandle) Fsync(_ context.Context, flags uint32) syscall.Errno {
-	_, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSFsync, Handle: h.id, Flags: flags & 1})
+	_, errno := h.call(&proto.FSRequest{Op: proto.FSFsync, Handle: h.id, Flags: flags & 1})
 	return errno
 }
 
@@ -130,14 +143,14 @@ func (h *fileHandle) Flush(_ context.Context) syscall.Errno {
 	if !h.dirty.Swap(false) {
 		return 0
 	}
-	_, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSFsync, Handle: h.id, Flags: 1})
+	_, errno := h.call(&proto.FSRequest{Op: proto.FSFsync, Handle: h.id, Flags: 1})
 	return errno
 }
 
 // Release implements fs.FileReleaser. The kernel ignores the result.
 func (h *fileHandle) Release(_ context.Context) syscall.Errno {
-	h.fsys.open.drop(h.node, h.id)
-	_, errno := h.fsys.call(&proto.FSRequest{Op: proto.FSRelease, Handle: h.id})
+	h.fsys.open.drop(h.be, h.node, h.id)
+	_, errno := h.call(&proto.FSRequest{Op: proto.FSRelease, Handle: h.id})
 	return errno
 }
 
@@ -198,7 +211,7 @@ func (d *dirHandle) Readdirent(_ context.Context) (*fuse.DirEntry, syscall.Errno
 	return &fuse.DirEntry{
 		Name: e.Name,
 		Mode: e.Attr.Mode & syscall.S_IFMT,
-		Ino:  d.n.fsys.mapIno(e.Attr.Dev, e.Attr.Ino),
+		Ino:  d.n.be.ino(e.Attr.Dev, e.Attr.Ino),
 		Off:  uint64(e.Offset),
 	}, 0
 }
@@ -207,8 +220,8 @@ func (d *dirHandle) Readdirent(_ context.Context) (*fuse.DirEntry, syscall.Errno
 func (d *dirHandle) fetch() syscall.Errno {
 	f := d.n.fsys
 	gen := f.invalGen.Load()
-	f.watchDir(d.n, d.path)
-	resp, errno := f.call(&proto.FSRequest{Op: proto.FSReaddir, Handle: d.id, Offset: d.next, Size: readdirPage})
+	f.watchDir(d.n, d.n.be, d.path)
+	resp, errno := d.n.call(&proto.FSRequest{Op: proto.FSReaddir, Handle: d.id, Offset: d.next, Size: readdirPage})
 	if errno != 0 {
 		return errno
 	}
@@ -265,8 +278,8 @@ func (d *dirHandle) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	}
 	a, gen, unwatched := e.Attr, d.gen, d.unwatched
 	d.mu.Unlock()
-	ch := d.n.child(ctx, name, &a, unwatched)
-	d.n.fsys.fillEntry(out, ch, &a, gen, unwatched)
+	ch := d.n.child(ctx, d.n.be, name, &a, unwatched)
+	d.n.fsys.fillEntry(out, d.n.be, ch, &a, gen, unwatched)
 	return ch, 0
 }
 
@@ -278,13 +291,13 @@ const errTypeOnly = syscall.EACCES
 
 // Releasedir implements fs.FileReleasedirer.
 func (d *dirHandle) Releasedir(context.Context, uint32) {
-	d.n.fsys.open.drop(d.n.id(), d.id)
-	_, _ = d.n.fsys.call(&proto.FSRequest{Op: proto.FSReleasedir, Handle: d.id})
+	d.n.fsys.open.drop(d.n.be, d.n.id(), d.id)
+	_, _ = d.n.call(&proto.FSRequest{Op: proto.FSReleasedir, Handle: d.id})
 }
 
 // Fsyncdir implements fs.FileFsyncdirer.
 func (d *dirHandle) Fsyncdir(_ context.Context, flags uint32) syscall.Errno {
-	_, errno := d.n.fsys.call(&proto.FSRequest{Op: proto.FSFsync, Handle: d.id, Flags: flags & 1})
+	_, errno := d.n.call(&proto.FSRequest{Op: proto.FSFsync, Handle: d.id, Flags: flags & 1})
 	return errno
 }
 
@@ -348,10 +361,10 @@ func (m *mergedDir) load() {
 	}
 	m.gen = f.invalGen.Load()
 	if n.kind == kindAncestor {
-		m.unwatched = !m.loadRemote()
+		m.unwatched = !m.list(f.remote, n.rpath, false)
 	}
 	if n.local != nil {
-		m.loadLocal()
+		m.list(n.local.be, "/", true)
 	}
 	m.byName = make(map[string]int, len(m.entries))
 	for i, e := range m.entries {
@@ -360,37 +373,41 @@ func (m *mergedDir) load() {
 	m.loaded = true
 }
 
-// loadRemote appends the remote entries of an ancestor and reports whether
-// the server watches the directory. A failure leaves the synthetic entries
-// only: listing a synthesized directory must not fail.
-func (m *mergedDir) loadRemote() bool {
+// list appends the entries of directory dir of backend b: the local names
+// if local, else the remote entries that neither synthetic children nor
+// local names hide. It reports whether the server watches the directory.
+// A failure leaves the entries out: listing a synthesized directory must
+// not fail.
+func (m *mergedDir) list(b *backend, dir string, local bool) bool {
 	n, f := m.n, m.n.fsys
-	f.watchDir(n, n.rpath)
-	resp, errno := f.call(&proto.FSRequest{Op: proto.FSOpendir, Path: n.rpath})
+	f.watchDir(n, b, dir)
+	resp, errno := f.callOn(b, &proto.FSRequest{Op: proto.FSOpendir, Path: dir})
 	if errno != 0 {
+		f.log.Debug("telefs: list synthetic directory", "local", local, "errno", errno)
 		return false
 	}
 	h := resp.Handle
 	watched := !resp.Unwatched
-	defer func() { _, _ = f.call(&proto.FSRequest{Op: proto.FSReleasedir, Handle: h}) }()
+	defer func() { _, _ = f.callOn(b, &proto.FSRequest{Op: proto.FSReleasedir, Handle: h}) }()
 	var off int64
 	for len(m.entries) < maxMergedEntries {
-		resp, errno := f.call(&proto.FSRequest{Op: proto.FSReaddir, Handle: h, Offset: off, Size: readdirPage})
+		resp, errno := f.callOn(b, &proto.FSRequest{Op: proto.FSReaddir, Handle: h, Offset: off, Size: readdirPage})
 		if errno != 0 {
 			return false
 		}
 		watched = watched && !resp.Unwatched
 		for _, e := range resp.Entries {
 			off = e.Offset
-			if e.Name == "." || e.Name == ".." || n.synth[e.Name] != nil || n.local.owns(e.Name) {
+			if e.Name == "." || e.Name == ".." || n.local.owns(e.Name) != local || n.synth[e.Name] != nil {
 				continue
 			}
 			m.entries = append(m.entries, mergedEntry{
 				name:     e.Name,
 				mode:     e.Attr.Mode & syscall.S_IFMT,
-				ino:      f.mapIno(e.Attr.Dev, e.Attr.Ino),
+				ino:      b.ino(e.Attr.Dev, e.Attr.Ino),
 				attr:     e.Attr,
 				typeOnly: e.TypeOnly,
+				local:    local,
 			})
 		}
 		if resp.EOF || len(resp.Entries) == 0 {
@@ -398,34 +415,6 @@ func (m *mergedDir) loadRemote() bool {
 		}
 	}
 	return watched
-}
-
-// loadLocal appends the local names. Like the remote entries, a failure
-// only leaves them out.
-func (m *mergedDir) loadLocal() {
-	l := m.n.local
-	d, err := os.Open(l.root)
-	if err != nil {
-		m.n.fsys.log.Debug("telefs: list local names", "err", err)
-		return
-	}
-	defer func() { _ = d.Close() }() // read-only
-	// Unsorted names, and a stat of the matches only: the directory is
-	// the local HOME, with many other entries.
-	names, err := d.Readdirnames(-1)
-	if err != nil {
-		m.n.fsys.log.Debug("telefs: list local names", "err", err)
-	}
-	for _, name := range names {
-		if !l.owns(name) {
-			continue
-		}
-		var st unix.Stat_t
-		if unix.Fstatat(int(d.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
-			continue
-		}
-		m.entries = append(m.entries, mergedEntry{name: name, mode: st.Mode & syscall.S_IFMT, ino: localIno(&st), local: true})
-	}
 }
 
 // Readdirent implements fs.FileReaddirenter.
@@ -474,7 +463,7 @@ func (m *mergedDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 	case e.typeOnly:
 		return nil, errTypeOnly
 	}
-	ch := m.n.child(ctx, name, &e.attr, unwatched)
-	m.n.fsys.fillEntry(out, ch, &e.attr, gen, unwatched)
+	ch := m.n.child(ctx, m.n.be, name, &e.attr, unwatched)
+	m.n.fsys.fillEntry(out, m.n.be, ch, &e.attr, gen, unwatched)
 	return ch, 0
 }

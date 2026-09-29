@@ -5,10 +5,11 @@
 // for long TTLs.
 //
 // Paths in requests are absolute paths of the remote view. The service
-// resolves them under Config.Root, which is "/" in production; tests serve a
-// temporary directory instead. Root is a test facility, not a security
-// boundary: symlinks in intermediate components are followed as the kernel
-// follows them.
+// resolves them under Config.Root, which is "/" on the target host; tests
+// serve a temporary directory instead, and session main serves the local
+// HOME for the local names of telefs (docs/telefs.md "组成"). Root is not a
+// security boundary: symlinks in intermediate components are followed as
+// the kernel follows them.
 //
 // Every operation acts on the named node itself (lstat semantics): the last
 // path component is never followed, because the client resolves symlinks
@@ -44,18 +45,22 @@ var ErrClosed = errors.New("fssvc: service closed")
 
 // Config configures a Service.
 type Config struct {
-	// Root is the directory that the remote view's "/" maps to: "/" in
-	// production; tests serve a temporary directory as the root. It is a
-	// test facility, not a security boundary.
-	Root   string
-	Logger *slog.Logger
+	// Root is the directory that the remote view's "/" maps to: "/" on
+	// the target host. It is not a security boundary.
+	Root string
+	// NoWatch serves without watching directories: every response is
+	// marked Unwatched and the watch stream reports nothing. The local
+	// backend of telefs uses it, whose files the kernel never caches.
+	NoWatch bool
+	Logger  *slog.Logger
 }
 
 // Service executes FS requests and publishes directory changes. All methods
 // are safe for concurrent use.
 type Service struct {
-	root string
-	log  *slog.Logger
+	root    string
+	noWatch bool
+	log     *slog.Logger
 	// umask is the process umask, or -1 if it could not be read. The client
 	// kernel already applied the caller's umask to create modes, so the
 	// server must not apply its own on top (see fixMode).
@@ -79,6 +84,13 @@ type Service struct {
 	w  watchState
 
 	wg sync.WaitGroup // tracks the inotify reader
+
+	// inproc tracks the requests served for Open. They run under
+	// inprocCtx, which Close cancels: the service is long-lived and owns
+	// their lifetime, so it keeps the context.
+	inproc       sync.WaitGroup
+	inprocCtx    context.Context
+	inprocCancel context.CancelFunc
 }
 
 // New creates a Service and starts its inotify reader.
@@ -121,6 +133,7 @@ func newService(cfg Config) (*Service, error) {
 	}
 	s := &Service{
 		root:    cfg.Root,
+		noWatch: cfg.NoWatch,
 		log:     log,
 		umask:   processUmask(),
 		inotify: f,
@@ -129,6 +142,7 @@ func newService(cfg Config) (*Service, error) {
 	}
 	s.handles.init()
 	s.w.init(randomEpoch())
+	s.inprocCtx, s.inprocCancel = context.WithCancel(context.Background())
 	return s, nil
 }
 
@@ -177,6 +191,8 @@ func (s *Service) Close() error {
 		s.w.streamCancel()
 	}
 	s.mu.Unlock()
+	s.inprocCancel()
+	s.inproc.Wait()
 
 	err := s.inotify.Close()
 	s.wg.Wait()
@@ -208,6 +224,26 @@ func (s *Service) ServeRequest(ctx context.Context, c net.Conn) error {
 		return fmt.Errorf("fssvc: write %d response: %w", req.Op, err)
 	}
 	return nil
+}
+
+// Open serves one FS stream in this process, as if a client had opened it
+// over a session: session main serves the local names of telefs this way
+// (docs/telefs.md "组成"). Only proto.StreamFS is served; no stream header
+// is exchanged. It implements telefs.Opener.
+func (s *Service) Open(kind proto.StreamKind) (net.Conn, error) {
+	if kind != proto.StreamFS {
+		return nil, fmt.Errorf("fssvc: in-process %v stream not supported", kind)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.w.closed {
+		return nil, ErrClosed
+	}
+	client, server := net.Pipe()
+	s.inproc.Go(func() {
+		_ = s.ServeRequest(s.inprocCtx, server) // failures are the client's to see
+	})
+	return client, nil
 }
 
 // real maps a remote-view path to the path on this host.

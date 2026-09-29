@@ -114,6 +114,9 @@ func (w *watchState) init(epoch uint64) {
 // that names p, not the reader, Sync (the exec barrier) or requests for
 // other directories.
 func (s *Service) watch(p string) bool {
+	if s.noWatch {
+		return false
+	}
 	s.mu.Lock()
 	_, ok := s.w.byPath[p]
 	closed := s.w.closed

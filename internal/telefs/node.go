@@ -18,8 +18,9 @@ import (
 type nodeKind uint8
 
 const (
-	// kindRemote is an object on the target host, identified by its
-	// remote (dev, ino).
+	// kindRemote is an object of a backend, identified by its (dev, ino)
+	// there: on the target host, or in the local HOME for local names
+	// (node.be).
 	kindRemote nodeKind = iota
 	// kindAncestor is a synthesized directory above placeholders (and the
 	// root): it shows the remote directory at rpath merged with its
@@ -36,6 +37,9 @@ const (
 type node struct {
 	fs.Inode
 	fsys *FS
+	// be is the backend the node's own requests go to: the remote one for
+	// synthetic nodes. Fixed at creation.
+	be   *backend
 	kind nodeKind
 
 	// Synthetic nodes only. vpath is the path in the view, rpath the
@@ -46,11 +50,11 @@ type node struct {
 	rpath    string
 	synth    map[string]*node
 	synthIno uint64
-	// local, if set, serves some entry names from a local directory
+	// local, if set, serves some entry names from another backend
 	// (LocalNames).
 	local *localDir
 
-	// Remote nodes only: the remote identity, fixed at creation.
+	// Remote nodes only: the identity in the backend, fixed at creation.
 	dev, ino uint64
 	// shortTTL is set when the server could not watch the directory the
 	// node was last looked up in.
@@ -61,9 +65,14 @@ type node struct {
 	watchPaths map[string]struct{}
 }
 
-// id returns the remote identity of remote node n.
+// id returns the identity of remote node n in its backend.
 func (n *node) id() proto.NodeID {
 	return proto.NodeID{Dev: n.dev, Ino: n.ino}
+}
+
+// call sends req to n's backend.
+func (n *node) call(req *proto.FSRequest) (*proto.FSResponse, syscall.Errno) {
+	return n.fsys.callOn(n.be, req)
 }
 
 // callNode sends req, which acts on n itself.
@@ -78,9 +87,9 @@ func (n *node) id() proto.NodeID {
 // object now; a path-based system call then repeats its lookup once.
 func (n *node) callNode(req *proto.FSRequest, byHandle bool) (*proto.FSResponse, syscall.Errno) {
 	if byHandle && n.kind == kindRemote {
-		if h := n.fsys.open.any(n.id()); h != 0 {
+		if h := n.fsys.open.any(n.be, n.id()); h != 0 {
 			req.Handle = h
-			resp, errno := n.fsys.call(req)
+			resp, errno := n.call(req)
 			if errno != syscall.EBADF {
 				return resp, errno
 			}
@@ -97,7 +106,7 @@ func (n *node) callNode(req *proto.FSRequest, byHandle bool) (*proto.FSResponse,
 		id := n.id()
 		req.Node = &id
 	}
-	return n.fsys.call(req)
+	return n.call(req)
 }
 
 // Interfaces implemented by node.
@@ -125,8 +134,9 @@ var (
 	_ fs.NodeOnForgetter    = (*node)(nil)
 )
 
-// remotePath returns the remote path of n, or false if n is no longer in
-// the tree (unlinked while cached).
+// remotePath returns the path of n in its backend, or false if n is no
+// longer in the tree (unlinked while cached). The local names of a
+// LocalNames directory are entries of their backend's root.
 func (n *node) remotePath() (string, bool) {
 	if n.kind != kindRemote {
 		return n.rpath, true
@@ -144,7 +154,11 @@ func (n *node) remotePath() (string, bool) {
 			return "", false
 		}
 		if pn.kind != kindRemote {
-			names = append(names, pn.rpath)
+			base := pn.rpath
+			if cur.be != pn.be {
+				base = "/"
+			}
+			names = append(names, base)
 			slices.Reverse(names)
 			return path.Join(names...), true
 		}
@@ -181,6 +195,16 @@ func (n *node) opPath() (string, syscall.Errno) {
 	return p, 0
 }
 
+// entryDir returns the backend and the directory in it where entry name of
+// n is created, removed and looked up, or an errno if n has none.
+func (n *node) entryDir(name string) (*backend, string, syscall.Errno) {
+	if n.local.owns(name) {
+		return n.local.be, "/", 0
+	}
+	p, errno := n.dirPath()
+	return n.be, p, errno
+}
+
 // isProtected reports whether entry name of n is a placeholder or an
 // ancestor of one. Such entries never get entry invalidations and cannot
 // be removed or replaced (docs/filesystem.md "已知陷阱").
@@ -188,25 +212,25 @@ func (n *node) isProtected(name string) bool {
 	return n.synth[name] != nil
 }
 
-// child returns the inode for entry name with remote attributes a, reusing
-// the cached one when it is the same remote object.
-func (n *node) child(ctx context.Context, name string, a *proto.Attr, unwatched bool) *fs.Inode {
-	f := n.fsys
-	id := fs.StableAttr{Mode: a.Mode & syscall.S_IFMT, Ino: f.mapIno(a.Dev, a.Ino), Gen: 1}
+// child returns the inode for entry name, an object of backend b with
+// attributes a, reusing the cached one when it is the same object.
+func (n *node) child(ctx context.Context, b *backend, name string, a *proto.Attr, unwatched bool) *fs.Inode {
+	id := fs.StableAttr{Mode: a.Mode & syscall.S_IFMT, Ino: b.ino(a.Dev, a.Ino), Gen: 1}
 	if ex := n.GetChild(name); ex != nil {
-		if en, ok := ex.Operations().(*node); ok && en.kind == kindRemote && en.dev == a.Dev && en.ino == a.Ino && ex.StableAttr() == id {
+		if en, ok := ex.Operations().(*node); ok && en.kind == kindRemote && en.be == b && en.dev == a.Dev && en.ino == a.Ino && ex.StableAttr() == id {
 			en.shortTTL.Store(unwatched)
 			return ex
 		}
 	}
-	c := &node{fsys: f, kind: kindRemote, dev: a.Dev, ino: a.Ino}
+	c := &node{fsys: n.fsys, be: b, kind: kindRemote, dev: a.Dev, ino: a.Ino}
 	c.shortTTL.Store(unwatched)
 	return n.NewInode(ctx, c, id)
 }
 
-// fillEntry fills the reply for child with remote attributes a.
-func (f *FS) fillEntry(out *fuse.EntryOut, child *fs.Inode, a *proto.Attr, gen uint64, unwatched bool) {
-	entry, attr := f.ttls(gen, unwatched)
+// fillEntry fills the reply for child, an object of backend b with
+// attributes a.
+func (f *FS) fillEntry(out *fuse.EntryOut, b *backend, child *fs.Inode, a *proto.Attr, gen uint64, unwatched bool) {
+	entry, attr := f.ttls(b, gen, unwatched)
 	out.Attr = f.fuseAttr(a, child.StableAttr().Ino)
 	out.SetEntryTimeout(entry)
 	out.SetAttrTimeout(attr)
@@ -219,34 +243,31 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 		f.synthEntry(c, out)
 		return &c.Inode, 0
 	}
-	if n.local.owns(name) {
-		return n.localAt().lookup(ctx, name, out)
-	}
 	if n.kind == kindPlaceholderDir {
 		out.SetEntryTimeout(shortTTL)
 		return nil, syscall.ENOENT
 	}
-	dir, errno := n.dirPath()
+	b, dir, errno := n.entryDir(name)
 	if errno != 0 {
 		return nil, errno
 	}
 	gen := f.invalGen.Load()
-	f.watchDir(n, dir)
-	resp, errno := f.call(&proto.FSRequest{Op: proto.FSLookup, Path: dir, Name: name})
+	f.watchDir(n, b, dir)
+	resp, errno := f.callOn(b, &proto.FSRequest{Op: proto.FSLookup, Path: dir, Name: name})
 	if errno == syscall.ENOENT {
 		// Negative entries under synthetic directories are kept short:
 		// a full invalidation cannot reach them, because it never
 		// invalidates the synthetic directory's own dentry.
 		unwatched := n.kind != kindRemote || (resp != nil && resp.Unwatched)
-		entry, _ := f.ttls(gen, unwatched)
+		entry, _ := f.ttls(b, gen, unwatched)
 		out.SetEntryTimeout(entry)
 		return nil, syscall.ENOENT
 	}
 	if errno != 0 {
 		return nil, errno
 	}
-	ch := n.child(ctx, name, resp.Attr, resp.Unwatched)
-	f.fillEntry(out, ch, resp.Attr, gen, resp.Unwatched)
+	ch := n.child(ctx, b, name, resp.Attr, resp.Unwatched)
+	f.fillEntry(out, b, ch, resp.Attr, gen, resp.Unwatched)
 	return ch, 0
 }
 
@@ -266,7 +287,7 @@ func (n *node) Getattr(_ context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 	)
 	if h, ok := fh.(*fileHandle); ok {
 		req.Handle = h.id
-		resp, errno = f.call(req)
+		resp, errno = n.call(req)
 	} else {
 		// fstat(2) passes no file handle either.
 		resp, errno = n.callNode(req, true)
@@ -280,7 +301,7 @@ func (n *node) Getattr(_ context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 		// revalidation, which replaces the stale dentry.
 		return syscall.ESTALE
 	}
-	_, attr := f.ttls(gen, n.shortTTL.Load())
+	_, attr := f.ttls(n.be, gen, n.shortTTL.Load())
 	out.Attr = f.fuseAttr(resp.Attr, n.StableAttr().Ino)
 	out.SetTimeout(attr)
 	return 0
@@ -312,7 +333,7 @@ func (n *node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	)
 	if h, ok := fh.(*fileHandle); ok {
 		req.Handle = h.id
-		resp, errno = f.call(req)
+		resp, errno = n.call(req)
 	} else {
 		// A size change without a file handle is truncate(2) of a path,
 		// which an open handle of the node may not allow (read-only).
@@ -328,7 +349,7 @@ func (n *node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		out.SetTimeout(shortTTL)
 		return 0
 	}
-	_, attr := f.ttls(gen, n.shortTTL.Load())
+	_, attr := f.ttls(n.be, gen, n.shortTTL.Load())
 	out.Attr = f.fuseAttr(resp.Attr, n.StableAttr().Ino)
 	out.SetTimeout(attr)
 	return 0
@@ -366,7 +387,7 @@ func setAttrOf(in *fuse.SetAttrIn) *proto.SetAttr {
 }
 
 // Access implements fs.NodeAccesser: permissions are the target user's on
-// the target host.
+// the target host (the local user's for local names).
 func (n *node) Access(_ context.Context, mask uint32) syscall.Errno {
 	if n.isPlaceholder() {
 		return 0
@@ -409,135 +430,118 @@ func (n *node) Open(_ context.Context, flags uint32) (fs.FileHandle, uint32, sys
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	resp, errno := n.fsys.call(&proto.FSRequest{Op: proto.FSOpen, Path: p, Flags: flags})
+	resp, errno := n.call(&proto.FSRequest{Op: proto.FSOpen, Path: p, Flags: flags})
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	return n.fsys.newFileHandle(n.id(), resp.Handle), 0, 0
+	return n.fsys.newFileHandle(n.be, n.id(), resp.Handle), 0, 0
 }
 
-// newEntry checks that name may be created in n and returns the remote
-// directory to create it in.
-func (n *node) newEntry(name string) (string, syscall.Errno) {
+// newEntry checks that name may be created in n and returns the backend
+// and the directory in it to create it in.
+func (n *node) newEntry(name string) (*backend, string, syscall.Errno) {
 	if n.isProtected(name) {
-		return "", syscall.EEXIST
+		return nil, "", syscall.EEXIST
 	}
-	return n.dirPath()
+	return n.entryDir(name)
 }
 
-// created finishes a request that created entry name.
-func (n *node) created(ctx context.Context, name string, resp *proto.FSResponse, gen uint64, out *fuse.EntryOut) *fs.Inode {
-	ch := n.child(ctx, name, resp.Attr, resp.Unwatched)
-	n.fsys.fillEntry(out, ch, resp.Attr, gen, resp.Unwatched)
+// created finishes a request to backend b that created entry name.
+func (n *node) created(ctx context.Context, b *backend, name string, resp *proto.FSResponse, gen uint64, out *fuse.EntryOut) *fs.Inode {
+	ch := n.child(ctx, b, name, resp.Attr, resp.Unwatched)
+	n.fsys.fillEntry(out, b, ch, resp.Attr, gen, resp.Unwatched)
 	return ch
 }
 
 // Create implements fs.NodeCreater.
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	f := n.fsys
-	if n.local.owns(name) {
-		return n.localAt().create(ctx, name, flags, mode, out)
-	}
-	dir, errno := n.newEntry(name)
+	b, dir, errno := n.newEntry(name)
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
 	gen := f.invalGen.Load()
-	f.watchDir(n, dir)
-	resp, errno := f.call(&proto.FSRequest{Op: proto.FSCreate, Path: dir, Name: name, Flags: flags, Mode: mode})
+	f.watchDir(n, b, dir)
+	resp, errno := f.callOn(b, &proto.FSRequest{Op: proto.FSCreate, Path: dir, Name: name, Flags: flags, Mode: mode})
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
-	fh := f.newFileHandle(proto.NodeID{Dev: resp.Attr.Dev, Ino: resp.Attr.Ino}, resp.Handle)
-	return n.created(ctx, name, resp, gen, out), fh, 0, 0
+	fh := f.newFileHandle(b, proto.NodeID{Dev: resp.Attr.Dev, Ino: resp.Attr.Ino}, resp.Handle)
+	return n.created(ctx, b, name, resp, gen, out), fh, 0, 0
 }
 
 // mkentry sends a request that creates entry name in n.
 func (n *node) mkentry(ctx context.Context, req *proto.FSRequest, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	f := n.fsys
-	dir, errno := n.newEntry(req.Name)
+	b, dir, errno := n.newEntry(req.Name)
 	if errno != 0 {
 		return nil, errno
 	}
 	req.Path = dir
 	gen := f.invalGen.Load()
-	f.watchDir(n, dir)
-	resp, errno := f.call(req)
+	f.watchDir(n, b, dir)
+	resp, errno := f.callOn(b, req)
 	if errno != 0 {
 		return nil, errno
 	}
-	return n.created(ctx, req.Name, resp, gen, out), 0
+	return n.created(ctx, b, req.Name, resp, gen, out), 0
 }
 
 // Mkdir implements fs.NodeMkdirer.
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if n.local.owns(name) {
-		return n.localAt().mkdir(ctx, name, mode, out)
-	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSMkdir, Name: name, Mode: mode}, out)
 }
 
 // Mknod implements fs.NodeMknoder.
 func (n *node) Mknod(ctx context.Context, name string, mode, dev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if n.local.owns(name) {
-		return nil, syscall.EPERM // Claude creates only files and directories there
-	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSMknod, Name: name, Mode: mode, Rdev: remoteRdev(dev)}, out)
 }
 
 // Symlink implements fs.NodeSymlinker.
 func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	if n.local.owns(name) {
-		return n.localAt().symlink(ctx, target, name, out)
-	}
 	return n.mkentry(ctx, &proto.FSRequest{Op: proto.FSSymlink, Name: name, Target: target}, out)
 }
 
-// Link implements fs.NodeLinker.
+// Link implements fs.NodeLinker. A link between backends is one between
+// file systems (EXDEV).
 func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	f := n.fsys
-	if _, isLocal := target.(*localNode); isLocal || n.local.owns(name) {
-		return nil, syscall.EXDEV
-	}
 	tn, ok := target.(*node)
 	if !ok || tn.kind != kindRemote {
 		return nil, syscall.EPERM
+	}
+	b, dir, errno := n.newEntry(name)
+	if errno != 0 {
+		return nil, errno
+	}
+	if b != tn.be {
+		return nil, syscall.EXDEV
 	}
 	tp, errno := tn.opPath()
 	if errno != 0 {
 		return nil, errno
 	}
-	dir, errno := n.newEntry(name)
-	if errno != 0 {
-		return nil, errno
-	}
 	gen := f.invalGen.Load()
-	f.watchDir(n, dir)
-	resp, errno := f.call(&proto.FSRequest{Op: proto.FSLink, Path: tp, Path2: dir, Name2: name})
+	f.watchDir(n, b, dir)
+	resp, errno := f.callOn(b, &proto.FSRequest{Op: proto.FSLink, Path: tp, Path2: dir, Name2: name})
 	if errno != 0 {
 		return nil, errno
 	}
-	return n.created(ctx, name, resp, gen, out), 0
+	return n.created(ctx, b, name, resp, gen, out), 0
 }
 
 // remove sends FSUnlink or FSRmdir for entry name of n.
 func (n *node) remove(op proto.FSOp, name string) syscall.Errno {
 	f := n.fsys
-	if n.local.owns(name) {
-		if op == proto.FSRmdir {
-			return n.localAt().rmdir(name)
-		}
-		return n.localAt().unlink(name)
-	}
 	if n.isProtected(name) {
 		return syscall.EBUSY
 	}
-	dir, errno := n.dirPath()
+	b, dir, errno := n.entryDir(name)
 	if errno != 0 {
 		return errno
 	}
-	f.watchDir(n, dir)
-	_, errno = f.call(&proto.FSRequest{Op: op, Path: dir, Name: name})
+	f.watchDir(n, b, dir)
+	_, errno = f.callOn(b, &proto.FSRequest{Op: op, Path: dir, Name: name})
 	return errno
 }
 
@@ -551,30 +555,31 @@ func (n *node) Rmdir(_ context.Context, name string) syscall.Errno {
 	return n.remove(proto.FSRmdir, name)
 }
 
-// Rename implements fs.NodeRenamer, including renameat2 flags.
+// Rename implements fs.NodeRenamer, including renameat2 flags. A rename
+// between backends is one between file systems (EXDEV).
 func (n *node) Rename(_ context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	f := n.fsys
-	if n.local.owns(name) {
-		return n.localAt().rename(name, newParent, newName, flags)
-	}
 	np, ok := newParent.(*node)
-	if !ok || np.local.owns(newName) {
+	if !ok {
 		return syscall.EXDEV
 	}
 	if n.isProtected(name) || np.isProtected(newName) {
 		return syscall.EBUSY
 	}
-	d1, errno := n.dirPath()
+	b1, d1, errno := n.entryDir(name)
 	if errno != 0 {
 		return errno
 	}
-	d2, errno := np.dirPath()
+	b2, d2, errno := np.entryDir(newName)
 	if errno != 0 {
 		return errno
 	}
-	f.watchDir(n, d1)
-	f.watchDir(np, d2)
-	_, errno = f.call(&proto.FSRequest{Op: proto.FSRename, Path: d1, Name: name, Path2: d2, Name2: newName, Flags: flags})
+	if b1 != b2 {
+		return syscall.EXDEV
+	}
+	f.watchDir(n, b1, d1)
+	f.watchDir(np, b2, d2)
+	_, errno = f.callOn(b1, &proto.FSRequest{Op: proto.FSRename, Path: d1, Name: name, Path2: d2, Name2: newName, Flags: flags})
 	return errno
 }
 
@@ -588,12 +593,12 @@ func (n *node) OpendirHandle(_ context.Context, _ uint32) (fs.FileHandle, uint32
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	f.watchDir(n, p)
-	resp, errno := f.call(&proto.FSRequest{Op: proto.FSOpendir, Path: p})
+	f.watchDir(n, n.be, p)
+	resp, errno := n.call(&proto.FSRequest{Op: proto.FSOpendir, Path: p})
 	if errno != 0 {
 		return nil, 0, errno
 	}
-	f.open.add(n.id(), resp.Handle)
+	f.open.add(n.be, n.id(), resp.Handle)
 	return &dirHandle{n: n, path: p, id: resp.Handle, last: -1}, 0, 0
 }
 
@@ -603,7 +608,7 @@ func (n *node) Statfs(_ context.Context, out *fuse.StatfsOut) syscall.Errno {
 	if errno != 0 {
 		p = "/"
 	}
-	resp, errno := n.fsys.call(&proto.FSRequest{Op: proto.FSStatfs, Path: p})
+	resp, errno := n.call(&proto.FSRequest{Op: proto.FSStatfs, Path: p})
 	if errno != 0 {
 		return errno
 	}

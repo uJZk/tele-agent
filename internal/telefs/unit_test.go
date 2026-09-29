@@ -9,8 +9,8 @@ import (
 	"github.com/ujzk/tele-agent/internal/proto"
 )
 
-func TestMapIno(t *testing.T) {
-	f := &FS{rootDev: unix.Mkdev(8, 1)}
+func TestBackendIno(t *testing.T) {
+	f := &backend{rootDev: unix.Mkdev(8, 1)}
 	cases := []struct {
 		name     string
 		dev, ino uint64
@@ -21,7 +21,7 @@ func TestMapIno(t *testing.T) {
 	}
 	seen := map[uint64]string{}
 	for _, tc := range cases {
-		got := f.mapIno(tc.dev, tc.ino)
+		got := f.ino(tc.dev, tc.ino)
 		if got&synthIno != 0 {
 			t.Errorf("%s: %#x collides with the synthetic range", tc.name, got)
 		}
@@ -30,8 +30,16 @@ func TestMapIno(t *testing.T) {
 		}
 		seen[got] = tc.name
 	}
-	if got := f.mapIno(unix.Mkdev(8, 1), 12345); got != 12345 {
+	if got := f.ino(unix.Mkdev(8, 1), 12345); got != 12345 {
 		t.Errorf("root device inode mapped to %d", got)
+	}
+	// Local numbers are apart from remote and synthetic ones.
+	local := &backend{local: true}
+	for _, tc := range cases {
+		got := local.ino(tc.dev, tc.ino)
+		if got&localTag != localTag {
+			t.Errorf("local %s: %#x lacks the local tag", tc.name, got)
+		}
 	}
 }
 

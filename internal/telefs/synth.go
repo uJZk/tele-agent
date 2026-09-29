@@ -47,7 +47,7 @@ func buildTree(ps []Placeholder, ls []LocalNames) (*synthSpec, error) {
 		if cur.local != nil {
 			return nil, fmt.Errorf("telefs: local names: %s listed twice", l.Dir)
 		}
-		cur.local = &localDir{prefix: l.Prefix, root: l.Local}
+		cur.local = &localDir{prefix: l.Prefix, be: &backend{opener: l.Opener, local: true}}
 	}
 	explicit := map[string]bool{}
 	for _, p := range ps {
@@ -114,7 +114,7 @@ func (f *FS) newSynthTree(spec *synthSpec) *node {
 	next := uint64(synthIno) + 1
 	var mk func(s *synthSpec, vpath string) *node
 	mk = func(s *synthSpec, vpath string) *node {
-		n := &node{fsys: f, kind: s.kind, vpath: vpath, rpath: vpath, synth: map[string]*node{}, local: s.local}
+		n := &node{fsys: f, be: f.remote, kind: s.kind, vpath: vpath, rpath: vpath, synth: map[string]*node{}, local: s.local}
 		for _, name := range slices.Sorted(maps.Keys(s.children)) {
 			c := mk(s.children[name], path.Join(vpath, name))
 			c.synthIno = next
@@ -218,7 +218,7 @@ func (f *FS) synthAttrFrom(n *node, a *proto.Attr) fuse.Attr {
 func (f *FS) synthEntry(c *node, out *fuse.EntryOut) {
 	gen := f.invalGen.Load()
 	out.Attr = f.synthAttr(c)
-	entry, attr := f.ttls(gen, false)
+	entry, attr := f.ttls(f.remote, gen, false)
 	if c.kind == kindAncestor {
 		// Nobody watches the remote directory that supplies these
 		// attributes (looking up a synthetic name sends no request).

@@ -695,3 +695,47 @@ func FuzzServeRequest(f *testing.F) {
 		}
 	})
 }
+
+// TestInProcessNoWatch serves requests through Open, as session main does
+// for the local names of telefs: nothing is watched, and Close ends the
+// service for new streams.
+func TestInProcessNoWatch(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Config{Root: dir, NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Open(proto.StreamWatch); err == nil {
+		t.Error("Open accepted a watch stream")
+	}
+	c, err := s.Open(proto.StreamFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proto.WriteFrame(c, &proto.FSRequest{Op: proto.FSLookup, Path: "/", Name: "f"}); err != nil {
+		t.Fatal(err)
+	}
+	var resp proto.FSResponse
+	if err := proto.ReadFrame(c, &resp, proto.MaxDataFrame); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Close()
+	if resp.Errno != 0 || resp.Attr == nil || resp.Attr.Size != 1 || !resp.Unwatched {
+		t.Fatalf("lookup = %+v, want the file, unwatched", resp)
+	}
+	// A stream the client never finishes does not keep Close waiting.
+	idle, err := s.Open(proto.StreamFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = idle.Close() }()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Open(proto.StreamFS); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Open after Close = %v, want ErrClosed", err)
+	}
+}
