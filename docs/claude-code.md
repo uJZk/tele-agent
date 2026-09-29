@@ -46,6 +46,7 @@ Claude 自己也调用 `rg`：启动时先执行 `rg --version`，并用 `rg --f
 ## 代理与 CA
 
 - API 请求遵循 `HTTPS_PROXY`：经 CONNECT 隧道到达 API 主机，Claude 自己不解析 API 的主机名。
+- 代理 URL 中的用户名和密码，Claude 作为 Basic `Proxy-Authorization` 发送，所以 tele 把 CONNECT 代理的随机密码放在 `HTTPS_PROXY` 的 userinfo 中。
 - `SSL_CERT_FILE` 或 `NODE_EXTRA_CA_CERTS` 任意一个指向的 CA 都会被信任。tele 两个都设置，指向同一个 bundle。
 - 证书不受信任时，Claude 报 API 错误后退出，不会绕过代理直连。
 - WebFetch 的域名预检（向 `api.anthropic.com` 询问域名是否可以抓取）和抓取本身都经过代理；抓回的页面交给模型摘要时走 API。

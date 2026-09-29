@@ -79,3 +79,11 @@ func claudeEnv(s claudeEnvSpec) []string {
 	)
 	return append(env, s.Switch...)
 }
+
+// proxyURL is the URL of the local CONNECT proxy at addr for Claude: the
+// password travels in the userinfo, which Claude sends as Basic
+// Proxy-Authorization (docs/security.md "信任边界"). token must be
+// URL-safe, as rand.Text is.
+func proxyURL(addr, token string) string {
+	return "http://tele:" + token + "@" + addr
+}

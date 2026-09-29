@@ -3,13 +3,16 @@ package launcher
 import (
 	"context"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/ujzk/tele-agent/internal/connectproxy"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/relay"
 	"github.com/ujzk/tele-agent/internal/rexec"
@@ -171,4 +174,77 @@ func TestExecChainWithClaude(t *testing.T) {
 func readLog(sess string) string {
 	b, _ := os.ReadFile(filepath.Join(sess, shimsrv.LogFile))
 	return string(b)
+}
+
+// TestClaudeThroughProxy runs claude against tele's own CONNECT proxy with
+// the environment tele builds: Claude authenticates with the password in
+// HTTPS_PROXY, and a wrong password is refused.
+func TestClaudeThroughProxy(t *testing.T) {
+	claude := claudetest.Require(t)
+	const host = "api.tele-compat.invalid"
+	for _, tc := range []struct {
+		name    string
+		offered string // the password Claude is given
+		ok      bool
+	}{
+		{"authenticated", "secret", true},
+		{"wrong password", "guess", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := claudetest.NewTLSAPI(t, host, claudetest.Say("through tele's proxy"))
+			var lc net.ListenConfig
+			ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var dialed []string
+			var mu sync.Mutex
+			proxy := &connectproxy.Server{
+				Token: "secret",
+				// The API name does not resolve: send it to the stand-in.
+				Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					mu.Lock()
+					dialed = append(dialed, addr)
+					mu.Unlock()
+					var d net.Dialer
+					return d.DialContext(ctx, network, api.Addr())
+				},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_ = proxy.Serve(ctx, ln)
+			}()
+			defer func() {
+				cancel()
+				<-done
+			}()
+			env := claudeEnv(claudeEnvSpec{
+				UserEnv:  []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "DISABLE_AUTOUPDATER=1"},
+				SessDir:  "/.tele/0123456789abcdef",
+				Home:     t.TempDir(),
+				User:     "bob",
+				ProxyURL: proxyURL(ln.Addr().String(), tc.offered),
+			})
+			// Without a session directory, point the CA variables at the
+			// stand-in's certificate directly.
+			env = append(env, "SSL_CERT_FILE="+api.CAFile(), "NODE_EXTRA_CA_CERTS="+api.CAFile(), "PATH=/usr/bin:/bin")
+			r := claudetest.Run(t, claude, api, claudetest.Options{Prompt: "hi", Env: env, Args: []string{"--max-turns", "1"}})
+			mu.Lock()
+			defer mu.Unlock()
+			if tc.ok {
+				if r.Err != nil || r.Output.Result != "through tele's proxy" {
+					t.Fatalf("claude: %v, result %q\nstderr: %s", r.Err, r.Output.Result, r.Stderr)
+				}
+				if !slices.Contains(dialed, host+":443") {
+					t.Errorf("proxy dialed %q, want %s:443", dialed, host)
+				}
+				return
+			}
+			if r.Err == nil || len(dialed) != 0 {
+				t.Fatalf("claude with a wrong proxy password: %v, proxy dialed %q; want a refusal before any dial", r.Err, dialed)
+			}
+		})
+	}
 }
