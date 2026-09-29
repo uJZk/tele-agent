@@ -16,7 +16,7 @@ all: build
 
 teleswitch: $(TELESWITCH_SO)
 
-$(TELESWITCH_SO): internal/teleswitch/teleswitch.c
+$(TELESWITCH_SO): internal/teleswitch/csrc/teleswitch.c
 	$(CC) $(TELESWITCH_CFLAGS) -o $@ $<
 
 build: teleswitch

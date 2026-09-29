@@ -14,6 +14,7 @@
 package helperproc
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,6 +47,23 @@ func Dispatch() {
 		os.Exit(2)
 	}
 	os.Exit(fn(os.Args[1:]))
+}
+
+// Exec returns a command that runs helper name with args in a new process
+// of the current executable, for helpers that start helpers themselves.
+// Unlike Command it needs no test; the caller owns the process.
+func Exec(ctx context.Context, name string, args ...string) (*exec.Cmd, error) {
+	if _, ok := helpers[name]; !ok {
+		return nil, fmt.Errorf("helperproc: helper %q not registered", name)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("helperproc: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Env = append(os.Environ(), envName+"="+name)
+	cmd.Stderr = os.Stderr
+	return cmd, nil
 }
 
 // Command returns a command that runs helper name with args in a new
