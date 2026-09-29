@@ -25,6 +25,7 @@ exec 服务本质上就是远程代码执行的入口：
 
 - shim 连接的是**抽象** unix socket，它没有文件权限保护，同一个网络命名空间中的任何进程都能连接。所以既要用 `SO_PEERCRED` 校验对端 uid，也要校验会话 token。token 存放在会话目录中权限为 0600 的文件里，会话目录只在这个会话的远端视图和会话主进程中可见。
 - 校验是**双向**的：抽象 socket 的名字没有属主，正在使用的 sid 又能从所有人可读的 `/proc/net/unix` 中看到。会话主进程退出后，另一个本地用户可以绑定同一个 `@tele-<sid>`，从而收到 shim 发来的 token 和 Claude 的 stdin、stdout、stderr，还能伪造退出状态。所以 shim 在发送任何内容之前，先用 `SO_PEERCRED` 确认监听方的 uid 与自己相同。
+- 系统限制非特权 userns 时（Ubuntu 的 AppArmor），`tele doctor` 安装的 profile 只按 tele 可执行文件的确切路径放行，不关闭全局限制（见[预检与修复策略](cli.md#预检与修复策略)）。
 - 会话主进程在 userns 中持有 `CAP_SYS_ADMIN`，但这只在它自己创建的命名空间中有效。Claude 在切换视图后清空了全部 capability（见[命名空间的构建](filesystem.md#命名空间的构建)）。
 - 视图切换失败时 Claude 必须立即退出，绝不能在本地视图中继续运行（见 [teleswitch](filesystem.md#teleswitch)）。
 

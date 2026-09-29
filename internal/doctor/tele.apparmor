@@ -1,0 +1,17 @@
+# AppArmor profile for tele (docs/cli.md "预检与修复策略").
+#
+# Ubuntu restricts unprivileged user namespaces with AppArmor
+# (kernel.apparmor_restrict_unprivileged_userns). tele builds its view of
+# the remote host in one, so this profile allows them for the tele
+# executable alone instead of lifting the restriction for every program.
+# `tele doctor` installs it as /etc/apparmor.d/tele with @TELE@ replaced by
+# the absolute path of the executable.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile tele "@TELE@" flags=(unconfined) {
+  userns,
+
+  include if exists <local/tele>
+}

@@ -22,11 +22,23 @@ import (
 
 // Usage is the synopsis of "tele server".
 const Usage = `usage: tele server run [--config <file>] [--listen <addr>] [--debug]
-       tele server install --pair <tele1:…> [--listen <addr>] [--yes | --check | --print-commands]
+       tele server install [--pair <tele1:…> | --pair-file <file>] [--listen <addr>] [--yes | --check | --print-commands]
        tele server uninstall [--yes]`
 
+// Streams are the process's standard streams; tests replace them.
+type Streams struct {
+	// In is the standard input, used when it is a terminal.
+	In *os.File
+	// Terminal, if set, is where consent is asked and answered; nil when
+	// the standard input is not a terminal.
+	Terminal io.ReadWriter
+	Out, Err io.Writer
+}
+
 // Main runs "tele server <args>" and returns the exit status.
-func Main(args []string, stdout, stderr io.Writer) int {
+func Main(args []string, st Streams) int {
+	stdout, stderr := st.Out, st.Err
+	ctx := context.Background()
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, Usage)
 		return 2
@@ -36,9 +48,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	case "run":
 		err = run(args[1:], stderr)
 	case "install":
-		err = install(args[1:], stdout, stderr)
+		err = install(ctx, args[1:], st)
 	case "uninstall":
-		err = uninstall(args[1:], stdout, stderr)
+		err = uninstall(ctx, args[1:], st)
 	case "help", "-h", "--help":
 		fmt.Fprintln(stdout, Usage)
 		return 0

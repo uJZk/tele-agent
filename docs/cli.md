@@ -31,8 +31,8 @@ tele dev -p "…"           # 同上
 | 命令 | 作用 |
 |---|---|
 | `tele host add <别名> …` / `tele host confirm` / `tele host ls` / `tele host rm` | 登记主机、配对，查看状态（连通性、RTT、时钟偏差、操作系统信息） |
-| `tele doctor [别名]` | 本地检查，指定别名时再检查到该主机的连通性（见[预检与修复策略](#预检与修复策略)） |
-| `tele server install` / `run` / `uninstall` | 远端服务。`run` 在前台运行服务，日志写到 stderr（由 systemd 送进 journal），收到 SIGTERM 或 SIGINT 后结束所有会话再退出；`--listen` 覆盖配置中的监听地址 |
+| `tele doctor [--claude <路径>] [别名]` | 本地检查，指定别名时再检查到该主机的连通性和时钟偏差（见[预检与修复策略](#预检与修复策略)） |
+| `tele server install` / `run` / `uninstall` | 远端服务。`install` 配对并安装（见[安装与配对](#安装与配对)）；`run` 在前台运行服务，日志写到 stderr（由 systemd 送进 journal），收到 SIGTERM 或 SIGINT 后结束所有会话再退出；`--listen` 覆盖配置中的监听地址；`uninstall` 按安装清单回滚，并删除配置以吊销 PSK |
 | `tele version` | 打印版本：发布版本由构建时注入，开发构建显示 Go 工具链记录的 VCS 修订 |
 
 所有子命令名都是保留字，不能用作主机别名。
@@ -73,7 +73,9 @@ tele host confirm myhost 'tele1r:…'
 
 **`tele host add --ssh [user@]host`** 一步完成配对，远端不需要预先安装 tele：检查远端的架构与本地 tele 相同（不同时报错，改为手动安装），经 SSH 把本地的 tele 上传到 `~/.local/bin/tele`，把配对串经 SSH 的标准输入写入远端一个权限为 0600 的文件（不出现在任何命令行上），执行 `tele server install --pair-file`（本地有终端时分配终端，以便回答预检中需要同意的项目），从输出中取出回执并自动确认。省略 `--endpoint` 时，endpoint 是 SSH 目标的主机名加默认端口 8443。
 
-远端服务默认以 `systemd --user` 运行。
+远端服务默认以 `systemd --user` 单元 `tele-server.service` 运行，`ExecStart` 是 `~/.local/bin/tele server run`。从别处运行 `tele server install`（例如解压目录）时，它先把自己复制到 `~/.local/bin/tele`，免得单元指向一个随时会被删除的文件；只有当前用户无权写入的位置（例如发行版的软件包）才直接使用原路径。
+
+对已经配置过的服务端不带配对串运行 `tele server install`（终端中直接回车），保留现有的 PSK，只重新预检和修复。回执在配置写入后打印，即使还有未通过的检查项：配对本身已经完成，服务端的问题修好后再 `tele host confirm` 也可以。
 
 ## 配置与状态文件
 
@@ -81,7 +83,10 @@ tele host confirm myhost 'tele1r:…'
 |---|---|
 | `~/.config/tele/hosts/<别名>.json`（本地） | 主机别名的 endpoint 与凭据（0600）：SS2022 endpoint（`host:port`）用 PSK，`unix:<路径>` endpoint 用 token。`alternates` 列出同一服务端的其他 `host:port`（例如 IPv4 与 IPv6 地址、不同端口），会话层在它们之间轮换（见[可恢复会话层](transport.md#可恢复会话层)）；`tele host add` 多次给出 `--endpoint` 时，第一个是主 endpoint，其余进入 `alternates`。其他用户可读时拒绝使用 |
 | `~/.config/tele/server.json`（远端） | 服务端的监听地址与 PSK（0600）。其他用户可读时拒绝启动 |
-| `~/.config/tele/install-manifest.json`（远端） | 安装清单 |
+| `~/.config/tele/install-manifest.json`（远端） | 安装清单，见[预检与修复策略](#预检与修复策略)；被替换的文件备份在同一目录的 `backup/` 中 |
+| `~/.config/systemd/user/tele-server.service`（远端） | 服务的 systemd 单元 |
+| `~/.cache/tele/doctor-passed`（本地） | 本地检查已经通过的标记，见[预检与修复策略](#预检与修复策略)；删除它，下次启动会话时重新检查 |
+| `/etc/apparmor.d/tele`（本地） | 允许 tele 创建 userns 的 AppArmor profile，只在需要时由 `tele doctor` 安装 |
 | `~/.cache/tele/s/<sid>/`（远端） | 会话目录：scratch 文件、溢出到磁盘的命令输出 |
 
 ## 预检与修复策略
@@ -111,7 +116,7 @@ tele host confirm myhost 'tele1r:…'
 | linger（`loginctl enable-linger $USER`） | 🔐 | 没有 linger 时，用户登出后服务会停止。polkit 的 `set-self-linger` 在活跃会话中通常允许，在 SSH 等非活跃会话中可能需要认证。拒绝时降级为 ⚠️，并说明后果 |
 | 监听端口可达（本机防火墙：firewalld、ufw、nft） | 🔐 | 生成对应前端的放行命令，经同意后用 sudo 执行；云安全组无法检测，只给出提示 |
 | `fs.inotify.max_user_watches` 不足（按项目文件数估算） | 🔐 | 写入 `/etc/sysctl.d/90-tele.conf` 并执行 `sysctl --system`；拒绝时降级为 ⚠️：变更推送会退回短 TTL |
-| 时钟同步（SS2022 要求误差在 30 秒以内） | 误差已超限为 ❌；NTP 未启用为 🔐 | 启用 `timedatectl set-ntp true` 需要同意；误差已经超限时直接报错，因为连接会被拒绝 |
+| 时钟同步（SS2022 要求误差在 30 秒以内） | NTP 未启用为 🔐 | 启用 `timedatectl set-ntp true` 需要同意。服务端没有参照时钟，偏差本身由客户端测量（见下面的本地检查项） |
 | `bash`、`rg`、`git` 是否可用 | ⚠️ | 缺少时对应的 Claude 功能会失败（见 [shim](exec.md#shim)） |
 | 内核版本、`/proc` 已挂载（telefs 服务端经 `/proc/self/fd` 操作文件，见[对象标识](telefs.md#对象标识)）、`/proc/sys/fs/inotify` 可用 | ❌ | 报错，并说明最低要求 |
 
@@ -122,11 +127,20 @@ tele host confirm myhost 'tele1r:…'
 | `/dev/fuse` 存在且可读写 | 权限不足为 🔐；不存在为 ❌ | 发行版默认是 0666；异常时给出 `modprobe fuse` 或 udev 规则的建议 |
 | 非特权 userns 可用（`user.max_user_namespaces`、Ubuntu 的 AppArmor 限制） | 🔐 | 安装随包附带的 AppArmor profile（需要 sudo），而不是全局关闭限制；拒绝时报错 |
 | Claude Code 版本在已验证列表中 | ⚠️ | 未验证的版本给出警告，但仍然允许运行 |
-| 与目标主机的时钟偏差 | ⚠️ / ❌ | 同上表 |
+| 与目标主机的连通性和时钟偏差（指定别名时） | ⚠️ / ❌ | 偏差按 Hello 中服务端报告的时间估算：10 秒以上为 ⚠️，30 秒以上为 ❌。偏差超过 30 秒时 SS2022 握手本身就会失败，得不到服务端的时间，这时只能报告连接失败的可能原因和本地时钟是否同步 |
 
 **通用约定**：
 
 - **非交互**时（没有 TTY，例如在 CI 中，或由 Claude 在 Bash 里调用）**绝不提权**：🔧 项照常执行，🔐 项全部视为未同意，打印需要手动执行的命令。
 - `--yes` 表示同意所有 🔐 项，用于自动化部署；`--check` 只做预检；`--print-commands` 只打印命令，不执行。
-- 所有改动记入安装清单，`tele server uninstall` 据此逐项回滚。
-- 每一步都是幂等的，可以重复运行。
+- 所有改动记入安装清单，`tele server uninstall` 据此按相反顺序逐项回滚：自己写入的文件删除，替换过的文件从备份恢复，🔐 项的回滚命令同样要征得同意。服务端配置从不备份，而且即使清单中没有它也会被删除，因为删除它就是吊销 PSK。
+- 每一步都是幂等的，可以重复运行。检查项在修复前重新运行一次，因为前面的修复可能改变了它的状态（例如写入新的 PSK 后，正在运行的服务需要重启）。
+
+**不明显的细节**：
+
+- **inotify watch 的估算**：telefs 服务端按需对目录注册 watch（见[变更监视](telefs.md#变更监视)），需要量随 Claude 访问过的目录数增长。安装时还不知道项目，所以按家目录下的目录数估算（计数有时间上限），要求至少为目录数的 2 倍、不少于 65536；需要调高时至少写入 524288，给同一用户的其他程序（编辑器等）留出余量。
+- **ufw 的规则需要 root 才能读取**，所以只认 tele 自己在清单中记录过的放行规则；用户已经手动放行时，重复执行 `ufw allow` 也是无害的。firewalld 的查询不需要 root，按实际规则判断。
+- **没有 systemd user manager**（容器、没有 `pam_systemd` 的登录方式）时，服务、linger 两项都降级为 ⚠️，其余检查照常，配置照常写入。
+- **本地检查在首次启动会话时自动执行**：只做预检，不修复；未通过时报告清单并提示运行 `tele doctor`，通过后在缓存目录留下标记，以后不再检查。
+- **userns 的检查是实际尝试**：以启动会话主进程的方式创建 userns + mountns，并在其中修改挂载传播。只检查 sysctl 不够：Ubuntu 的 AppArmor 限制允许创建 userns，但会收回其中的 capability。
+- **AppArmor profile 只放行这一个可执行文件**：profile 按 tele 可执行文件的绝对路径附着，内容是 `userns,`，随包附带的模板中路径是占位符，由 `tele doctor` 填入。不用通配路径（例如 `@{HOME}/.local/bin/tele`），否则任何用户把任意程序放到这个路径，都能绕过系统对非特权 userns 的限制。移动 tele 之后要重新运行 `tele doctor`。卸载：`sudo apparmor_parser -R /etc/apparmor.d/tele && sudo rm /etc/apparmor.d/tele`。

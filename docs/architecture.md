@@ -74,7 +74,7 @@ tele 让 Claude Code 仍在本地运行，但它看到和操作的「世界」�
 | shim | `<sess>/bin/{bash,tele-exec,sh,rg,git,uname,…}` → `tele` | 把请求交给会话主进程，见 [exec.md](exec.md) |
 | 远端服务 | `tele server run` / `tele server install --pair …` | 远端服务名为 `tele-server` |
 
-内部角色（会话主进程、视图辅助进程、启动阶段）按 `argv[0]` 分派，名字形如 `tele:session`，含有 shim 名中不会出现的 `:`。
+内部角色（会话主进程、视图辅助进程、启动阶段，以及 `tele doctor` 用来检查 userns 的探测进程）按 `argv[0]` 分派，名字形如 `tele:session`，含有 shim 名中不会出现的 `:`。
 
 `<sess>` 是会话目录。它在本地创建，在远端视图中挂载到 `/.tele/<sid>`（远端不存在这个路径）。其中存放 shim、`CLAUDE_CODE_TMPDIR`、预加载库、会话 token、本地 CA bundle、系统提示词文件和会话主进程的日志（shim 出错时让用户去看它，见 [shim 与会话主进程](exec.md#shim-与会话主进程)）。
 

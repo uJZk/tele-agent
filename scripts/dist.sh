@@ -26,6 +26,9 @@ for arch in $ARCHES; do
 	pkg=$out/tele-$VERSION-linux-$arch
 	make --no-print-directory build GOARCH="$arch" CC="$cc" VERSION="$VERSION" BIN="$pkg/tele"
 	cp LICENSE "$pkg/"
+	# The AppArmor profile tele doctor installs, for packagers
+	# (docs/cli.md "预检与修复策略").
+	cp internal/doctor/tele.apparmor "$pkg/"
 	tar -C "$out" --sort=name --owner=0 --group=0 --numeric-owner -czf "$pkg.tar.gz" "${pkg#"$out"/}"
 	rm -r "$pkg"
 done

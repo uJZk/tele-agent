@@ -90,7 +90,7 @@ func TestMainUsage(t *testing.T) {
 		{[]string{"help"}, 0, "usage:"},
 	} {
 		var out, errb bytes.Buffer
-		code := Main(tc.args, &out, &errb)
+		code := Main(tc.args, Streams{Out: &out, Err: &errb})
 		if code != tc.code || !strings.Contains(out.String()+errb.String(), tc.want) {
 			t.Errorf("Main(%q) = %d, %q; want %d containing %q", tc.args, code, out.String()+errb.String(), tc.code, tc.want)
 		}

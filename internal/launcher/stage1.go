@@ -1,6 +1,7 @@
 package launcher
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +19,8 @@ import (
 
 	"github.com/ujzk/tele-agent/internal/claudever"
 	"github.com/ujzk/tele-agent/internal/cli"
+	"github.com/ujzk/tele-agent/internal/doctor"
+	"github.com/ujzk/tele-agent/internal/preflight"
 	"github.com/ujzk/tele-agent/internal/sigexit"
 	"github.com/ujzk/tele-agent/internal/view"
 )
@@ -124,6 +128,9 @@ func Main(args []string) int {
 			return failf("%v", err)
 		}
 	}
+	if !firstRun(os.Stderr) {
+		return ExitFailure
+	}
 	warnVersion(os.Stderr, cfg.Claude)
 	b, err := json.Marshal(cfg)
 	if err != nil {
@@ -133,13 +140,7 @@ func Main(args []string) int {
 	cmd := exec.CommandContext(context.Background(), "/proc/self/exe", string(b))
 	cmd.Args[0] = RoleSession
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:                 syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
-		UidMappings:                []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
-		GidMappings:                []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
-		GidMappingsEnableSetgroups: false,
-		AmbientCaps:                view.Caps,
-	}
+	cmd.SysProcAttr = view.SessionAttr()
 	sigs := notifySignals()
 	defer signal.Stop(sigs)
 	if err := cmd.Start(); err != nil {
@@ -157,6 +158,30 @@ func absPath(p string) (string, error) {
 		return "", err
 	}
 	return wd + "/" + p, nil
+}
+
+// firstRun runs the local checks of tele doctor before the first session
+// (docs/cli.md "预检与修复策略"). Once they pass, a stamp in the cache
+// directory skips them.
+func firstRun(w io.Writer) bool {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return true // the session reports what fails
+	}
+	stamp := filepath.Join(dir, "tele", "doctor-passed")
+	if _, err := os.Stat(stamp); err == nil {
+		return true
+	}
+	var out bytes.Buffer
+	r := &preflight.Runner{Mode: preflight.CheckOnly, Out: &out}
+	if !r.Run(context.Background(), doctor.LocalChecks()) {
+		_, _ = fmt.Fprintf(w, "tele: this host is not ready for tele:\n%s\nRun `tele doctor` to repair it.\n", out.String())
+		return false
+	}
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o700); err == nil {
+		_ = os.WriteFile(stamp, nil, 0o600)
+	}
+	return true
 }
 
 // warnVersion warns about a Claude Code version tele was not verified with

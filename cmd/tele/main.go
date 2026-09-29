@@ -9,9 +9,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/ujzk/tele-agent/internal/cli"
+	"github.com/ujzk/tele-agent/internal/doctor"
 	"github.com/ujzk/tele-agent/internal/hostcmd"
 	"github.com/ujzk/tele-agent/internal/launcher"
+	"github.com/ujzk/tele-agent/internal/preflight"
 	"github.com/ujzk/tele-agent/internal/servercmd"
 	"github.com/ujzk/tele-agent/internal/shim"
 	"github.com/ujzk/tele-agent/internal/version"
@@ -34,6 +35,8 @@ func run(name string, args []string) int {
 		return view.HelperMain()
 	case launcher.RoleLaunch:
 		return view.LaunchMain(args)
+	case doctor.RoleProbe:
+		return doctor.ProbeMain()
 	default:
 		// Every other name is a shim in <sess>/bin (docs/exec.md "shim").
 		return shim.Main(name, append([]string{os.Args[0]}, args...))
@@ -47,13 +50,11 @@ func run(name string, args []string) int {
 		fmt.Println("tele", version.String())
 		return 0
 	case "server":
-		return servercmd.Main(args[1:], os.Stdout, os.Stderr)
+		return servercmd.Main(args[1:], servercmd.Streams{In: os.Stdin, Terminal: preflight.OpenTerminal(os.Stdin), Out: os.Stdout, Err: os.Stderr})
+	case "doctor":
+		return doctor.Main(args[1:], doctor.Streams{Terminal: preflight.OpenTerminal(os.Stdin), Out: os.Stdout, Err: os.Stderr})
 	case "host":
 		return hostcmd.Main(args[1:], hostcmd.Streams{In: os.Stdin, Out: os.Stdout, Err: os.Stderr})
-	}
-	if cli.IsReserved(args[0]) {
-		fmt.Fprintf(os.Stderr, "tele: %s: not implemented yet\n", args[0])
-		return 2
 	}
 	return launcher.Main(args)
 }

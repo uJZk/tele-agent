@@ -277,6 +277,19 @@ func LaunchMain(argv []string) int {
 	return 1
 }
 
+// SessionAttr is the SysProcAttr for session main: a new user and mount
+// namespace, with the current user mapped to itself and Caps kept across
+// the exec (docs/filesystem.md "命名空间的构建").
+func SessionAttr() *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		Cloneflags:                 syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+		UidMappings:                []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
+		GidMappings:                []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
+		GidMappingsEnableSetgroups: false,
+		AmbientCaps:                Caps,
+	}
+}
+
 // LaunchAttr is the SysProcAttr for the command that enters LaunchMain.
 func LaunchAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
