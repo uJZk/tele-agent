@@ -9,8 +9,10 @@ tele 不修改 Claude Code，只通过环境变量、命令行参数和 Claude �
 Bash 工具使用的 shell。
 
 - 路径中**必须包含** `bash` 或 `zsh`，并且可执行，否则 Claude 会忽略这个变量。所以 shim 命名为 `<sess>/bin/bash`。
-- 调用参数是 `[shell, "-c", "-l", <命令串>]`。命令串的形式是 `source <快照> && <关闭 extglob> && eval '<命令>' && pwd -P >| <cwd 文件>`。
-- shell 快照也由这个 shell 生成，所以快照是**在远端**生成的，记录的是远端的 PATH、别名和函数。
+- Bash 工具的调用参数是 `[shell, "-c", <命令串>]`，不是登录 shell。命令串的形式是 `source <快照> 2>/dev/null || true && <关闭 extglob> && <取消名为 unsetenv 的别名和函数> && eval '<命令>' < /dev/null && pwd -P >| <cwd 文件>`。cwd 文件位于 `CLAUDE_CODE_TMPDIR`，名为 `claude-<随机>-cwd`。
+- 命令的 stdin 是 `/dev/null`，所以 Bash 工具的命令从不读取 Claude 的 stdin。
+- shell 快照也由这个 shell 生成，调用参数是 `[shell, "-c", "-l", <脚本>]`，即登录 shell。所以快照是**在远端**生成的，记录的是远端的 PATH、别名和函数。
+- 快照中定义了同名函数，把 `rg`、`find`、`grep` 转给 Claude 二进制内嵌的实现，二进制的路径取自 `CLAUDE_CODE_EXECPATH`，或 Claude 的默认安装路径。这些路径在远端通常不可执行，函数随即回退到 `command rg` 等远端程序。
 
 ## CLAUDE_CODE_SHELL_PREFIX
 
@@ -18,8 +20,8 @@ Bash 工具使用的 shell。
 
 | 调用方 | Claude 的做法 |
 |---|---|
-| Bash 工具 | 把 `<命令串>` 包装成 `'<PREFIX>' '<命令串>'`，再按 [CLAUDE_CODE_SHELL](#claude_code_shell) 交给 shell |
-| shell 形式的 hooks | 把 hook 命令包装成 `'<PREFIX>' '<命令>'`，以 `shell: true` spawn，也就是交给 `/bin/sh -c` |
+| Bash 工具 | 把 `<命令串>` 包装成 `<PREFIX> '<命令串>'` 两个 shell 词，再按 [CLAUDE_CODE_SHELL](#claude_code_shell) 交给 shell |
+| shell 形式的 hooks | 把 hook 命令包装成 `<PREFIX> '<命令>'`，以 `shell: true` spawn，也就是 `/bin/sh -c "<PREFIX> '<命令>'"`，PREFIX 收到的唯一参数就是 hook 命令 |
 | stdio MCP server | 直接把**整个 PREFIX 当作可执行文件路径** spawn，唯一的参数是把 `command` 和 `args` 引号拼接而成的 shell 字符串 |
 
 推论：
@@ -28,6 +30,7 @@ Bash 工具使用的 shell。
 - Bash 工具同时受 SHELL 和 PREFIX 影响，会被**包两层**。bash shim 识别出最外层是 tele-exec 的包装后，先去掉这一层。
 - 包装时 Claude 会对 PREFIX 中最后一个 ` -` 做特殊处理，所以会话目录和 shim 的路径中不能包含空格。
 - 包装使用的引号风格由 Claude 决定（单引号、双引号或反斜杠转义都可能出现），识别包装时要按 POSIX shell 的规则解析。
+- 例子中 PREFIX 没有引号，因为路径中没有需要引用的字符；命令串中的单引号写成 `'"'"'`。
 - **缺口**：exec 形式的 hooks（指定了 `command` 和 `args` 的）直接 spawn，**不经过** PREFIX。对策是启动器用 `--setting-sources` 加 `--settings` 注入改写后的 hooks，插件的 hooks 也要同样处理。
 
 ## USE_BUILTIN_RIPGREP 与 git
@@ -36,6 +39,14 @@ Bash 工具使用的 shell。
 - Claude 内部的 git 调用（例如 `status --porcelain`）使用的可执行文件，是**第一次**使用时按 PATH 查到的 `git`，之后在进程内缓存。PATH 中只有 shim 目录，所以查到的是 `git` shim，调用同样转发到远端。
 
 这两项避免了大量元数据操作经过 FUSE 往返。
+
+Claude 自己也调用 `rg`：启动时先执行 `rg --version`，并用 `rg --files` 列出工作目录，以及 `~/.claude/plugins/cache` 下的 `.orphaned_at` 标记文件（用来清理孤立的插件）。在 tele 下，这些调用同样经 shim 在远端执行，而 `~/.claude` 属于本地集合，所以插件缓存的扫描看到的是远端的同名目录，通常不存在，结果为空。空结果只是不清理任何插件，没有危害。
+
+## 代理与 CA
+
+- API 请求遵循 `HTTPS_PROXY`：经 CONNECT 隧道到达 API 主机，Claude 自己不解析 API 的主机名。
+- `SSL_CERT_FILE` 或 `NODE_EXTRA_CA_CERTS` 任意一个指向的 CA 都会被信任。tele 两个都设置，指向同一个 bundle。
+- 证书不受信任时，Claude 报 API 错误后退出，不会绕过代理直连。
 
 ## scratch 文件
 
@@ -120,7 +131,7 @@ This session operates on the remote host "{{alias}}" via tele.
 
 ## 验证方法
 
-- **兼容性测试**：用模拟的 Anthropic API 返回事先编排好的 tool_use，驱动真实的 `claude -p`，逐条检查本文的契约。
+- **兼容性测试**：用模拟的 Anthropic API 返回事先编排好的 tool_use，驱动真实的 `claude -p`，逐条检查本文的契约。测试在 `internal/claudecompat`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用；测试注释按小节标题指向本文，契约和测试要一起修改。
 - **每个新的 Claude Code 版本**在加入已验证列表之前都要重新验证：运行兼容性测试；用 `strace -f` 对切换视图之后的文件访问和 exec 做差异比对。新出现的 dlopen、运行时文件，以及按名字或按绝对路径启动的程序，都要在预加载列表、本地集合或 shim 列表中处理。telefs 在 debug 日志中记录 Claude 进程对疑似运行时文件（`*.so*`、`/etc/ssl` 下的路径）的访问，用来排查这类回归。
 - **逆向**：Claude Code 是 bun 编译的单文件二进制，内嵌压缩过的 JS。在二进制中搜索 `CLAUDE_CODE_SHELL_PREFIX`、`USE_BUILTIN_RIPGREP` 等字符串，就能找到相关实现。
 - **文件访问**：用 `strace -f -e trace=%file,execve claude -p …` 观察 Claude 在启动、加载配置、发起一次 API 请求期间访问的路径。
@@ -134,8 +145,8 @@ This session operates on the remote host "{{alias}}" via tele.
 | 在 `main` 之前，bun 仍然是单线程的（`setns(CLONE_NEWNS)` 要求进程不与其它线程共享文件系统信息） | 回到「bind 挂载动态库和 DNS 文件」的做法，本地例外变多 |
 | 切换之后，Claude 不再 dlopen 或打开其它本地运行时文件 | 在切换前预先加载；实在不行，加入本地集合 |
 | 本地 uid 在远端的 `/etc/passwd` 中可能不存在，但 `os.userInfo()` 等调用不受影响，或者 `USER`、`HOME` 足以兜底。另外，glibc 的 NSS 会按远端的 `nsswitch.conf` dlopen 远端的 `libnss_*.so`，远端 glibc 版本不同时可能崩溃 | 切换前预先加载本地的 NSS 模块，或在远端视图中合成 passwd 条目 |
-| Claude 的所有出站 HTTP（API、WebFetch、遥测、OAuth 刷新）都遵循代理。不走代理的连接会在远端视图中做 DNS 解析，从而失败 | 把本地的 DNS 配置文件加入本地集合 |
-| 只靠 `SSL_CERT_FILE` 和 `NODE_EXTRA_CA_CERTS`，bun 就会使用 `<sess>/ca-bundle.pem`，不再依赖系统证书目录 | 把本地证书目录 bind 到 `/etc/ssl` 等路径，多一个本地例外 |
+| 除 API 请求以外（见[代理与 CA](#代理与-ca)），Claude 的其它出站 HTTP（WebFetch、遥测、OAuth 刷新）也都遵循代理。不走代理的连接会在远端视图中做 DNS 解析，从而失败 | 把本地的 DNS 配置文件加入本地集合 |
+| bun 信任 `<sess>/ca-bundle.pem`（见[代理与 CA](#代理与-ca)）之后，不再依赖系统证书目录；切换到远端视图后，`/etc/ssl` 是远端的 | 把本地证书目录 bind 到 `/etc/ssl` 等路径，多一个本地例外 |
 | Claude 写 `~/.claude.json` 的方式与 bind 挂载的单个文件兼容。如果它先写临时文件再 rename 覆盖，rename 到挂载点上会失败（`EBUSY` 或 `EXDEV`） | telefs 把远端 `HOME` 下以 `.claude.json` 开头的名字映射到本地文件，让临时文件和目标文件位于同一个文件系统 |
 | `tasks/` 标记文件位于某个 scratch 前缀之下 | 为它所在的目录增加 scratch 前缀 |
 | Claude 在运行 SessionStart hook 之前，在本地创建了 `CLAUDE_ENV_FILE` 这个文件，而不只是它所在的 `session-env/<id>` 目录。scratch 同步只传普通文件、不传空目录，只有目录时远端 hook 的 `>> "$CLAUDE_ENV_FILE"` 会因远端目录不存在而失败（ENOENT） | 上传时为本会话认领的空目录在远端建出对应目录 |
