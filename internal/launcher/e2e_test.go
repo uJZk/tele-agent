@@ -26,9 +26,16 @@ var (
 	errBuildTele error
 )
 
+// prebuiltEnv names a tele executable to test instead of building one, for
+// running the test binary where no Go toolchain is, such as as another user.
+const prebuiltEnv = "TELE_TEST_TELE"
+
 // buildTele builds cmd/tele once per test binary.
 func buildTele(t *testing.T) string {
 	t.Helper()
+	if p := os.Getenv(prebuiltEnv); p != "" {
+		return p
+	}
 	teleOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "tele-e2e-")
 		if err != nil {
@@ -41,7 +48,23 @@ func buildTele(t *testing.T) string {
 			errBuildTele = err
 			return
 		}
-		out, err := exec.CommandContext(context.Background(), gobin, "build", "-o", teleBin, "github.com/ujzk/tele-agent/cmd/tele").CombinedOutput()
+		// The teleswitch library is embedded at build time; make builds it
+		// into the (ignored) embed directory when a compiler is at hand.
+		// Without it, tele builds but refuses to start Claude.
+		if _, err := exec.LookPath("make"); err == nil {
+			if _, err := exec.LookPath("cc"); err == nil {
+				out, err := exec.CommandContext(context.Background(), "make", "-C", "../..", "-s", "teleswitch").CombinedOutput()
+				if err != nil {
+					errBuildTele = &buildError{err: err, out: string(out)}
+					return
+				}
+			}
+		}
+		// Static like a release build (Makefile): a dynamic shim would
+		// load the target's libraries in the remote view.
+		cmd := exec.CommandContext(context.Background(), gobin, "build", "-o", teleBin, "github.com/ujzk/tele-agent/cmd/tele")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			errBuildTele = &buildError{err: err, out: string(out)}
 		}
@@ -195,8 +218,10 @@ func TestClaudeThroughProxy(t *testing.T) {
 			// not resolve, so the proxy sends it to the stand-in.
 			proxy := claudetest.NewProxy(t, api.Addr(), "secret")
 			env := claudeEnv(claudeEnvSpec{
-				UserEnv:  []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "DISABLE_AUTOUPDATER=1"},
-				SessDir:  "/.tele/0123456789abcdef",
+				UserEnv: []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "DISABLE_AUTOUPDATER=1"},
+				// Without the view switch Claude uses the session
+				// directory's local path (CLAUDE_CODE_TMPDIR is in it).
+				SessDir:  t.TempDir(),
 				Home:     t.TempDir(),
 				User:     "bob",
 				ProxyURL: proxyURL(proxy.Addr(), tc.offered),

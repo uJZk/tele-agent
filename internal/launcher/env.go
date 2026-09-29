@@ -75,6 +75,12 @@ func claudeEnv(s claudeEnvSpec) []string {
 		"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1",
 		"SSL_CERT_FILE="+ca,
 		"NODE_EXTRA_CA_CERTS="+ca,
+		// Claude's runtime scans a certificate directory besides
+		// SSL_CERT_FILE: SSL_CERT_DIR, else /etc/ssl/certs, which the
+		// remote view takes from the target. The bundle already holds the
+		// local directory's certificates, so the directory is empty
+		// (docs/claude-code.md "代理与 CA").
+		"SSL_CERT_DIR="+s.SessDir+"/"+certDir,
 		"TELE_SESSION="+s.SessDir,
 	)
 	return append(env, s.Switch...)

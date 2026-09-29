@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,6 +139,13 @@ func (a *API) URL() string {
 		return "https://" + a.host
 	}
 	return a.srv.URL
+}
+
+// DirectURL is the base URL of a TLS API that clients reach directly,
+// for a host that is an IP address of this machine.
+func (a *API) DirectURL() string {
+	_, port, _ := net.SplitHostPort(a.Addr())
+	return "https://" + net.JoinHostPort(a.host, port)
 }
 
 // CAFile is the PEM file that makes a TLS API's certificate trusted.
@@ -398,6 +406,9 @@ func blocks(raw json.RawMessage) []Block {
 // siblings returns host and a wildcard for its parent domain, so that one
 // certificate also covers other names there, such as a page for WebFetch.
 func siblings(host string) []string {
+	if net.ParseIP(host) != nil {
+		return []string{host}
+	}
 	if _, parent, ok := strings.Cut(host, "."); ok && strings.Contains(parent, ".") {
 		return []string{host, "*." + parent}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"path"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"syscall"
 
@@ -253,6 +254,9 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	}
 	gen := f.invalGen.Load()
 	f.watchDir(n, b, dir)
+	if !b.local && runtimeLike(dir, name) {
+		f.log.Debug("telefs: runtime-like file looked up", "path", path.Join(dir, name))
+	}
 	resp, errno := f.callOn(b, &proto.FSRequest{Op: proto.FSLookup, Path: dir, Name: name})
 	if errno == syscall.ENOENT {
 		// Negative entries under synthetic directories are kept short:
@@ -269,6 +273,16 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	ch := n.child(ctx, b, name, resp.Attr, resp.Unwatched)
 	f.fillEntry(out, b, ch, resp.Attr, gen, resp.Unwatched)
 	return ch, 0
+}
+
+// runtimeLike reports whether entry name of remote directory dir looks
+// like a file a program's runtime loads: a shared library, or something
+// under /etc/ssl. A Claude that looks such files up after the switch would
+// get the target's instead of its own, so telefs logs them to catch new
+// Claude versions that do (docs/telefs.md "组成").
+func runtimeLike(dir, name string) bool {
+	return strings.HasSuffix(name, ".so") || strings.Contains(name, ".so.") ||
+		dir == "/etc/ssl" || strings.HasPrefix(dir, "/etc/ssl/") || (dir == "/etc" && name == "ssl")
 }
 
 // Getattr implements fs.NodeGetattrer.

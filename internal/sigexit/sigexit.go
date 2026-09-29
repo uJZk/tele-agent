@@ -1,4 +1,7 @@
-package shim
+// Package sigexit ends the process the way another process ended when a
+// signal killed it: the shim reproduces the remote command's end, and tele
+// reproduces Claude's (docs/exec.md "shim 与会话主进程").
+package sigexit
 
 import (
 	"runtime"
@@ -7,8 +10,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// raise terminates the process with sig, the way the command on the target
-// host ended (docs/exec.md "shim 与会话主进程"). It returns only if sig's
+// Raise terminates the process with sig. It returns only if sig's
 // default action does not terminate a process (e.g. SIGWINCH, SIGCHLD) or
 // would merely stop it.
 //
@@ -17,12 +19,12 @@ import (
 // status 2, and treats SIGSEGV as a crash. So the kernel disposition is set
 // to SIG_DFL directly, the signal is unblocked on this thread, and sent to
 // this thread, where the default action takes effect before tgkill returns.
-func raise(sig unix.Signal) {
+func Raise(sig unix.Signal) {
 	if !terminatesByDefault(sig) {
 		return
 	}
-	// The command's core, if any, was dumped on the target host; the shim
-	// must not drop a core of itself into the user's working directory.
+	// The process that died dumped its own core, if any; this one must
+	// not drop a core of itself into the user's working directory.
 	_ = unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
 	_ = unix.Setrlimit(unix.RLIMIT_CORE, &unix.Rlimit{})
 

@@ -18,6 +18,7 @@ import (
 // shim, relies on them.
 const (
 	caBundleFile     = "ca-bundle.pem"
+	certDir          = "certs" // empty: SSL_CERT_DIR, see claudeEnv
 	systemPromptFile = "system-prompt.md"
 	binDir           = "bin"
 	libDir           = "lib"
@@ -31,6 +32,8 @@ type sessDirSpec struct {
 	Token        []byte   // session token
 	SystemPrompt string   // composed appended system prompt
 	LogLevel     slog.Level
+	// LogCopy, if set, receives the log too.
+	LogCopy io.Writer
 	// Warn receives warnings the user must see before Claude starts, such
 	// as an ignored CA path. It is tele's own stderr, never a shim's.
 	Warn io.Writer
@@ -63,7 +66,7 @@ func prepareSessionDir(s sessDirSpec) (_ *sessionDir, err error) {
 			_ = os.RemoveAll(s.Dir) // ours, created above
 		}
 	}()
-	for _, d := range []string{binDir, libDir, tmpDir} {
+	for _, d := range []string{binDir, libDir, tmpDir, certDir} {
 		if err := os.Mkdir(filepath.Join(s.Dir, d), 0o700); err != nil {
 			return nil, fmt.Errorf("create session directory: %w", err)
 		}
@@ -78,9 +81,13 @@ func prepareSessionDir(s sessDirSpec) (_ *sessionDir, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("create session log: %w", err)
 	}
+	var w io.Writer = logf
+	if s.LogCopy != nil {
+		w = io.MultiWriter(logf, s.LogCopy)
+	}
 	sd := &sessionDir{
 		Dir: s.Dir,
-		Log: slog.New(slog.NewTextHandler(logf, &slog.HandlerOptions{Level: s.LogLevel})),
+		Log: slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: s.LogLevel})),
 		log: logf,
 	}
 	defer func() {

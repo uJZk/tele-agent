@@ -4,7 +4,7 @@ Claude 启动的命令由 shim 接住，交给会话主进程，再经会话通�
 
 ## shim
 
-shim 都是指向 `tele` 的符号链接，位于 `<sess>/bin/`，按 `argv[0]` 分派。
+shim 都是指向 `../tele` 的相对符号链接，位于 `<sess>/bin/`，按 `argv[0]` 分派。`<sess>/tele` 是 tele 可执行文件的 bind 挂载，所以 shim 在远端视图中也能运行；远端视图中的 `/bin/sh` 同样是它。tele 必须是静态链接的（`make build` 如此）：shim 在远端视图中启动，动态链接的 shim 会加载远端的库。
 
 | shim | 谁调用 | 行为 |
 |---|---|---|
@@ -50,7 +50,7 @@ shim 都是指向 `tele` 的符号链接，位于 `<sess>/bin/`，按 `argv[0]` 
 - `PATH`、`HOME`：远端使用自己的值；
 - `LD_PRELOAD` 和所有 `TELE_*`；
 - `HTTPS_PROXY`、`HTTP_PROXY`、`NO_PROXY`、`ALL_PROXY`（大小写两种形式）：指向本地的 CONNECT 代理；
-- `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`：指向本地的 CA bundle；
+- `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`、`SSL_CERT_DIR`：指向本地的 CA bundle 和空的证书目录；
 - `CLAUDE_CODE_SHELL`、`CLAUDE_CODE_SHELL_PREFIX`、`USE_BUILTIN_RIPGREP`：指向本地的 shim；
 - `SSH_AUTH_SOCK`、`DISPLAY`、`WAYLAND_DISPLAY`、`XDG_RUNTIME_DIR`、`DBUS_SESSION_BUS_ADDRESS`：本地桌面和本地会话的资源。
 

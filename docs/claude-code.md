@@ -48,6 +48,7 @@ Claude 自己也调用 `rg`：启动时先执行 `rg --version`，并用 `rg --f
 - API 请求遵循 `HTTPS_PROXY`：经 CONNECT 隧道到达 API 主机，Claude 自己不解析 API 的主机名。
 - 代理 URL 中的用户名和密码，Claude 作为 Basic `Proxy-Authorization` 发送，所以 tele 把 CONNECT 代理的随机密码放在 `HTTPS_PROXY` 的 userinfo 中。
 - `SSL_CERT_FILE` 或 `NODE_EXTRA_CA_CERTS` 任意一个指向的 CA 都会被信任。tele 两个都设置，指向同一个 bundle。
+- 设置了 `SSL_CERT_FILE` 之后，Claude 的运行时仍然会扫描一个证书目录：`SSL_CERT_DIR`，没有设置时是 `/etc/ssl/certs`，其中的 CA 同样被信任。切换视图之后 `/etc/ssl/certs` 是远端的，所以 tele 把 `SSL_CERT_DIR` 设为会话目录中的一个空目录；bundle 已经包含了本地证书目录中的证书。
 - 证书不受信任时，Claude 报 API 错误后退出，不会绕过代理直连。
 - OAuth 访问令牌过期后的刷新（令牌端点在 `platform.claude.com`）同样经过代理，刷新得到的新令牌随后用于 API 请求。
 - WebFetch 的域名预检（向 `api.anthropic.com` 询问域名是否可以抓取）和抓取本身都经过代理；抓回的页面交给模型摘要时走 API。
@@ -84,6 +85,7 @@ Claude 写全局配置时，先在 `$HOME` 中创建 `.claude.json.tmp.<pid>.<�
 | 设置文件的热加载（Claude 通过文件监视发现设置文件的变化） | 内核只为经过本地 VFS 的操作产生 inotify 事件，telefs 的缓存失效不会产生。所以远端命令对设置文件的改动不会触发热加载，经 Claude 自己的 Write/Edit 做的改动仍然会。影响很小 |
 | WebFetch、WebSearch | 在本地或 Anthropic 侧执行，出站 IP 是本地的 |
 | 超时与中断：先 SIGTERM，再 SIGKILL（tree-kill，会调用 `ps`） | shim 转发可捕获的信号。SIGKILL 无法捕获，由会话主进程发现 shim 的连接关闭后结束远端进程组（见 [shim 与会话主进程](exec.md#shim-与会话主进程)）。`ps` 走本地 exec 代理，因为它必须看到本地进程 |
+| 环境探测（例如是否存在 `/lib/libc.musl-*.so.1`、是否在 Docker 中） | 在视图切换之后进行，所以探测的是远端。它们只影响环境信息，不加载任何文件 |
 | 系统提示词中的操作系统和平台 | Claude 在进程内取得内核版本，不启动 `uname`，所以内置的环境信息（`OS Version: Linux <版本>`）在 tele 下是**本地**的内核。这是已知限制：tele 不拦截系统调用，UTS 命名空间也只隔离主机名，不隔离内核版本。目标主机的信息由[附加系统提示词](#附加系统提示词)给出 |
 | 会话存储 `~/.claude/projects/<cwd 编码>` | 以 cwd 路径为键，不同主机上的相同路径会共用会话历史（已知限制，见[启动流程](cli.md#启动流程)） |
 
@@ -102,8 +104,9 @@ USE_BUILTIN_RIPGREP=0
 HTTPS_PROXY=http://tele:<密码>@127.0.0.1:<port>   # 本地 CONNECT 代理；HTTP_PROXY 和小写形式同理
 NO_PROXY=localhost,127.0.0.1,::1                  # 回环连接不走代理：IDE 插件在本地，远端 MCP 的端口由本地转发
 SSL_CERT_FILE=<sess>/ca-bundle.pem                # 本地 CA 合并而成；NODE_EXTRA_CA_CERTS 同样指向它
+SSL_CERT_DIR=<sess>/certs                         # 空目录，见「代理与 CA」
 TELE_SESSION=<sess>                               # shim 据此找到会话主进程的 socket 和会话 token
-LD_PRELOAD=<sess>/lib/teleswitch.so               # 与 TELE_SWITCH_FD、TELE_SWITCH_DIR 一起，在视图切换后被清除
+LD_PRELOAD=<本地会话目录>/lib/teleswitch.so       # 由启动阶段设置；与 TELE_SWITCH_FD、TELE_SWITCH_DIR 一起，在视图切换后被清除
 ```
 
 用户原有环境中指向本地资源的变量（代理、CA、`TMPDIR`、`XDG_RUNTIME_DIR`、`SSH_AUTH_SOCK` 等）不传给 Claude，具体列表以代码为准。
@@ -142,19 +145,16 @@ This session operates on the remote host "{{alias}}" via tele.
 
 ## 验证方法
 
-- **兼容性测试**：用模拟的 Anthropic API 返回事先编排好的 tool_use，驱动真实的 `claude -p`，逐条检查本文的契约。测试在 `internal/claudecompat`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用；测试注释按小节标题指向本文，契约和测试要一起修改。其中观察系统调用的测试（Claude 自己启动了哪些程序、网络连接指向哪里）需要 `strace`，没有时跳过。`internal/launcher` 中还有用同一个变量启用的端到端测试：不切换视图，让真实的 Claude 经 shim、relay 和 tele server 走完整条 exec 链路，以及经 tele 自己的 CONNECT 代理访问 API。
+- **兼容性测试**：用模拟的 Anthropic API 返回事先编排好的 tool_use，驱动真实的 `claude -p`，逐条检查本文的契约。测试在 `internal/claudecompat`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用；测试注释按小节标题指向本文，契约和测试要一起修改。其中观察系统调用的测试（Claude 自己启动了哪些程序、网络连接指向哪里）需要 `strace`，没有时跳过。`internal/launcher` 中还有用同一个变量启用的端到端测试：不切换视图，让真实的 Claude 经 shim、relay 和 tele server 走完整条 exec 链路，以及经 tele 自己的 CONNECT 代理访问 API；再运行完整的 `tele <别名>`，经命名空间和视图切换驱动真实的 Claude（见[视图切换](#视图切换)），这部分还需要 userns 和 FUSE。以 root 运行时子进程会重新获得 capability（见[已知陷阱](filesystem.md#已知陷阱)），所以这些测试也要以普通用户运行一遍；`TELE_TEST_TELE=<tele 路径>` 让测试使用预先构建的 tele，不需要 Go 工具链。
 - **每个新的 Claude Code 版本**在加入已验证列表之前都要重新验证：运行兼容性测试（最后一条检查被测版本已列入 `claudever.Verified`）；用 `strace -f` 对切换视图之后的文件访问和 exec 做差异比对（切换视图之前的 exec 和网络连接已由兼容性测试覆盖）。新出现的 dlopen、运行时文件，以及按名字或按绝对路径启动的程序，都要在预加载列表、本地集合或 shim 列表中处理。telefs 在 debug 日志中记录 Claude 进程对疑似运行时文件（`*.so*`、`/etc/ssl` 下的路径）的访问，用来排查这类回归。
 - **逆向**：Claude Code 是 bun 编译的单文件二进制，内嵌压缩过的 JS。在二进制中搜索 `CLAUDE_CODE_SHELL_PREFIX`、`USE_BUILTIN_RIPGREP` 等字符串，就能找到相关实现。
 - **文件访问**：用 `strace -f -e trace=%file,execve claude -p …` 观察 Claude 在启动、加载配置、发起一次 API 请求期间访问的路径。
 
-## 待验证的行为
+## 视图切换
 
-以下 Claude Code 和 bun 的行为决定了「先本地加载、再切换视图」能否成立，实现前必须逐条验证。验证通过后把结论作为契约写入上文、由兼容性测试守护，然后删除对应条目。
+「先在本地加载、再切换视图」（见[命名空间的构建](filesystem.md#命名空间的构建)）依赖下面这些行为，由 `internal/launcher` 的端到端测试和兼容性测试守护：
 
-| 假设 | 不成立时的退路 |
-|---|---|
-| 在 `main` 之前，bun 仍然是单线程的（`setns(CLONE_NEWNS)` 要求进程不与其它线程共享文件系统信息） | 回到「bind 挂载动态库和 DNS 文件」的做法，本地例外变多 |
-| 切换之后，Claude 不再 dlopen 或打开其它本地运行时文件 | 在切换前预先加载；实在不行，加入本地集合 |
-| 本地 uid 在远端的 `/etc/passwd` 中可能不存在，但 `os.userInfo()` 等调用不受影响，或者 `USER`、`HOME` 足以兜底。另外，glibc 的 NSS 会按远端的 `nsswitch.conf` dlopen 远端的 `libnss_*.so`，远端 glibc 版本不同时可能崩溃 | 切换前预先加载本地的 NSS 模块，或在远端视图中合成 passwd 条目 |
-| bun 信任 `<sess>/ca-bundle.pem`（见[代理与 CA](#代理与-ca)）之后，不再依赖系统证书目录；切换到远端视图后，`/etc/ssl` 是远端的 | 把本地证书目录 bind 到 `/etc/ssl` 等路径，多一个本地例外 |
-| 兼容性测试覆盖的功能中，Claude 自己按绝对路径启动的只有 `/bin/sh`，其余都按 PATH 查找。没有覆盖的功能（打开浏览器、剪贴板、通知等）启动的程序同样可以逐个列出并处理（见 [shim](exec.md#shim)） | 无 |
+- 在 `main` 之前，Claude（bun）仍然是单线程的，所以预加载库可以 `setns(CLONE_NEWNS)`。
+- 切换之后，Claude 不再加载或打开本地的运行时文件（动态库、证书、`/etc/passwd`、NSS 配置）：端到端测试让远端的 `/` 只是一棵几乎为空的目录树，没有任何库和证书，`/etc/passwd` 中也没有本地用户，Claude 照常运行、经 TLS 访问 API、读取远端文件。telefs 记录疑似运行时文件的查找（见[组成](telefs.md#组成)），测试要求除了[环境探测](#其它内置行为)之外一个都没有。
+- Claude 的运行时在 `main` 之前就要读取 `/proc`，没有 `/proc` 时直接中止，不发出任何请求。tele 据此让启动视图的 `/proc` 为空，使预加载没有生效的 Claude 无法在本地视图中运行（见[已知陷阱](filesystem.md#已知陷阱)）。
+- 兼容性测试覆盖的功能中，Claude 自己按绝对路径启动的只有 `/bin/sh`，其余都按 PATH 查找（见 [shim](exec.md#shim)）。没有覆盖的功能（打开浏览器、剪贴板、通知等）启动的程序要用 `strace` 逐个找出并处理（见[验证方法](#验证方法)）。

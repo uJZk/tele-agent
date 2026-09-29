@@ -10,6 +10,7 @@ var neverForward = map[string]bool{
 	"HOME":                     true,
 	"LD_PRELOAD":               true,
 	"SSL_CERT_FILE":            true,
+	"SSL_CERT_DIR":             true,
 	"NODE_EXTRA_CA_CERTS":      true,
 	"CLAUDE_CODE_SHELL":        true,
 	"CLAUDE_CODE_SHELL_PREFIX": true,

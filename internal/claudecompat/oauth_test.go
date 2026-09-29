@@ -45,6 +45,9 @@ func TestOAuthRefreshThroughProxy(t *testing.T) {
 		Args:   []string{"--max-turns", "1"},
 		Env: append([]string{
 			"ANTHROPIC_API_KEY=",
+			// Claude may run as uid 0 of a user namespace, which must not
+			// find another user's /tmp/claude-0.
+			"CLAUDE_CODE_TMPDIR=" + t.TempDir(),
 			"HTTPS_PROXY=" + proxy.URL(), "https_proxy=" + proxy.URL(),
 		}, api.TrustEnv()...),
 	})

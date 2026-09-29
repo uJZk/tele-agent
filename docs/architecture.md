@@ -69,9 +69,12 @@ tele 让 Claude Code 仍在本地运行，但它看到和操作的「世界」�
 | 启动器第 1 阶段 | `tele <别名>[:<目录>] …` | 解析参数，然后通过 `/proc/self/exe` 在新的 userns + mountns 中重新 exec 自己 |
 | 会话主进程（启动器第 2 阶段） | 内部重新 exec | Claude 的父进程。持有会话连接、FUSE、shim 的 socket、CONNECT 代理和本地 exec 代理，始终停留在**本地视图** |
 | 视图辅助进程 | 会话主进程内部 exec | 在新的 mountns 中准备远端视图，然后退出（见[命名空间的构建](filesystem.md#命名空间的构建)） |
-| Claude | 会话主进程 exec | 原版 Claude Code，由预加载库 teleswitch 在 `main` 之前切换到**远端视图** |
+| 启动阶段 | 会话主进程内部 exec | 在新的 mountns 中把 `/proc` 盖成空的，然后 exec Claude（见[命名空间的构建](filesystem.md#命名空间的构建)） |
+| Claude | 启动阶段 exec | 原版 Claude Code，由预加载库 teleswitch 在 `main` 之前切换到**远端视图** |
 | shim | `<sess>/bin/{bash,tele-exec,sh,rg,git,uname,…}` → `tele` | 把请求交给会话主进程，见 [exec.md](exec.md) |
 | 远端服务 | `tele server run` / `tele server install --pair …` | 远端服务名为 `tele-server` |
+
+内部角色（会话主进程、视图辅助进程、启动阶段）按 `argv[0]` 分派，名字形如 `tele:session`，含有 shim 名中不会出现的 `:`。
 
 `<sess>` 是会话目录。它在本地创建，在远端视图中挂载到 `/.tele/<sid>`（远端不存在这个路径）。其中存放 shim、`CLAUDE_CODE_TMPDIR`、预加载库、会话 token、本地 CA bundle、系统提示词文件和会话主进程的日志（shim 出错时让用户去看它，见 [shim 与会话主进程](exec.md#shim-与会话主进程)）。
 

@@ -18,7 +18,7 @@ Claude 在项目之外需要访问的路径可以分为几类：自身的二进�
 |---|---|---|
 | Claude 二进制与动态库 | **先在本地视图中加载，再切换**：Claude 在本地 mountns 中 exec，动态链接器映射完所有 `DT_NEEDED` 库之后、`main` 之前，由预加载库把整个进程切换到远端视图（见 [teleswitch](#teleswitch)）。之后 `/proc/self/exe` 走的是 magic link，与路径无关，bun 读取内嵌 JS 不受影响。运行时才 dlopen 的库（例如 libgcc_s）加入 `LD_PRELOAD`，在切换前就映射好 | 不需要本地例外 |
 | DNS | 会话主进程在本地回环地址上提供 **CONNECT 代理**，并设置 `HTTPS_PROXY`、`HTTP_PROXY`；用户原有的代理串联在它后面（见下文的「CONNECT 代理」）。Claude 自己不做 DNS 解析，由代理在本地视图中完成 | 不需要本地例外 |
-| CA 证书 | **使用本地的 CA**：Claude 的 TLS 连接经本地代理从本机网络出站，信任关系应当与本地网络一致（例如公司的 HTTPS 中间人 CA），而远端可能根本没有装 `ca-certificates`，或者版本很旧。启动时把本地系统 CA 和用户原有的 `NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 合并成 `<sess>/ca-bundle.pem`（规则见下文的「CA bundle」），再用 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS` 指向它。**不** bind 到 `/etc/ssl`，所以远端视图中的 `/etc/ssl/certs` 仍然是远端的 | 用本地 CA，但不增加本地例外 |
+| CA 证书 | **使用本地的 CA**：Claude 的 TLS 连接经本地代理从本机网络出站，信任关系应当与本地网络一致（例如公司的 HTTPS 中间人 CA），而远端可能根本没有装 `ca-certificates`，或者版本很旧。启动时把本地系统 CA 和用户原有的 `NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 合并成 `<sess>/ca-bundle.pem`（规则见下文的「CA bundle」），再用 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS` 指向它。Claude 的运行时还会扫描一个证书目录（见[代理与 CA](claude-code.md#代理与-ca)），所以 `SSL_CERT_DIR` 指向会话目录中的一个空目录：否则它会读远端的 `/etc/ssl/certs`，远端可以借此让 Claude 信任它放进去的 CA。**不** bind 到 `/etc/ssl`，所以远端视图中的 `/etc/ssl/certs` 仍然是远端的，但 Claude 不读它 | 用本地 CA，但不增加本地例外 |
 | `git`、`rg`、`uname` | `PATH` 中只有 `<sess>/bin` 里的转发 shim | 在远端执行 |
 | `/bin/sh`（`shell: true` 的 spawn 固定使用它） | 替换为 tele 的 `sh` shim（见 [shim](exec.md#shim)） | 语义上等同于远端的 sh |
 | 必须在本地运行的程序（例如 `ps`，它要看到本地进程） | `PATH` 中放**本地 exec 代理**（见 [shim](exec.md#shim)） | 在本地执行 |
@@ -57,10 +57,10 @@ Claude 在项目之外需要访问的路径可以分为几类：自身的二进�
 ## 命名空间的构建
 
 1. `tele` 以 `CLONE_NEWUSER|CLONE_NEWNS` 重新 exec 自己，uid/gid 映射为自身，并带上 ambient `CAP_SYS_ADMIN` 和 `CAP_SYS_CHROOT`，成为**会话主进程**。它始终停留在**本地视图**：CONNECT 代理和本地 exec 代理在本地视图中工作。
-2. 会话主进程用 `DirectMountStrict` 在本地的一个私有目录挂载 telefs，内容是远端的 `/`。telefs 为本地集合中的路径合成挂载点占位节点。
-3. **准备远端视图**：一个辅助子进程在新的 mountns 中启动（Go 进程是多线程的，不能自己 `unshare(CLONE_NEWNS)`），把本地集合 bind 挂载到占位节点上，rbind `/proc`、`/sys`、`/dev`，然后 `pivot_root` 到 telefs，再 `stat /`（原因见[已知陷阱](#已知陷阱)）。会话主进程通过 `/proc/<pid>/ns/mnt` 持有这个 mountns 的 fd，辅助进程退出后命名空间依然存在。
-4. **启动 Claude**：在**本地视图**中 exec Claude，保留 ambient `CAP_SYS_ADMIN` 和 `CAP_SYS_CHROOT`（`setns` 需要这两个），设置 `LD_PRELOAD=<sess>/lib/teleswitch.so`，并通过继承的 fd 把远端视图的 mountns 交给它。动态链接器在本地视图中完成所有库的映射。
-5. **切换视图**：teleswitch 的构造函数在 `main` 之前依次执行：`setns(mntns_fd, CLONE_NEWNS)` → `chdir(<工作目录>)` → 关闭继承的 fd → 从环境中清除 `LD_PRELOAD` 和只供 teleswitch 使用的 `TELE_SWITCH_*`，让子进程不再继承（shim 需要的 `TELE_SESSION` 保留） → `PR_CAP_AMBIENT_CLEAR_ALL`，并用 `capset` 清空全部 capability。此后 Claude 以普通权限运行在远端视图中。
+2. 会话主进程先把自己的全部挂载设为私有，再用 `DirectMountStrict` 在本地的一个私有目录挂载 telefs，内容是远端的 `/`。telefs 为本地集合中的路径合成挂载点占位节点。会话目录在本地位于 `$XDG_CACHE_HOME/tele/s/<sid>`（默认 `~/.cache`），其中的 `tele` 是 tele 可执行文件的 bind 挂载，shim 都是指向它的相对符号链接，所以远端视图中的 shim 也能运行。
+3. **准备远端视图**：一个辅助子进程在新的 mountns 中启动（Go 进程是多线程的，不能自己 `unshare(CLONE_NEWNS)`），把本地集合递归地 bind 挂载到占位节点上（包括 rbind `/proc`、`/sys`、`/dev`），然后 `pivot_root(".", ".")` 到 telefs 并分离旧的根，再 `stat /`（原因见[已知陷阱](#已知陷阱)）。会话主进程通过 `/proc/<pid>/ns/mnt` 持有这个 mountns 的 fd，辅助进程随后退出，命名空间依然存在。以上都在 userns 中完成，不需要任何特权。
+4. **启动 Claude**：会话主进程启动一个**启动阶段**进程（tele 自身），它在新的 mountns 中用一个空的只读文件系统盖住 `/proc`，形成**启动视图**，然后 exec Claude。进程保留 ambient `CAP_SYS_ADMIN` 和 `CAP_SYS_CHROOT`（`setns` 需要这两个），通过继承的 fd 3 拿到远端视图的 mountns，并由启动阶段设置 `LD_PRELOAD=<本地会话目录>/lib/teleswitch.so`：启动视图是本地的，`/.tele/<sid>` 在那里不存在。启动阶段自己不带 `LD_PRELOAD`（库经 `TELE_LAUNCH_PRELOAD` 传给它），否则库会先切换启动阶段自己，并清掉它挂载所需的 capability。动态链接器在启动视图中完成所有库的映射。
+5. **切换视图**：teleswitch 的构造函数在 `main` 之前依次执行：`setns(mntns_fd, CLONE_NEWNS)` → `chdir(<工作目录>)` → 确认 `TELE_SESSION` 指向的会话目录存在（它只存在于远端视图中） → 关闭继承的 fd → 从环境中清除 `LD_PRELOAD` 和只供 teleswitch 使用的 `TELE_SWITCH_*`，让子进程不再继承（shim 需要的 `TELE_SESSION` 保留） → `PR_CAP_AMBIENT_CLEAR_ALL`，并用 `capset` 清空全部 capability。此后 Claude 以普通权限运行在远端视图中。
 6. shim 通过**抽象 unix socket** 与会话主进程通信。抽象 socket 属于网络命名空间，不依赖文件路径，所以在两种视图中都能访问。
 
 ## teleswitch
@@ -69,7 +69,9 @@ teleswitch 是一个用 C 写的小共享库。Go 运行时是多线程的，而
 
 它不链接 libc，只使用原始系统调用（见 [C 代码](coding-standards.md#c-代码teleswitch)），因此同时适用于 glibc 和 musl 版本的 Claude。它在构建时编译并嵌入 `tele`，运行时释放到 `<sess>/lib/`，所以对外发布仍然只有一个文件。
 
-**必须失败关闭**：任何一步失败，Claude 进程都要立即退出。在本地视图中继续运行的 Claude 会把本地文件当作远端文件修改。
+**必须失败关闭**：任何一步失败，Claude 进程都要立即退出（退出码见 `teleswitch.ExitCode`，并在 stderr 写一行原因）。在本地视图中继续运行的 Claude 会把本地文件当作远端文件修改。
+
+**清除环境变量时不改变数组长度**：被清除的条目改为指向空字符串，而不是把后面的条目前移。有的运行时（例如链接了 libc 的 Go 程序）沿初始栈上环境数组的 NULL 结尾向后找辅助向量，数组变短会让它们读到错误的辅助向量而崩溃。
 
 ## 已知陷阱
 
@@ -82,17 +84,8 @@ teleswitch 是一个用 C 写的小共享库。Go 运行时是多线程的，而
 | 子进程仍然带着 `CAP_SYS_ADMIN` | ambient capability 会被 exec 继承 | 在 teleswitch 中清除（见[命名空间的构建](#命名空间的构建)中的「切换视图」） |
 | 以 root 运行时，子进程在 exec 后又获得全部 capability | uid 0 在 exec 时会重新获得 capability，清空 ambient 集合对它无效 | 测试要以普通用户运行，才能验证无特权语义 |
 | bind 挂载落到了本地路径上 | 挂载目标路径上的绝对符号链接（例如远端的 `/bin` → `/usr/bin`）在 `pivot_root` 之前按本地的根解析 | 在远端根内解析挂载目标（`openat2` 的 `RESOLVE_IN_ROOT`），再挂载到解析出的 fd 上 |
-| 预加载库无法映射 | 会话目录位于 `noexec` 的文件系统上（有的系统的 `/tmp`、`/run/user/<uid>`），动态链接器无法以可执行权限映射库 | 会话目录选在允许执行的文件系统上 |
-| teleswitch 根本没有运行，Claude 却照常启动 | glibc 的动态链接器加载不了 `LD_PRELOAD` 中的库时（文件缺失、架构不符、无法映射），只打印 `cannot be preloaded … ignored`，然后照常运行程序。teleswitch 自身的失败关闭覆盖不到这种情况，Claude 会在本地视图中运行 | 不能只依赖 teleswitch 失败关闭：Claude 被 exec 时所处的视图本身必须无害，例如只包含 Claude 的二进制和动态库的只读最小视图，预加载失败时它碰不到本地的用户文件和凭证 |
-| 远端视图中的 bind 挂载被意外卸下（待验证） | FUSE 的 entry 失效通知会对 dentry 调用 `d_invalidate`，而 `d_invalidate` 会卸下挂在该 dentry 及其子孙上的所有挂载 | telefs 不对本地集合的挂载点及其祖先目录发送 entry 失效；这些节点的 LOOKUP 必须始终返回同一个 inode（见[变更监视](telefs.md#变更监视)） |
+| 预加载库无法映射 | 会话目录位于 `noexec` 的文件系统上（有的系统的 `/tmp`、`/run/user/<uid>`），动态链接器无法以可执行权限映射库 | 会话主进程拒绝 `noexec` 上的缓存目录，并提示用 `XDG_CACHE_HOME` 换到别处 |
+| teleswitch 根本没有运行，Claude 却照常启动 | glibc 的动态链接器加载不了 `LD_PRELOAD` 中的库时（文件缺失、架构不符、无法映射），只打印 `cannot be preloaded … ignored`，然后照常运行程序。teleswitch 自身的失败关闭覆盖不到这种情况，Claude 会在本地视图中运行 | 不能只依赖 teleswitch 失败关闭：Claude 在启动视图中被 exec，那里的 `/proc` 是空的。Claude 的运行时在 `main` 之前就要读 `/proc/self/maps` 等文件，读不到时直接中止，所以预加载没有生效的 Claude 根本启动不了；切换到远端视图之后，`/proc` 是本地的真实挂载（见[视图切换](claude-code.md#视图切换)） |
+| 远端视图中的 bind 挂载被意外卸下 | FUSE 的 entry 失效通知会对 dentry 调用 `d_invalidate`，而 `d_invalidate` 会卸下挂在该 dentry 及其子孙上的所有挂载 | telefs 不对本地集合的挂载点及其祖先目录发送 entry 失效；这些节点的 LOOKUP 必须始终返回同一个 inode（见[变更监视](telefs.md#变更监视)） |
 
 **兼容性**：Ubuntu 23.10 及以后的版本默认 `kernel.apparmor_restrict_unprivileged_userns=1`，需要随包附带一个授予 `userns,` 的 AppArmor profile；`user.max_user_namespaces=0` 的系统无法使用 tele。两者都由 `tele doctor` 检查（见[预检与修复策略](cli.md#预检与修复策略)）。
-
-## 待验证的假设
-
-下面是内核与命名空间层面的假设，实现前必须逐条验证。验证通过后把结论并入上文，然后删除对应条目。Claude Code 自身行为的假设见[待验证的行为](claude-code.md#待验证的行为)。
-
-| 假设 | 不成立时的退路 |
-|---|---|
-| `pivot_root` 到 FUSE 根，以及在嵌套的 mountns 中做 bind 挂载，都可以在 userns 中完成 | 无（这是方案的前提） |
-| entry 失效会卸下挂载点（见[已知陷阱](#已知陷阱)中的「bind 挂载被意外卸下」） | 如果不会，就取消对应的限制 |

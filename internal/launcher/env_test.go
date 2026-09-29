@@ -47,6 +47,7 @@ func TestClaudeEnv(t *testing.T) {
 		"NO_PROXY":                 "localhost,127.0.0.1,::1",
 		"SSL_CERT_FILE":            "/.tele/0123456789abcdef/ca-bundle.pem",
 		"NODE_EXTRA_CA_CERTS":      "/.tele/0123456789abcdef/ca-bundle.pem",
+		"SSL_CERT_DIR":             "/.tele/0123456789abcdef/certs",
 		"TELE_SESSION":             "/.tele/0123456789abcdef",
 		"LD_PRELOAD":               "/.tele/0123456789abcdef/lib/teleswitch.so",
 		"TELE_SWITCH_FD":           "3",

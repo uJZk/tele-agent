@@ -38,7 +38,10 @@ type Config struct {
 	FSRoot string
 	// Target, if set, replaces host discovery (tests).
 	Target *proto.TargetInfo
-	Logger *slog.Logger
+	// ScratchBase, if set, replaces ~/.cache/tele/s as the directory of
+	// the sessions' scratch directories (tests).
+	ScratchBase string
+	Logger      *slog.Logger
 }
 
 // Server serves sessions.
@@ -181,7 +184,11 @@ func (s *Server) handshake(ctx context.Context, sess *mux.Session) (*session, er
 	} else if target, err = hostinfo.Gather(ctx); err != nil {
 		return nil, reject(fmt.Sprintf("describe target: %v", err))
 	}
-	ss := &session{sid: hello.SessionID, scratch: filepath.Join(target.Home, ".cache", "tele", "s", hello.SessionID)}
+	base := s.cfg.ScratchBase
+	if base == "" {
+		base = filepath.Join(target.Home, ".cache", "tele", "s")
+	}
+	ss := &session{sid: hello.SessionID, scratch: filepath.Join(base, hello.SessionID)}
 	if err := os.MkdirAll(ss.scratch, 0o700); err != nil {
 		return nil, reject(fmt.Sprintf("create scratch dir: %v", err))
 	}

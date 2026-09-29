@@ -20,6 +20,20 @@ import (
 func Start(t testing.TB, token string, target *proto.TargetInfo) (endpoint.Endpoint, string) {
 	t.Helper()
 	root := t.TempDir()
+	return StartRoot(t, token, target, root), root
+}
+
+// StartRoot is Start serving root as "/"; "/" serves this machine's own
+// file system.
+func StartRoot(t testing.TB, token string, target *proto.TargetInfo, root string) endpoint.Endpoint {
+	t.Helper()
+	return StartConfig(t, server.Config{Token: []byte(token), FSRoot: root, Target: target})
+}
+
+// StartConfig runs a tele server with cfg on a unix socket until the test
+// ends.
+func StartConfig(t testing.TB, cfg server.Config) endpoint.Endpoint {
+	t.Helper()
 	ep, err := endpoint.Parse("unix:" + filepath.Join(t.TempDir(), "tele.sock"))
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +42,7 @@ func Start(t testing.TB, token string, target *proto.TargetInfo) (endpoint.Endpo
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := server.New(server.Config{Token: []byte(token), FSRoot: root, Target: target})
+	srv := server.New(cfg)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Go(func() { _ = srv.Serve(ctx, ln) })
@@ -36,7 +50,7 @@ func Start(t testing.TB, token string, target *proto.TargetInfo) (endpoint.Endpo
 		cancel()
 		wg.Wait()
 	})
-	return ep, root
+	return ep
 }
 
 // Hello opens session sid with the server at ep and returns it with the

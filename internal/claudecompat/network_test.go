@@ -131,3 +131,46 @@ func TestNoDirectConnections(t *testing.T) {
 		t.Error("no connection to the proxy recorded")
 	}
 }
+
+// TestCertDirectory pins that Claude's runtime reads a certificate
+// directory besides SSL_CERT_FILE: SSL_CERT_DIR if set, else
+// /etc/ssl/certs, which the remote view would take from the target. tele
+// points SSL_CERT_DIR at an empty local directory (docs/claude-code.md
+// "代理与 CA").
+func TestCertDirectory(t *testing.T) {
+	claude := claudetest.Require(t)
+	for _, tc := range []struct {
+		name    string
+		certDir bool // set SSL_CERT_DIR
+	}{
+		{"default directory", false},
+		{"SSL_CERT_DIR", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := claudetest.NewTrace(t, claude, "openat")
+			api := claudetest.NewTLSAPI(t, "api.tele-compat.invalid", claudetest.Say("done"))
+			proxy := claudetest.NewProxy(t, api.Addr(), "")
+			dir := t.TempDir()
+			env := append([]string{"HTTPS_PROXY=" + proxy.URL()}, api.TrustEnv()...)
+			if tc.certDir {
+				env = append(env, "SSL_CERT_DIR="+dir)
+			}
+			r := claudetest.Run(t, tr.Claude, api, claudetest.Options{Prompt: "hi", Env: env})
+			r.Must(t)
+			var system, given bool
+			for _, c := range tr.Calls(t) {
+				if !c.Own || c.Name != "openat" {
+					continue
+				}
+				system = system || strings.Contains(c.Line, `"/etc/ssl`)
+				given = given || strings.Contains(c.Line, `"`+dir+`"`)
+			}
+			if tc.certDir && (system || !given) {
+				t.Errorf("with SSL_CERT_DIR: opened /etc/ssl %v, the given directory %v; want only the given one", system, given)
+			}
+			if !tc.certDir && !system {
+				t.Errorf("without SSL_CERT_DIR Claude read nothing under /etc/ssl; tele's empty SSL_CERT_DIR may no longer be needed")
+			}
+		})
+	}
+}

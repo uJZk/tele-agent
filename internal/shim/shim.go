@@ -23,6 +23,7 @@ import (
 
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/shimsrv"
+	"github.com/ujzk/tele-agent/internal/sigexit"
 )
 
 // ExitFailure is the exit code for infrastructure failures: session main
@@ -322,7 +323,7 @@ func finish(st *proto.ShimStatus) int {
 		if st.Signal < 1 || st.Signal > 64 {
 			return fail(fmt.Errorf("invalid signal %d in exit status", st.Signal))
 		}
-		raise(unix.Signal(st.Signal))
+		sigexit.Raise(unix.Signal(st.Signal))
 		// Still alive: the signal's default action does not terminate.
 		return 128 + st.Signal
 	case st.Code < 0 || st.Code > 255:

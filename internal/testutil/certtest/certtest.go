@@ -10,14 +10,15 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"os"
 	"testing"
 	"time"
 )
 
-// SelfSigned returns a CA certificate for the given DNS names, valid now
-// and signed by itself, and its PEM encoding. The first name is also the
-// subject's common name.
+// SelfSigned returns a CA certificate for the given DNS names and IP
+// addresses, valid now and signed by itself, and its PEM encoding. The
+// first name is also the subject's common name.
 func SelfSigned(t testing.TB, names ...string) (tls.Certificate, []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -27,7 +28,8 @@ func SelfSigned(t testing.TB, names ...string) (tls.Certificate, []byte) {
 	tmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: names[0]},
-		DNSNames:              names,
+		DNSNames:              dnsNames(names),
+		IPAddresses:           ips(names),
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(24 * time.Hour),
 		IsCA:                  true,
@@ -69,4 +71,24 @@ func Names(t testing.TB, bundle []byte) []string {
 		}
 		names = append(names, c.Subject.CommonName)
 	}
+}
+
+func dnsNames(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if net.ParseIP(n) == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func ips(names []string) []net.IP {
+	var out []net.IP
+	for _, n := range names {
+		if ip := net.ParseIP(n); ip != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
