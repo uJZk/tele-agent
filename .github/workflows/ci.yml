@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: make build
+      - name: Check
+        run: make check vuln
+
+  # The privileged tests run twice, as an ordinary user and as root
+  # (docs/coding-standards.md "测试"), with the Claude compatibility and
+  # end-to-end tests against the newest verified Claude Code version.
+  priv:
+    runs-on: ubuntu-24.04
+    env:
+      TELE_TEST_REQUIRE_PRIV: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Allow unprivileged user namespaces and FUSE
+        # Ubuntu restricts unprivileged user namespaces through AppArmor
+        # (docs/filesystem.md "已知陷阱").
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update && sudo apt-get install -y strace
+          sudo chmod 666 /dev/fuse
+      - name: Install Claude Code
+        run: |
+          ver=$(awk '/^var Verified/,/^}/' internal/claudever/claudever.go | grep -o '[0-9][0-9.]*' | tail -1)
+          npm install -g "@anthropic-ai/claude-code@$ver"
+          echo "TELE_TEST_CLAUDE=$(readlink -f "$(command -v claude)")" >> "$GITHUB_ENV"
+          claude --version
+      - name: Build
+        run: make build
+      - name: Test as an ordinary user
+        run: make test-priv
+      - name: Test as root
+        # A separate build cache keeps root-owned files out of the user's.
+        run: |
+          sudo --preserve-env=TELE_TEST_REQUIRE_PRIV,TELE_TEST_CLAUDE \
+            env PATH="$PATH" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$RUNNER_TEMP/root-gocache" \
+            make test-priv

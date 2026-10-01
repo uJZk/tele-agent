@@ -11,7 +11,7 @@ make lint         # golangci-lint，必须零告警
 make check        # 提交前检查：格式、vet、lint、test
 make vuln         # govulncheck
 make dist         # 发布文件：各架构的归档、附带依赖的源码、SHA256SUMS（需要 aarch64-linux-gnu-gcc）
-make test-priv    # 特权集成测试（userns、FUSE）：设置 TELE_TEST_REQUIRE_PRIV=1，环境不具备能力时失败而不是跳过
+make test-priv    # 特权集成测试（userns、FUSE）：设置 TELE_TEST_REQUIRE_PRIV=1，环境不具备能力时失败而不是跳过；以 root 和普通用户各运行一遍
 go test ./internal/<pkg> -run TestName   # 运行单个测试
 ```
 

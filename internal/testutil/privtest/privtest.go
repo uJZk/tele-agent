@@ -63,11 +63,14 @@ func RequireFUSE(t testing.TB) {
 	_ = unix.Close(fd)
 }
 
-// RequireRoot skips or fails t unless it runs as uid 0 in the initial user
-// namespace, for tests that mount without creating a user namespace.
+// RequireRoot skips t unless it runs as uid 0 in the initial user
+// namespace, for tests that mount without creating a user namespace. It
+// skips even under TELE_TEST_REQUIRE_PRIV: the privileged tests run once as
+// root and once as an ordinary user, which must still run every user
+// namespace and FUSE test (docs/coding-standards.md "测试").
 func RequireRoot(t testing.TB) {
 	t.Helper()
 	if os.Geteuid() != 0 {
-		unavailable(t, "root", unix.EPERM)
+		t.Skip("needs root; run the privileged tests as root to cover it")
 	}
 }
