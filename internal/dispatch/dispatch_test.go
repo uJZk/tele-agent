@@ -3,6 +3,7 @@ package dispatch
 import (
 	"errors"
 	"fmt"
+	"path"
 	"reflect"
 	"slices"
 	"strings"
@@ -179,6 +180,25 @@ func TestClassify(t *testing.T) {
 			want: Action{Argv: []string{"sh", "-c", fmt.Sprintf(clipboardScripts[1], testShot), "a0"}}},
 		{name: "sh", sessDir: "relative", argv: []string{"/bin/sh", "-c", "rm -f -- relative/tmp/claude-0/" + screenshotName},
 			want: Action{Argv: []string{"sh", "-c", "rm -f -- relative/tmp/claude-0/" + screenshotName}}},
+
+		// The IDE detection script runs locally; nothing else like it does.
+		{name: "sh", argv: []string{"/bin/sh", "-c", ideScript},
+			want: Action{Local: true, Argv: []string{"sh", "-c", ideScript}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", ideScript + "; id"},
+			want: Action{Argv: []string{"sh", "-c", ideScript + "; id"}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", ideScript, "a0"},
+			want: Action{Argv: []string{"sh", "-c", ideScript, "a0"}}},
+
+		// The editor gets one absolute path, which stays a path in the
+		// remote view.
+		{name: NameEditor, argv: []string{NameEditor, "/home/bob/proj/CLAUDE.md"},
+			want: Action{Local: true, Edit: "/home/bob/proj/CLAUDE.md"}},
+		{name: NameEditor, argv: []string{"/x/" + NameEditor, "/home/bob/proj/../.claude//CLAUDE.md"},
+			want: Action{Local: true, Edit: "/home/bob/.claude/CLAUDE.md"}},
+		{name: NameEditor, argv: []string{NameEditor, "+1", "/home/bob/CLAUDE.md"}, wantErr: ErrRejected},
+		{name: NameEditor, argv: []string{NameEditor, "CLAUDE.md"}, wantErr: ErrRejected},
+		{name: NameEditor, argv: []string{NameEditor, "/x\ny"}, wantErr: ErrRejected},
+		{name: NameEditor, argv: []string{NameEditor}, wantErr: ErrRejected},
 
 		// Errors.
 		{name: "python3", argv: []string{"python3"}, wantErr: ErrUnknownProgram},
@@ -480,6 +500,8 @@ func FuzzClassify(f *testing.F) {
 	f.Add("xdg-open", "https://x")
 	f.Add("xclip", "-selection\x00clipboard")
 	f.Add("sh", "-c\x00"+fmt.Sprintf(clipboardScripts[2], testShot))
+	f.Add("sh", "-c\x00"+ideScript)
+	f.Add(NameEditor, "/home/bob/CLAUDE.md")
 	f.Add("x", "")
 	f.Fuzz(func(t *testing.T, name, args string) {
 		argv := []string{name}
@@ -494,12 +516,18 @@ func FuzzClassify(f *testing.F) {
 		if err != nil {
 			return
 		}
+		if act.Edit != "" {
+			if name != NameEditor || !act.Local || act.Argv != nil || len(orig) != 2 || !path.IsAbs(act.Edit) {
+				t.Fatalf("Classify(%q, %q) = %+v", name, orig, act)
+			}
+			return
+		}
 		if len(act.Argv) == 0 {
 			t.Fatalf("Classify(%q, %q) returned an empty Argv", name, orig)
 		}
 		switch {
 		case act.Local && name == "sh":
-			if _, ok := clipboardScript(orig[2], testSess); !ok || len(orig) != 3 || orig[1] != "-c" {
+			if _, ok := clipboardScript(orig[2], testSess); (!ok && orig[2] != ideScript) || len(orig) != 3 || orig[1] != "-c" {
 				t.Fatalf("Classify(%q, %q) = local %q", name, orig, act.Argv)
 			}
 		case act.Local:

@@ -50,8 +50,25 @@ const maxSignal = 64
 //
 // Its own process group makes the program a background job for a
 // controlling terminal: reading from the terminal stops it with SIGTTIN.
-// Local exec proxies therefore must not need the terminal.
+// Local exec proxies therefore must not need the terminal; RunInGroup is
+// for one that does.
 func Run(ctx context.Context, argv []string, dir string, env []string, stdin, stdout, stderr *os.File, sigs <-chan int) proto.ShimStatus {
+	return run(ctx, argv, dir, env, stdin, stdout, stderr, sigs, 0)
+}
+
+// RunInGroup is Run for a program that needs the terminal: it joins the
+// existing process group pgid, the foreground job whose terminal it uses,
+// instead of starting its own. Signals and the SIGKILL when ctx ends then
+// go to the program alone, never to the group, which is not its own.
+func RunInGroup(ctx context.Context, argv []string, dir string, env []string, stdin, stdout, stderr *os.File, sigs <-chan int, pgid int) proto.ShimStatus {
+	if pgid <= 0 {
+		return proto.ShimStatus{Code: codeFailure, Msg: fmt.Sprintf("local exec: bad process group %d", pgid)}
+	}
+	return run(ctx, argv, dir, env, stdin, stdout, stderr, sigs, pgid)
+}
+
+// run is Run in a new process group when pgid is 0, RunInGroup otherwise.
+func run(ctx context.Context, argv []string, dir string, env []string, stdin, stdout, stderr *os.File, sigs <-chan int, pgid int) proto.ShimStatus {
 	if len(argv) == 0 {
 		return proto.ShimStatus{Code: codeFailure, Msg: "local exec: empty command"}
 	}
@@ -83,23 +100,27 @@ func Run(ctx context.Context, argv []string, dir string, env []string, stdin, st
 		Dir:   dir,
 		Env:   env,
 		Files: files,
-		Sys:   &syscall.SysProcAttr{Setpgid: true},
+		Sys:   &syscall.SysProcAttr{Setpgid: true, Pgid: pgid},
 	})
 	closeNull()
 	if err != nil {
 		return NotStarted(err, "%s: %v", argv[0], err)
 	}
-	return wait(ctx, proc, sigs)
+	return wait(ctx, proc, sigs, pgid == 0)
 }
 
 // wait forwards signals to proc's group until proc exits, then reaps it.
 // proc is observed with waitid(WNOWAIT) and reaped only after forwarding
 // has stopped: while it is an unreaped zombie its pid, and so the group
-// id, cannot be reused, so no signal can reach an unrelated group.
-func wait(ctx context.Context, proc *os.Process, sigs <-chan int) proto.ShimStatus {
-	pgid := proc.Pid
+// id, cannot be reused, so no signal can reach an unrelated group. Signals
+// go to proc alone unless group is set.
+func wait(ctx context.Context, proc *os.Process, sigs <-chan int, group bool) proto.ShimStatus {
+	target := proc.Pid
+	if group {
+		target = -proc.Pid
+	}
 	exited := make(chan error, 1)
-	go func() { exited <- waitExited(pgid) }()
+	go func() { exited <- waitExited(proc.Pid) }()
 
 	done := ctx.Done()
 	var waitErr error
@@ -114,10 +135,10 @@ loop:
 				continue
 			}
 			if sig >= 1 && sig <= maxSignal {
-				_ = unix.Kill(-pgid, unix.Signal(sig)) // ESRCH: the group is gone already
+				_ = unix.Kill(target, unix.Signal(sig)) // ESRCH: the group is gone already
 			}
 		case <-done:
-			_ = unix.Kill(-pgid, unix.SIGKILL)
+			_ = unix.Kill(target, unix.SIGKILL)
 			done = nil
 		}
 	}
@@ -179,6 +200,11 @@ func pathOf(env []string) string {
 		}
 	}
 	return p
+}
+
+// LookPath finds the program file in env's PATH as Run does.
+func LookPath(file string, env []string) (string, error) {
+	return lookPath(file, pathOf(env))
 }
 
 // lookPath resolves file like execvp(3): a name with a slash is used as it

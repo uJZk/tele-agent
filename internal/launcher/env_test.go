@@ -21,7 +21,7 @@ func TestClaudeEnv(t *testing.T) {
 		"https_proxy=http://corp:3128", "HTTPS_PROXY=http://corp:3128", "all_proxy=socks5://x",
 		"SSL_CERT_FILE=/etc/corp.pem", "LD_PRELOAD=/x.so", "TELE_SESSION=/stale",
 		"CLAUDE_CODE_SHELL=/bin/zsh", "TMPDIR=/tmp/alice", "noequals",
-		"BROWSER=firefox", "DISPLAY=:0", "WAYLAND_DISPLAY=wayland-0",
+		"BROWSER=firefox", "DISPLAY=:0", "WAYLAND_DISPLAY=wayland-0", "VISUAL=code",
 	}
 	env := claudeEnv(claudeEnvSpec{
 		UserEnv:  user,
@@ -34,11 +34,12 @@ func TestClaudeEnv(t *testing.T) {
 	m := envMap(env)
 
 	want := map[string]string{
-		"PATH":                     "/.tele/0123456789abcdef/bin",
-		"HOME":                     "/home/bob",
-		"USER":                     "bob",
-		"TERM":                     "xterm",
-		"EDITOR":                   "vim",
+		"PATH": "/.tele/0123456789abcdef/bin",
+		"HOME": "/home/bob",
+		"USER": "bob",
+		"TERM": "xterm",
+		// The user's editor is chosen by tele-editor, which runs it here.
+		"VISUAL":                   "tele-editor",
 		"CLAUDE_CODE_SHELL":        "/.tele/0123456789abcdef/bin/bash",
 		"CLAUDE_CODE_SHELL_PREFIX": "/.tele/0123456789abcdef/bin/tele-exec",
 		"CLAUDE_CODE_TMPDIR":       "/.tele/0123456789abcdef/tmp",
@@ -62,7 +63,7 @@ func TestClaudeEnv(t *testing.T) {
 			t.Errorf("%s = %q, want exactly [%q]", k, got, v)
 		}
 	}
-	for _, k := range []string{"all_proxy", "TMPDIR", "noequals", "BROWSER"} {
+	for _, k := range []string{"all_proxy", "TMPDIR", "noequals", "BROWSER", "EDITOR"} {
 		if _, ok := m[k]; ok {
 			t.Errorf("%s leaked into Claude's environment", k)
 		}

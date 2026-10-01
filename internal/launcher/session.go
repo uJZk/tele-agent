@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -388,7 +389,7 @@ func (s *session) shims(p paths) error {
 			return err
 		}
 	}
-	for _, name := range dispatch.DesktopPrograms {
+	for _, name := range slices.Concat(dispatch.DesktopPrograms, []string{dispatch.NameEditor}) {
 		if err := os.Symlink("../tele", filepath.Join(p.local, binDir, name)); err != nil {
 			return err
 		}

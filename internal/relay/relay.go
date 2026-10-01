@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/dispatch"
+	"github.com/ujzk/tele-agent/internal/editproxy"
 	"github.com/ujzk/tele-agent/internal/localexec"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/rexec"
@@ -85,6 +86,12 @@ func (r *Relay) Serve(ctx context.Context, req *shimsrv.Request, sigs <-chan int
 	if err != nil {
 		closeAll(req)
 		return proto.ShimStatus{Code: codeFailure, Msg: err.Error()}
+	}
+	if act.Edit != "" {
+		defer closeAll(req)
+		return editproxy.Edit(ctx, editproxy.Config{Dir: r.cfg.LocalDir, Env: r.cfg.LocalEnv}, editproxy.Request{
+			Path: act.Edit, ViewPID: req.PeerPID, Stdin: req.Stdin, Stdout: req.Stdout, Stderr: req.Stderr,
+		}, sigs)
 	}
 	if act.Local {
 		defer closeAll(req)

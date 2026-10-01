@@ -3,6 +3,8 @@ package launcher
 import (
 	"slices"
 	"strings"
+
+	"github.com/ujzk/tele-agent/internal/dispatch"
 )
 
 // claudeEnvSpec holds what claudeEnv needs to build the environment of the
@@ -28,6 +30,10 @@ var droppedUserEnv = []string{
 	// that is the target's; the local xdg-open proxy uses it instead
 	// (docs/claude-code.md "浏览器、剪贴板与通知").
 	"BROWSER",
+	// Claude would start the editor by a name without a shim, or by a path
+	// that is the target's; it gets tele-editor instead, which runs the
+	// user's editor here (docs/claude-code.md "外部编辑器与 IDE 探测").
+	"VISUAL", "EDITOR",
 	"CLAUDE_CODE_SHELL", "CLAUDE_CODE_SHELL_PREFIX", "CLAUDE_CODE_TMPDIR", "USE_BUILTIN_RIPGREP",
 }
 
@@ -74,6 +80,7 @@ func claudeEnv(s claudeEnvSpec) []string {
 		"CLAUDE_CODE_SHELL_PREFIX="+bin+"/tele-exec",
 		"CLAUDE_CODE_TMPDIR="+s.SessDir+"/"+tmpDir,
 		"USE_BUILTIN_RIPGREP=0",
+		"VISUAL="+dispatch.NameEditor,
 		"HTTPS_PROXY="+s.ProxyURL, "https_proxy="+s.ProxyURL,
 		"HTTP_PROXY="+s.ProxyURL, "http_proxy="+s.ProxyURL,
 		"NO_PROXY=localhost,127.0.0.1,::1", "no_proxy=localhost,127.0.0.1,::1",

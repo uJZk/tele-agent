@@ -25,6 +25,7 @@ type desktop struct {
 	*claudetest.Session
 	api  *claudetest.API
 	tr   *claudetest.Trace
+	home string // Claude's HOME
 	sess string // stands for the session directory; CLAUDE_CODE_TMPDIR is in it
 	bin  string // stands for the shim directory
 	log  string // the fakes' argv log
@@ -41,11 +42,14 @@ type desktopSpec struct {
 	Env       []string
 	Config    map[string]any
 	Turns     []claudetest.Turn
+	// Scripts are more programs in the shim directory, by name: shell
+	// scripts written before claude starts, which looks some up at once.
+	Scripts map[string]string
 }
 
 func newDesktop(t *testing.T, spec desktopSpec) *desktop {
 	t.Helper()
-	d := &desktop{sess: t.TempDir(), bin: t.TempDir(), log: filepath.Join(t.TempDir(), "argv")}
+	d := &desktop{home: t.TempDir(), sess: t.TempDir(), bin: t.TempDir(), log: filepath.Join(t.TempDir(), "argv")}
 	d.tr = claudetest.NewTrace(t, claudetest.Require(t))
 	if err := os.Mkdir(filepath.Join(d.sess, "tmp"), 0o700); err != nil {
 		t.Fatal(err)
@@ -72,9 +76,12 @@ esac
 	for _, name := range progs {
 		claudetest.WriteScript(t, d.bin, name, logArgv(d.log, play+" "+name))
 	}
+	for name, body := range spec.Scripts {
+		claudetest.WriteScript(t, d.bin, name, body)
+	}
 	d.api = claudetest.NewAPI(t, spec.Turns...)
 	d.Session = claudetest.Start(t, d.tr.Claude, d.api, claudetest.TTYOptions{
-		Options: claudetest.Options{Env: append([]string{
+		Options: claudetest.Options{Home: d.home, Env: append([]string{
 			"PATH=" + d.bin, "SHELL=" + d.bin + "/bash",
 			"CLAUDE_CODE_SHELL=" + d.bin + "/bash",
 			"CLAUDE_CODE_TMPDIR=" + d.sess + "/tmp",
@@ -100,9 +107,15 @@ func (d *desktop) waitLogged(t *testing.T, name string) {
 }
 
 // started stops claude and returns the desktop programs it started itself
-// and the sh -c scripts it ran, other than the IDE detection. Each must be
-// one tele runs locally; any other program must be a shim.
+// and the sh -c scripts it ran, other than the IDE detection (see ide).
+// Each must be one tele runs locally; any other program must be a shim.
 func (d *desktop) started(t *testing.T) (progs, scripts [][]string) {
+	progs, scripts, _ = d.startedAll(t)
+	return progs, scripts
+}
+
+// startedAll is started that also returns the IDE detection scripts.
+func (d *desktop) startedAll(t *testing.T) (progs, scripts, ide [][]string) {
 	t.Helper()
 	d.Stop()
 	seen := map[int]bool{} // children whose first program was seen
@@ -118,10 +131,9 @@ func (d *desktop) started(t *testing.T) (progs, scripts [][]string) {
 		}
 		name := filepath.Base(p)
 		switch {
+		case p == "/bin/sh" && len(argv) == 3 && strings.HasPrefix(argv[2], "ps aux | grep"):
+			ide = append(ide, argv)
 		case p == "/bin/sh":
-			if len(argv) == 3 && strings.HasPrefix(argv[2], "ps aux | grep") {
-				continue // IDE detection: no desktop program
-			}
 			scripts = append(scripts, argv)
 		case filepath.Dir(p) == d.bin && slices.Contains(dispatch.DesktopPrograms, name):
 			progs = append(progs, argv)
@@ -135,7 +147,7 @@ func (d *desktop) started(t *testing.T) (progs, scripts [][]string) {
 			t.Errorf("Claude started %q, which tele does not run locally: %+v, %v", argv, act, err)
 		}
 	}
-	return progs, scripts
+	return progs, scripts, ide
 }
 
 func writePNG(t *testing.T, name string) {

@@ -102,6 +102,16 @@ Claude 写全局配置时，先在 `$HOME` 中创建 `.claude.json.tmp.<pid>.<�
   - **已知限制**：截图文件在 `CLAUDE_CODE_TMPDIR` 中，Claude 删除它之前如果恰好有远端命令开始执行，它会随 scratch 同步上传到远端（见 [scratch 路径改写与回传](exec.md#scratch-路径改写与回传)）。
 - **通知**：只经过终端（响铃，或 iTerm2、kitty 等的 OSC 序列），不启动任何程序，所以本来就到达本地终端。
 
+## 外部编辑器与 IDE 探测
+
+- **编辑器的选择**：Claude 依次取 `VISUAL`、`EDITOR`，按空格拆成命令和参数；都没有时，在启动时按 `PATH` 查找 `code`、`vi`、`nano`，取第一个找到的并缓存。
+- **两种用途**：只是打开文件（例如跳到某一行）时，名字属于 `code`、`cursor`、`subl` 等 GUI 编辑器的脱离终端启动（`stdio: ignore`），不等待；其余的当作终端编辑器，切换到备用屏幕，继承 stdio 同步运行，名字像 `vi`、`nano`、`emacs` 的还额外得到 `+<行号>`。编辑文件并读回结果时，一律同步等待编辑器退出再重新读取文件，`code` 和 `subl` 分别换成 `code -w` 和 `subl --wait`。
+- **编辑的文件**：Ctrl+G 编辑提示词，文件是 `CLAUDE_CODE_TMPDIR/claude-<uid>/claude-prompt-<uuid>.md`；`/memory` 编辑 `~/.claude/CLAUDE.md` 或项目的 `./CLAUDE.md`；另外还有计划文件和 `/keybindings`。Claude 都传绝对路径，有的文件在本地集合中，有的在远端。
+- **在 tele 下**：用户原来的编辑器要么是一个没有 shim 的名字，要么是远端视图中的路径；后者会让远端的可执行文件在本地运行，还能访问本地集合中的凭证。所以 tele 不把用户的 `VISUAL`、`EDITOR` 交给 Claude，而是设 `VISUAL=tele-editor`。这个名字不像任何已知的编辑器，Claude 总是按终端编辑器、只传文件路径来启动它，`tele-editor` shim 因此只接受一个绝对路径。会话主进程按用户原来的环境，用与 Claude 相同的规则选出编辑器，在本地运行它（见 [shim](exec.md#shim)）：
+  - 编辑器只拿到文件的**副本**，位于本地会话目录中的一个新目录里，文件名不变。文件按 Claude 看到的远端视图解析：经 shim 进程的 `/proc/<pid>/root` 打开，用 `RESOLVE_IN_ROOT` 限制在这个根内，所以远端的文件经 telefs 读写，本地集合中的文件经 bind 挂载读写，远端的符号链接也不会指到本机自己的文件上。编辑器退出后，副本有变化时就原地写回（截断后重写，保留文件本身、属主和权限），没有变化时不动原文件。
+  - 编辑器加入 shim 所在的进程组，也就是终端的前台进程组，与不经 tele 时作为 Claude 的子进程一样，可以读写终端。
+- **IDE 探测**：Claude 启动时用 `/bin/sh -c` 运行一条固定的 `ps aux | grep -E "code|cursor|…" | grep -v grep`，找出本机正在运行的 IDE，用于 IDE 集成。IDE 集成的锁文件在 `~/.claude/ide`（本地集合），连接走本地回环，所以探测要看本地的进程：会话主进程逐字识别这条脚本，作为本地 exec 代理执行。
+
 ## 注入的环境
 
 ```bash
@@ -114,6 +124,7 @@ CLAUDE_CODE_SHELL=<sess>/bin/bash
 CLAUDE_CODE_SHELL_PREFIX=<sess>/bin/tele-exec
 CLAUDE_CODE_TMPDIR=<sess>/tmp                     # 本地 scratch；远端路径由 shim 改写（/tmp 本身是远端的）
 USE_BUILTIN_RIPGREP=0
+VISUAL=tele-editor                                # 见「外部编辑器与 IDE 探测」
 HTTPS_PROXY=http://tele:<密码>@127.0.0.1:<port>   # 本地 CONNECT 代理；HTTP_PROXY 和小写形式同理
 NO_PROXY=localhost,127.0.0.1,::1                  # 回环连接不走代理：IDE 插件在本地，远端 MCP 的端口由本地转发
 SSL_CERT_FILE=<sess>/ca-bundle.pem                # 本地 CA 合并而成；NODE_EXTRA_CA_CERTS 同样指向它
@@ -122,7 +133,7 @@ TELE_SESSION=<sess>                               # shim 据此找到会话主�
 LD_PRELOAD=<本地会话目录>/lib/teleswitch.so       # 由启动阶段设置；与 TELE_SWITCH_FD、TELE_SWITCH_DIR 一起，在视图切换后被清除
 ```
 
-用户原有环境中指向本地资源的变量（代理、CA、`TMPDIR`、`XDG_RUNTIME_DIR`、`SSH_AUTH_SOCK` 等）和 `BROWSER` 不传给 Claude，具体列表以代码为准。`DISPLAY`、`WAYLAND_DISPLAY` 照传，原因见[浏览器、剪贴板与通知](#浏览器剪贴板与通知)。
+用户原有环境中指向本地资源的变量（代理、CA、`TMPDIR`、`XDG_RUNTIME_DIR`、`SSH_AUTH_SOCK` 等），以及 `BROWSER`、`VISUAL`、`EDITOR` 不传给 Claude，具体列表以代码为准。`DISPLAY`、`WAYLAND_DISPLAY` 照传，原因见[浏览器、剪贴板与通知](#浏览器剪贴板与通知)。
 
 命令行参数：`--append-system-prompt-file <sess>/system-prompt.md`；需要时加 `--setting-sources`、`--settings`（改写后的 hooks）。
 
