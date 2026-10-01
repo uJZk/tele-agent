@@ -70,6 +70,14 @@ func (r Result) Must(t testing.TB) {
 	}
 }
 
+// PinnedArgs are claude arguments every test passes, ahead of its own, so
+// that a test does not depend on a default that changes between Claude Code
+// versions. Without an explicit permission mode, newer versions run -p in
+// auto mode, whose classifier asks the API about commands such as a for
+// loop even under --allowedTools Bash; the scripted API cannot answer, so
+// Claude blocks the command.
+var PinnedArgs = []string{"--permission-mode", "default"}
+
 // Run runs claude -p against api with a minimal environment that holds
 // nothing from the test's own, so that the user's configuration, proxy
 // and credentials never leak into a test.
@@ -92,7 +100,7 @@ func Run(t testing.TB, claude string, api *API, o Options) Result {
 		"DISABLE_AUTOUPDATER=1",
 	}
 	env = append(env, o.Env...)
-	args := append([]string{"-p", o.Prompt, "--output-format", "json"}, o.Args...)
+	args := append(append([]string{"-p", o.Prompt, "--output-format", "json"}, PinnedArgs...), o.Args...)
 
 	ctx, cancel := context.WithTimeout(t.Context(), runTimeout)
 	defer cancel()

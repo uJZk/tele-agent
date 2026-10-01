@@ -56,8 +56,9 @@ func runTele(t *testing.T, tele, claude string, api *claudetest.API, ep, dir str
 	logFile := filepath.Join(t.TempDir(), "session.log")
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, tele, append([]string{"--debug", "--log", logFile, "--claude", claude, "dev:" + dir,
-		"-p", "go", "--output-format", "json"}, args...)...)
+	teleArgs := []string{"--debug", "--log", logFile, "--claude", claude, "dev:" + dir, "-p", "go", "--output-format", "json"}
+	teleArgs = append(append(teleArgs, claudetest.PinnedArgs...), args...)
+	cmd := exec.CommandContext(ctx, tele, teleArgs...)
 	cmd.Env = append([]string{
 		"PATH=/usr/local/bin:/usr/bin:/bin",
 		"HOME=" + r.home,
