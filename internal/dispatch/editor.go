@@ -17,9 +17,9 @@ const NameEditor = "tele-editor"
 // local IDEs only. It runs locally, like the clipboard scripts.
 const ideScript = `ps aux | grep -E "code|cursor|windsurf|devin-desktop|idea|pycharm|webstorm|phpstorm|rubymine|clion|goland|rider|datagrip|dataspell|aqua|gateway|fleet|android-studio" | grep -v grep`
 
-// editorAction returns the Action for the editor shim with arguments args.
-// Claude takes tele-editor for a terminal editor it knows nothing about, so
-// it passes exactly the file: no line number, no options.
+// editorAction returns the Action for the editor shim with arguments args:
+// exactly the file, as Claude passes it (docs/claude-code.md "外部编辑器与
+// IDE 探测").
 func editorAction(args []string) (Action, error) {
 	if len(args) != 1 || !path.IsAbs(args[0]) || strings.ContainsFunc(args[0], isControl) {
 		return Action{}, fmt.Errorf("%w: %s %q: only one absolute path", ErrRejected, NameEditor, args)

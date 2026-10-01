@@ -41,9 +41,8 @@ const codeFailure = 255
 // nor EDITOR is set, in its order.
 var fallbacks = []string{"code", "vi", "nano"}
 
-// waitFlags makes GUI editors wait for the file to be closed, as Claude
-// does for the same names; without it they return at once and the copy is
-// written back unchanged.
+// waitFlags makes GUI editors wait for the file to be closed; without it
+// they return at once and the copy is written back unchanged.
 var waitFlags = map[string]string{"code": "-w", "subl": "--wait"}
 
 // ErrNoEditor reports that the user has no editor configured or installed.
