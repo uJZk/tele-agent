@@ -92,7 +92,7 @@
 - 不用 `sleep` 做同步。需要等待时用 channel，或者带超时的轮询辅助函数。
 - **分层**：
   1. **单元测试**：不需要特权和网络，`go test ./...` 必须能以普通用户身份在任何 Linux 上通过。
-  2. **特权集成测试**（userns、FUSE、`pivot_root`）：先检测环境能力，不满足时 `t.Skip` 并写明原因。设置 `TELE_TEST_REQUIRE_PRIV=1`（`make test-priv`）时改为直接失败，避免 CI 中的测试被静默跳过。
+  2. **特权集成测试**（userns、FUSE、`pivot_root`）：先检测环境能力，不满足时 `t.Skip` 并写明原因。设置 `TELE_TEST_REQUIRE_PRIV=1`（`make test-priv`）时改为直接失败，避免 CI 中的测试被静默跳过。这一层要以 root 和普通用户各运行一遍：root 在 exec 时会重新获得 capability，验证不了无特权的语义（见[已知陷阱](filesystem.md#已知陷阱)）；而不建 userns、直接挂载的测试只能以 root 运行，所以它们以普通用户运行时总是跳过，即使设置了 `TELE_TEST_REQUIRE_PRIV`。两轮都要设置这个变量。
   3. **Claude 兼容性测试**：用模拟的 Anthropic API 按脚本驱动真实的 `claude -p`，由 `TELE_TEST_CLAUDE=<claude 路径>` 启用。它用来验证 [claude-code.md](claude-code.md) 中的每一条契约。辅助代码在 `internal/testutil/claudetest`（模拟 API、CONNECT 代理、strace 包装）。这一层是可选启用的：没有设置变量时跳过，`TELE_TEST_REQUIRE_PRIV` 不影响它。
   4. **故障注入**：会话层在 `net.Conn` 这一层注入断线、延迟、半开连接和乱序重连；端到端测试用 `tc netem`、toxiproxy 和网络命名空间切换，模拟丢包、断流和 IP 变化。
 - 新功能和 bug 修复都必须带测试。修 bug 时，先写一个能复现问题的失败测试。

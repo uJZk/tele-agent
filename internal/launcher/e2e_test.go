@@ -152,6 +152,11 @@ func TestExecChainWithClaude(t *testing.T) {
 		rl.Wait()
 	}()
 
+	// Grep runs rg on the target, which is this machine; without it Claude
+	// only reports that no files matched.
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Fatalf("the target needs ripgrep for Grep: %v", err)
+	}
 	work := t.TempDir()
 	if err := os.WriteFile(filepath.Join(work, "a.txt"), []byte("needle\n"), 0o600); err != nil {
 		t.Fatal(err)

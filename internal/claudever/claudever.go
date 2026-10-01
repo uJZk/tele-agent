@@ -19,6 +19,7 @@ import (
 // until the tested version is listed.
 var Verified = []string{
 	"2.1.284",
+	"2.1.286",
 }
 
 // versionTimeout bounds claude --version.

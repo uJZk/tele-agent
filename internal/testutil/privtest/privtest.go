@@ -33,7 +33,13 @@ var (
 )
 
 // RequireUserNS skips or fails t unless the process can create a user and
-// mount namespace with its own uid mapped to itself.
+// mount namespace with its own uid mapped to itself, and use CAP_SYS_ADMIN
+// in it. Creating the namespace is not enough: Ubuntu's AppArmor
+// restriction on unprivileged user namespaces (docs/filesystem.md
+// "已知陷阱") lets the creation succeed and denies every capability in the
+// namespace. So the probe also unshares a second mount namespace, after
+// which os/exec makes the mounts private, and raises CAP_SYS_ADMIN as an
+// ambient capability, as the tests do.
 func RequireUserNS(t testing.TB) {
 	t.Helper()
 	usernsOnce.Do(func() {
@@ -41,9 +47,11 @@ func RequireUserNS(t testing.TB) {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "/bin/true")
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
-			UidMappings: []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
-			GidMappings: []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
+			Cloneflags:   syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			Unshareflags: syscall.CLONE_NEWNS,
+			UidMappings:  []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
+			GidMappings:  []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
+			AmbientCaps:  []uintptr{unix.CAP_SYS_ADMIN},
 		}
 		errUserNS = cmd.Run()
 	})
@@ -63,11 +71,14 @@ func RequireFUSE(t testing.TB) {
 	_ = unix.Close(fd)
 }
 
-// RequireRoot skips or fails t unless it runs as uid 0 in the initial user
-// namespace, for tests that mount without creating a user namespace.
+// RequireRoot skips t unless it runs as uid 0 in the initial user
+// namespace, for tests that mount without creating a user namespace. It
+// skips even under TELE_TEST_REQUIRE_PRIV: the privileged tests run once as
+// root and once as an ordinary user, which must still run every user
+// namespace and FUSE test (docs/coding-standards.md "测试").
 func RequireRoot(t testing.TB) {
 	t.Helper()
 	if os.Geteuid() != 0 {
-		unavailable(t, "root", unix.EPERM)
+		t.Skip("needs root; run the privileged tests as root to cover it")
 	}
 }
