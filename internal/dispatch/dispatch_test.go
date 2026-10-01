@@ -2,6 +2,8 @@ package dispatch
 
 import (
 	"errors"
+	"fmt"
+	"path"
 	"reflect"
 	"slices"
 	"strings"
@@ -16,7 +18,13 @@ const (
 	bashCmd = `source /root/.claude/shell-snapshots/snapshot-bash-1.sh && shopt -u extglob 2>/dev/null || true && eval 'echo "a b" $HOME` + "`x`" + ` \; it'"'"'s' && pwd -P >| ` + testSess + `/tmp/claude-1a2b-cwd`
 )
 
-var testLocal = map[string]bool{"ps": true, "xdg-open": true, "git": true}
+var testLocal = map[string]bool{"ps": true, "git": true}
+
+// testShot is the clipboard screenshot file as Claude names it.
+const (
+	testShotRel = "tmp/claude-1000/" + screenshotName
+	testShot    = testSess + "/" + testShotRel
+)
 
 func wrap(style string, inner string) string {
 	q := quoteStyles[style]
@@ -122,6 +130,75 @@ func TestClassify(t *testing.T) {
 			want: Action{Local: true, Argv: []string{"ps", "-o", "pid", "--ppid", "1"}}},
 		{name: "xdg-open", argv: []string{"xdg-open", "https://x"},
 			want: Action{Local: true, Argv: []string{"xdg-open", "https://x"}}},
+		{name: "xdg-open", argv: []string{testSess + "/bin/xdg-open", "http://localhost:4000/cb?a=1&b=%20"},
+			want: Action{Local: true, Argv: []string{"xdg-open", "http://localhost:4000/cb?a=1&b=%20"}}},
+		{name: "xclip", argv: []string{"xclip", "-selection", "clipboard"},
+			want: Action{Local: true, Argv: []string{"xclip", "-selection", "clipboard"}}},
+		{name: "xclip", argv: []string{"xclip", "-selection", "clipboard", "-o"},
+			want: Action{Local: true, Argv: []string{"xclip", "-selection", "clipboard", "-o"}}},
+		{name: "xsel", argv: []string{"xsel", "--primary", "--input"},
+			want: Action{Local: true, Argv: []string{"xsel", "--primary", "--input"}}},
+		{name: "wl-copy", argv: []string{"wl-copy"}, want: Action{Local: true, Argv: []string{"wl-copy"}}},
+		{name: "wl-copy", argv: []string{"wl-copy", "--primary"},
+			want: Action{Local: true, Argv: []string{"wl-copy", "--primary"}}},
+		{name: "wl-paste", argv: []string{"wl-paste", "--no-newline"},
+			want: Action{Local: true, Argv: []string{"wl-paste", "--no-newline"}}},
+
+		// Desktop programs accept only the arguments Claude uses.
+		{name: "xdg-open", argv: []string{"xdg-open", "file:///etc/passwd"}, wantErr: ErrRejected},
+		{name: "xdg-open", argv: []string{"xdg-open", "/etc/passwd"}, wantErr: ErrRejected},
+		{name: "xdg-open", argv: []string{"xdg-open", "--manual"}, wantErr: ErrRejected},
+		{name: "xdg-open", argv: []string{"xdg-open", "https:///x"}, wantErr: ErrRejected},
+		{name: "xdg-open", argv: []string{"xdg-open", "https://x/\n"}, wantErr: ErrRejected},
+		{name: "xdg-open", argv: []string{"xdg-open", "https://x", "https://y"}, wantErr: ErrRejected},
+		{name: "xdg-open", argv: []string{"xdg-open"}, wantErr: ErrRejected},
+		{name: "xclip", argv: []string{"xclip", "-i", "/home/alice/.ssh/id_ed25519"}, wantErr: ErrRejected},
+		{name: "wl-paste", argv: []string{"wl-paste", "--watch", "sh", "-c", "id"}, wantErr: ErrRejected},
+		{name: "wl-copy", argv: []string{"wl-copy", "secret"}, wantErr: ErrRejected},
+
+		// The clipboard image scripts run locally, naming the screenshot
+		// file relative to the session directory.
+		{name: "sh", argv: []string{"/bin/sh", "-c", clipboardScripts[0]},
+			want: Action{Local: true, Argv: []string{"sh", "-c", clipboardScripts[0]}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", fmt.Sprintf(clipboardScripts[1], testShot)},
+			want: Action{Local: true, Argv: []string{"sh", "-c", fmt.Sprintf(clipboardScripts[1], testShotRel)}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", fmt.Sprintf(clipboardScripts[2], testShot)},
+			want: Action{Local: true, Argv: []string{"sh", "-c", "rm -f -- " + testShotRel}}},
+		{name: "sh", sessDir: testSess + "/", argv: []string{"/bin/sh", "-c", fmt.Sprintf(clipboardScripts[2], testShot)},
+			want: Action{Local: true, Argv: []string{"sh", "-c", "rm -f -- " + testShotRel}}},
+		// Anything else stays remote: another file, another directory,
+		// another command.
+		{name: "sh", argv: []string{"/bin/sh", "-c", "rm -f -- " + testSess + "/tmp/claude-0/other.png"},
+			want: Action{Argv: []string{"sh", "-c", "rm -f -- " + testSess + "/tmp/claude-0/other.png"}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", "rm -f -- /tmp/claude-0/" + screenshotName},
+			want: Action{Argv: []string{"sh", "-c", "rm -f -- /tmp/claude-0/" + screenshotName}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", "rm -f -- " + testShot + "; rm -rf ~"},
+			want: Action{Argv: []string{"sh", "-c", "rm -f -- " + testShot + "; rm -rf ~"}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", "rm -f -- " + testShot + " " + testSess + "/tmp/claude-1/" + screenshotName},
+			want: Action{Argv: []string{"sh", "-c", "rm -f -- " + testShot + " " + testSess + "/tmp/claude-1/" + screenshotName}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", fmt.Sprintf(clipboardScripts[1], testShot), "a0"},
+			want: Action{Argv: []string{"sh", "-c", fmt.Sprintf(clipboardScripts[1], testShot), "a0"}}},
+		{name: "sh", sessDir: "relative", argv: []string{"/bin/sh", "-c", "rm -f -- relative/tmp/claude-0/" + screenshotName},
+			want: Action{Argv: []string{"sh", "-c", "rm -f -- relative/tmp/claude-0/" + screenshotName}}},
+
+		// The IDE detection script runs locally; nothing else like it does.
+		{name: "sh", argv: []string{"/bin/sh", "-c", ideScript},
+			want: Action{Local: true, Argv: []string{"sh", "-c", ideScript}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", ideScript + "; id"},
+			want: Action{Argv: []string{"sh", "-c", ideScript + "; id"}}},
+		{name: "sh", argv: []string{"/bin/sh", "-c", ideScript, "a0"},
+			want: Action{Argv: []string{"sh", "-c", ideScript, "a0"}}},
+
+		// The editor gets one absolute path, which stays a path in the
+		// remote view.
+		{name: NameEditor, argv: []string{NameEditor, "/home/bob/proj/CLAUDE.md"},
+			want: Action{Local: true, Edit: "/home/bob/proj/CLAUDE.md"}},
+		{name: NameEditor, argv: []string{"/x/" + NameEditor, "/home/bob/proj/../.claude//CLAUDE.md"},
+			want: Action{Local: true, Edit: "/home/bob/.claude/CLAUDE.md"}},
+		{name: NameEditor, argv: []string{NameEditor, "+1", "/home/bob/CLAUDE.md"}, wantErr: ErrRejected},
+		{name: NameEditor, argv: []string{NameEditor, "CLAUDE.md"}, wantErr: ErrRejected},
+		{name: NameEditor, argv: []string{NameEditor, "/x\ny"}, wantErr: ErrRejected},
+		{name: NameEditor, argv: []string{NameEditor}, wantErr: ErrRejected},
 
 		// Errors.
 		{name: "python3", argv: []string{"python3"}, wantErr: ErrUnknownProgram},
@@ -420,6 +497,11 @@ func FuzzClassify(f *testing.F) {
 	f.Add("tele-exec", "")
 	f.Add("bash", "--rcfile")
 	f.Add("ps", "-o\x00pid")
+	f.Add("xdg-open", "https://x")
+	f.Add("xclip", "-selection\x00clipboard")
+	f.Add("sh", "-c\x00"+fmt.Sprintf(clipboardScripts[2], testShot))
+	f.Add("sh", "-c\x00"+ideScript)
+	f.Add(NameEditor, "/home/bob/CLAUDE.md")
 	f.Add("x", "")
 	f.Fuzz(func(t *testing.T, name, args string) {
 		argv := []string{name}
@@ -434,13 +516,27 @@ func FuzzClassify(f *testing.F) {
 		if err != nil {
 			return
 		}
+		if act.Edit != "" {
+			if name != NameEditor || !act.Local || act.Argv != nil || len(orig) != 2 || !path.IsAbs(act.Edit) {
+				t.Fatalf("Classify(%q, %q) = %+v", name, orig, act)
+			}
+			return
+		}
 		if len(act.Argv) == 0 {
 			t.Fatalf("Classify(%q, %q) returned an empty Argv", name, orig)
 		}
 		switch {
-		case act.Local:
-			if !testLocal[name] || act.Argv[0] != name {
+		case act.Local && name == "sh":
+			if _, ok := clipboardScript(orig[2], testSess); (!ok && orig[2] != ideScript) || len(orig) != 3 || orig[1] != "-c" {
 				t.Fatalf("Classify(%q, %q) = local %q", name, orig, act.Argv)
+			}
+		case act.Local:
+			desktop := slices.Contains(DesktopPrograms, name)
+			if !testLocal[name] && !desktop || act.Argv[0] != name {
+				t.Fatalf("Classify(%q, %q) = local %q", name, orig, act.Argv)
+			}
+			if desktop && name != NameXdgOpen && !slices.ContainsFunc(clipboardArgs[name], func(a []string) bool { return slices.Equal(a, act.Argv[1:]) }) {
+				t.Fatalf("Classify(%q, %q) = local %q, arguments not allowed", name, orig, act.Argv)
 			}
 		case act.Argv[0] == "bash", act.Argv[0] == "sh":
 		case remotePrograms[act.Argv[0]]:

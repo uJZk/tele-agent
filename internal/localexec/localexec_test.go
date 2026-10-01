@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -321,5 +323,53 @@ func waitDead(t *testing.T, pid int) {
 			t.Fatalf("process %d still running: %s", pid, b)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestRunInGroup: the program joins the given process group, and signals,
+// the SIGKILL of a cancel included, reach the program alone, never the
+// rest of a group that is not its own.
+func TestRunInGroup(t *testing.T) {
+	leader := exec.CommandContext(t.Context(), "sleep", "100")
+	leader.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := leader.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leader.Process.Kill(); _ = leader.Wait() })
+	pgid := leader.Process.Pid
+
+	outR, outW := pipe(t)
+	sigs := make(chan int)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ch := make(chan proto.ShimStatus, 1)
+	go func() {
+		ch <- RunInGroup(ctx, sh(`trap 'echo got' USR1; sleep 100 & echo "$(cut -d' ' -f5 /proc/$$/stat) $!"; `+busyLoop), "", testEnv, nil, outW, nil, sigs, pgid)
+	}()
+	rd := bufio.NewReader(outR)
+	line, err := rd.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var group, child int
+	if _, err := fmt.Sscan(line, &group, &child); err != nil || group != pgid {
+		t.Fatalf("program reports group and child %q, want group %d", line, pgid)
+	}
+	sigs <- int(unix.SIGUSR1)
+	if line, err := rd.ReadString('\n'); line != "got\n" {
+		t.Fatalf("read %q, %v", line, err)
+	}
+	cancel()
+	if st := await(t, ch); st != (proto.ShimStatus{Signal: int(unix.SIGKILL)}) {
+		t.Fatalf("status %+v, want SIGKILL", st)
+	}
+	for _, pid := range []int{pgid, child} {
+		if err := unix.Kill(pid, 0); err != nil {
+			t.Errorf("process %d of the group is gone: %v", pid, err)
+		}
+	}
+	_ = unix.Kill(child, unix.SIGKILL)
+	if st := RunInGroup(t.Context(), sh("exit 0"), "", testEnv, nil, nil, nil, nil, 0); st.Code != codeFailure {
+		t.Errorf("RunInGroup without a group: %+v", st)
 	}
 }

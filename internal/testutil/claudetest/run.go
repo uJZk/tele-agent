@@ -89,17 +89,7 @@ func Run(t testing.TB, claude string, api *API, o Options) Result {
 	if o.Home == "" {
 		o.Home = t.TempDir()
 	}
-	env := []string{
-		"PATH=/usr/local/bin:/usr/bin:/bin",
-		"HOME=" + o.Home,
-		"LANG=C.UTF-8",
-		"ANTHROPIC_BASE_URL=" + api.URL(),
-		"ANTHROPIC_API_KEY=sk-ant-tele-test",
-		// No update checks, telemetry or other traffic beyond the API.
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-		"DISABLE_AUTOUPDATER=1",
-	}
-	env = append(env, o.Env...)
+	env := append(baseEnv(api, o.Home), o.Env...)
 	args := append(append([]string{"-p", o.Prompt, "--output-format", "json"}, PinnedArgs...), o.Args...)
 
 	ctx, cancel := context.WithTimeout(t.Context(), runTimeout)
@@ -116,6 +106,24 @@ func Run(t testing.TB, claude string, api *API, o Options) Result {
 	r := Result{Stdout: stdout.String(), Stderr: stderr.String(), Err: err}
 	_ = json.Unmarshal(stdout.Bytes(), &r.Output) // not JSON: Output stays empty
 	return r
+}
+
+// apiKey is the API key claude runs with; the stand-in accepts any.
+const apiKey = "sk-ant-tele-test" //nolint:gosec // a fake key for the stand-in
+
+// baseEnv is the minimal environment of a claude run, holding nothing from
+// the test's own.
+func baseEnv(api *API, home string) []string {
+	return []string{
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+		"HOME=" + home,
+		"LANG=C.UTF-8",
+		"ANTHROPIC_BASE_URL=" + api.URL(),
+		"ANTHROPIC_API_KEY=" + apiKey,
+		// No update checks, telemetry or other traffic beyond the API.
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"DISABLE_AUTOUPDATER=1",
+	}
 }
 
 // WriteScript writes an executable shell script to dir/name and returns

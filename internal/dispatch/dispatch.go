@@ -36,18 +36,23 @@ var (
 
 // Action is what session main does for one shim invocation.
 type Action struct {
-	// Local runs Argv in session main's local view; otherwise Argv runs on
-	// the target host.
+	// Local runs Argv in session main's local view, in the session
+	// directory there; otherwise Argv runs on the target host.
 	Local bool
 	// Argv is the command to run. Argv[0] is a bare program name, looked
 	// up in the PATH of wherever it runs.
 	Argv []string
+	// Edit, when set, names the file, a path in the remote view, to open
+	// in the user's editor instead of running Argv (NameEditor).
+	Edit string
 }
 
 // Classify maps the shim name was invoked as, with its full argv (argv[0]
 // included), to an Action. sessDir is the session directory as Claude sees
-// it; localProgs names the local exec proxies. The names with dedicated
-// rules (bash, sh, tele-exec, rg, git, uname) are never local.
+// it; localProgs names the local exec proxies besides DesktopPrograms. The
+// names with dedicated rules (bash, sh, tele-exec, rg, git, uname) are never
+// local, except for the clipboard and IDE detection scripts Claude runs
+// with sh.
 func Classify(name string, argv []string, sessDir string, localProgs map[string]bool) (Action, error) {
 	if len(argv) == 0 {
 		return Action{}, ErrEmptyArgv
@@ -66,6 +71,12 @@ func Classify(name string, argv []string, sessDir string, localProgs map[string]
 				// so the outer $0... (args[2:]) are dropped.
 				return teleExecAction([]string{inner}), nil
 			}
+			if script, ok := clipboardScript(args[1], sessDir); ok && len(args) == 2 {
+				return Action{Local: true, Argv: []string{nameSh, "-c", script}}, nil
+			}
+			if args[1] == ideScript && len(args) == 2 {
+				return Action{Local: true, Argv: []string{nameSh, "-c", ideScript}}, nil
+			}
 		}
 		return Action{Argv: slices.Concat([]string{nameSh}, args)}, nil
 	case name == nameTeleExec:
@@ -75,6 +86,10 @@ func Classify(name string, argv []string, sessDir string, localProgs map[string]
 		return teleExecAction(args), nil
 	case remotePrograms[name]:
 		return Action{Argv: slices.Concat([]string{name}, args)}, nil
+	case slices.Contains(DesktopPrograms, name):
+		return desktopAction(name, args)
+	case name == NameEditor:
+		return editorAction(args)
 	case localProgs[name]:
 		return Action{Local: true, Argv: slices.Concat([]string{name}, args)}, nil
 	default:

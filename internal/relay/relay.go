@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/ujzk/tele-agent/internal/dispatch"
+	"github.com/ujzk/tele-agent/internal/editproxy"
 	"github.com/ujzk/tele-agent/internal/localexec"
 	"github.com/ujzk/tele-agent/internal/proto"
 	"github.com/ujzk/tele-agent/internal/rexec"
@@ -34,8 +35,17 @@ type Config struct {
 	// Baseline is the environment tele gave Claude; only what Claude added
 	// or changed is forwarded (docs/exec.md "环境变量").
 	Baseline []string
-	// LocalProgs names the local exec proxies.
+	// LocalProgs names the local exec proxies besides
+	// dispatch.DesktopPrograms.
 	LocalProgs map[string]bool
+	// LocalDir is the session directory in session main's view. Local exec
+	// proxies run there: Claude's working directory is a path in the
+	// remote view (docs/exec.md "shim").
+	LocalDir string
+	// LocalEnv is the environment of local exec proxies: the user's own,
+	// with the PATH and desktop variables of this machine. Claude's
+	// environment is written for the remote view.
+	LocalEnv []string
 	// Exec starts remote commands; its Barrier makes file changes visible
 	// before an exit is reported (docs/exec.md "exec 屏障").
 	Exec *rexec.Client
@@ -77,11 +87,31 @@ func (r *Relay) Serve(ctx context.Context, req *shimsrv.Request, sigs <-chan int
 		closeAll(req)
 		return proto.ShimStatus{Code: codeFailure, Msg: err.Error()}
 	}
+	if act.Edit != "" {
+		defer closeAll(req)
+		return editproxy.Edit(ctx, editproxy.Config{Dir: r.cfg.LocalDir, Env: r.cfg.LocalEnv}, editproxy.Request{
+			Path: act.Edit, ViewPID: req.PeerPID, Stdin: req.Stdin, Stdout: req.Stdout, Stderr: req.Stderr,
+		}, sigs)
+	}
 	if act.Local {
 		defer closeAll(req)
-		return localexec.Run(ctx, act.Argv, req.Dir, req.Env, req.Stdin, req.Stdout, req.Stderr, sigs)
+		return localexec.Run(ctx, r.localArgv(act.Argv), r.cfg.LocalDir, r.cfg.LocalEnv, req.Stdin, req.Stdout, req.Stderr, sigs)
 	}
 	return r.remote(ctx, req, act.Argv, sigs)
+}
+
+// localArgv returns the command a local action runs. A browser is opened
+// with the user's BROWSER, as Claude does when it is set; tele keeps it
+// from Claude, which would start it by a name that has no shim, or by a
+// path that is the target's (docs/claude-code.md "浏览器、剪贴板与通知").
+func (r *Relay) localArgv(argv []string) []string {
+	if argv[0] != dispatch.NameXdgOpen {
+		return argv
+	}
+	if b := envValue(r.cfg.LocalEnv, "BROWSER"); b != "" {
+		return append([]string{b}, argv[1:]...)
+	}
+	return argv
 }
 
 // remote runs argv on the target host.
@@ -194,8 +224,13 @@ func status(prog string, res rexec.Result) proto.ShimStatus {
 
 // pathOf returns PATH of env.
 func pathOf(env []string) string {
+	return envValue(env, "PATH")
+}
+
+// envValue returns the value of the last entry for key in env.
+func envValue(env []string, key string) string {
 	for i := len(env) - 1; i >= 0; i-- {
-		if v, ok := strings.CutPrefix(env[i], "PATH="); ok {
+		if v, ok := strings.CutPrefix(env[i], key+"="); ok {
 			return v
 		}
 	}

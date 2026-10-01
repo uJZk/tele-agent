@@ -10,10 +10,13 @@ shim 都是指向 `../tele` 的相对符号链接，位于 `<sess>/bin/`，按 `
 |---|---|---|
 | `bash` | Bash 工具（`CLAUDE_CODE_SHELL`），以及生成 shell 快照 | 在远端运行 `bash`，参数原样转发。`-c` 的脚本如果恰好是 `<sess>/bin/tele-exec` 加一个参数这两个 shell 词，先去掉这一层包装 |
 | `tele-exec` | shell 形式的 hooks、stdio MCP server（`CLAUDE_CODE_SHELL_PREFIX`） | 唯一的参数是一条 shell 字符串，在远端用 `sh -c` 执行，双向转发 stdio |
-| `sh` | `/bin/sh`（`shell: true` 的 spawn 固定使用它，hooks 就是这样启动的） | `-c` 的脚本如果恰好是 `<sess>/bin/tele-exec` 加一个参数，直接按 tele-exec 处理；否则在远端运行 `sh`，参数原样转发。必须识别这种形式，因为远端并不存在 `<sess>/bin/tele-exec` |
+| `sh` | `/bin/sh`（`shell: true` 的 spawn 固定使用它，hooks 就是这样启动的） | `-c` 的脚本如果恰好是 `<sess>/bin/tele-exec` 加一个参数，直接按 tele-exec 处理；恰好是 Claude 读取剪贴板图片的脚本之一（见[浏览器、剪贴板与通知](claude-code.md#浏览器剪贴板与通知)），或者 IDE 探测的脚本（见[外部编辑器与 IDE 探测](claude-code.md#外部编辑器与-ide-探测)）时，作为本地 exec 代理执行；否则在远端运行 `sh`，参数原样转发。必须识别 tele-exec 的形式，因为远端并不存在 `<sess>/bin/tele-exec` |
 | `rg`、`git`、`uname` | Grep、Glob，Claude 内部的 git 和 rg 调用；`uname` 给按名字调用它的程序（Claude 自己不调用，见[其它内置行为](claude-code.md#其它内置行为)） | 在远端运行同名程序，参数原样转发 |
-| 本地 exec 代理（例如 `ps`） | 必须看到本地进程或本地桌面的调用：tree-kill 用 `ps` 查找子进程，以及打开浏览器、访问剪贴板一类的程序 | 由会话主进程在**本地视图**中执行真实程序 |
+| `tele-editor` | Claude 的编辑器（`VISUAL`）：Ctrl+G、`/memory` 等 | 只接受一个绝对路径。会话主进程按用户原来的 `VISUAL`、`EDITOR` 在**本地**运行编辑器，编辑这个文件在本地会话目录中的副本，再写回原处（见[外部编辑器与 IDE 探测](claude-code.md#外部编辑器与-ide-探测)） |
+| 本地 exec 代理：`ps`，以及桌面程序 `xdg-open`、`xclip`、`xsel`、`wl-copy`、`wl-paste` | 必须看到本地进程或本地桌面的调用：tree-kill 用 `ps` 查找子进程；打开浏览器、读写剪贴板（见[浏览器、剪贴板与通知](claude-code.md#浏览器剪贴板与通知)） | 由会话主进程在**本地视图**中执行真实程序。桌面程序只接受 Claude 实际使用的参数，`xdg-open` 只接受一个 http 或 https URL，其余一律拒绝 |
 
+- 本地 exec 代理使用用户启动 tele 时的环境（`PATH`、`DISPLAY`、`WAYLAND_DISPLAY`、`XDG_RUNTIME_DIR`、`DBUS_SESSION_BUS_ADDRESS` 等），工作目录是本地的会话目录，而不是 Claude 请求中的环境和工作目录：后两者是为远端视图准备的，`PATH=<sess>/bin` 和项目目录在会话主进程的视图中都不存在。
+- 本地 exec 代理各自有一个新的进程组，对控制终端来说是后台作业，读终端会被 SIGTTIN 停住，所以它们不能需要终端。编辑器是唯一的例外：它加入 shim 的进程组，即终端的前台进程组，转发的信号只发给编辑器本身，不发给这个组（其中还有 Claude）。
 - `PATH` 中只有 `<sess>/bin`，Claude 按名字启动、却不在上表中的程序会得到 ENOENT。需要哪些本地 exec 代理，以 `strace` 观察到的 Claude 实际调用为准。
 - **陷阱**：Claude 如果按**绝对路径**启动程序（例如 `/usr/bin/xdg-open`），在远端视图中它会读到远端的可执行文件，却在本地内核上运行。这类调用同样要用 `strace` 找出来，逐个处理。
 - 远端按 argv 执行程序（`rg`、`git`、`uname`）时，使用目标用户**登录 shell 的 PATH**。这个 PATH 在建立会话时获取一次，因为以服务方式运行的 tele server 自己的 PATH 通常很短。

@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/ujzk/tele-agent/internal/cli"
 	"github.com/ujzk/tele-agent/internal/client"
 	"github.com/ujzk/tele-agent/internal/connectproxy"
+	"github.com/ujzk/tele-agent/internal/dispatch"
 	"github.com/ujzk/tele-agent/internal/fssvc"
 	"github.com/ujzk/tele-agent/internal/netwatch"
 	"github.com/ujzk/tele-agent/internal/portfwd"
@@ -56,7 +58,8 @@ const (
 const sessionRoot = "/.tele"
 
 // shimNames are the shims in <sess>/bin (docs/exec.md "shim"): the
-// remote programs, and the local exec proxies of localProgs.
+// remote programs, and the local exec proxies of localProgs and
+// dispatch.DesktopPrograms.
 var (
 	shimNames  = []string{"bash", "sh", "tele-exec", "rg", "git", "uname"}
 	localProgs = map[string]bool{"ps": true}
@@ -386,6 +389,11 @@ func (s *session) shims(p paths) error {
 			return err
 		}
 	}
+	for _, name := range slices.Concat(dispatch.DesktopPrograms, []string{dispatch.NameEditor}) {
+		if err := os.Symlink("../tele", filepath.Join(p.local, binDir, name)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -547,6 +555,8 @@ func (s *session) startShimServer(ctx context.Context, rs *remoteSession, fsys *
 		SessDir:    p.claude,
 		Baseline:   env,
 		LocalProgs: localProgs,
+		LocalDir:   p.local,
+		LocalEnv:   os.Environ(),
 		Exec:       &rexec.Client{Opener: rs.Mux, Barrier: fsys, Logger: s.log.With("svc", "exec")},
 		Scratch:    m,
 		Logger:     s.log.With("svc", "relay"),
