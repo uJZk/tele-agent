@@ -33,7 +33,13 @@ var (
 )
 
 // RequireUserNS skips or fails t unless the process can create a user and
-// mount namespace with its own uid mapped to itself.
+// mount namespace with its own uid mapped to itself, and use CAP_SYS_ADMIN
+// in it. Creating the namespace is not enough: Ubuntu's AppArmor
+// restriction on unprivileged user namespaces (docs/filesystem.md
+// "已知陷阱") lets the creation succeed and denies every capability in the
+// namespace. So the probe also unshares a second mount namespace, after
+// which os/exec makes the mounts private, and raises CAP_SYS_ADMIN as an
+// ambient capability, as the tests do.
 func RequireUserNS(t testing.TB) {
 	t.Helper()
 	usernsOnce.Do(func() {
@@ -41,9 +47,11 @@ func RequireUserNS(t testing.TB) {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "/bin/true")
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Cloneflags:  syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
-			UidMappings: []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
-			GidMappings: []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
+			Cloneflags:   syscall.CLONE_NEWUSER | syscall.CLONE_NEWNS,
+			Unshareflags: syscall.CLONE_NEWNS,
+			UidMappings:  []syscall.SysProcIDMap{{ContainerID: os.Getuid(), HostID: os.Getuid(), Size: 1}},
+			GidMappings:  []syscall.SysProcIDMap{{ContainerID: os.Getgid(), HostID: os.Getgid(), Size: 1}},
+			AmbientCaps:  []uintptr{unix.CAP_SYS_ADMIN},
 		}
 		errUserNS = cmd.Run()
 	})
