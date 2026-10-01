@@ -21,6 +21,7 @@ func TestClaudeEnv(t *testing.T) {
 		"https_proxy=http://corp:3128", "HTTPS_PROXY=http://corp:3128", "all_proxy=socks5://x",
 		"SSL_CERT_FILE=/etc/corp.pem", "LD_PRELOAD=/x.so", "TELE_SESSION=/stale",
 		"CLAUDE_CODE_SHELL=/bin/zsh", "TMPDIR=/tmp/alice", "noequals",
+		"BROWSER=firefox", "DISPLAY=:0", "WAYLAND_DISPLAY=wayland-0",
 	}
 	env := claudeEnv(claudeEnvSpec{
 		UserEnv:  user,
@@ -51,13 +52,17 @@ func TestClaudeEnv(t *testing.T) {
 		"TELE_SESSION":             "/.tele/0123456789abcdef",
 		"LD_PRELOAD":               "/.tele/0123456789abcdef/lib/teleswitch.so",
 		"TELE_SWITCH_FD":           "3",
+		// Claude opens a browser and uses the clipboard tools only when
+		// one of these is set.
+		"DISPLAY":         ":0",
+		"WAYLAND_DISPLAY": "wayland-0",
 	}
 	for k, v := range want {
 		if got := m[k]; !slices.Equal(got, []string{v}) {
 			t.Errorf("%s = %q, want exactly [%q]", k, got, v)
 		}
 	}
-	for _, k := range []string{"all_proxy", "TMPDIR", "noequals"} {
+	for _, k := range []string{"all_proxy", "TMPDIR", "noequals", "BROWSER"} {
 		if _, ok := m[k]; ok {
 			t.Errorf("%s leaked into Claude's environment", k)
 		}

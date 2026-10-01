@@ -24,6 +24,10 @@ var droppedUserEnv = []string{
 	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
 	"SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
 	"LD_PRELOAD", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK",
+	// Claude would start the browser by a name without a shim, or by a path
+	// that is the target's; the local xdg-open proxy uses it instead
+	// (docs/claude-code.md "浏览器、剪贴板与通知").
+	"BROWSER",
 	"CLAUDE_CODE_SHELL", "CLAUDE_CODE_SHELL_PREFIX", "CLAUDE_CODE_TMPDIR", "USE_BUILTIN_RIPGREP",
 }
 

@@ -3,8 +3,10 @@ package relay
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +35,7 @@ const (
 type env struct {
 	relay    *Relay
 	localTmp string // the tmp scratch area in session main's view
+	localDir string // the session directory in session main's view
 }
 
 // newEnv serves a tele server on a unix socket and returns a Relay using
@@ -43,7 +46,7 @@ func newEnv(t *testing.T, loginPath string) *env {
 		User: "bob", Home: t.TempDir(), Shell: "/bin/sh", LoginPath: loginPath,
 	})
 	m, reply := servertest.Hello(t, ep, "t", sid)
-	e := &env{localTmp: t.TempDir()}
+	e := &env{localTmp: t.TempDir(), localDir: t.TempDir()}
 	sm, err := scratch.New([]scratch.Area{{
 		ID: proto.ScratchTmp, ClaudePath: sessDir + "/tmp", LocalPath: e.localTmp, RemotePath: filepath.Join(reply.ScratchDir, "tmp"),
 	}})
@@ -53,7 +56,9 @@ func newEnv(t *testing.T, loginPath string) *env {
 	e.relay = New(Config{
 		SessDir:    sessDir,
 		Baseline:   []string{"PATH=" + sessDir + "/bin", "HOME=/home/bob"},
-		LocalProgs: map[string]bool{"id": true},
+		LocalProgs: map[string]bool{"id": true, "env": true, "pwd": true},
+		LocalDir:   e.localDir,
+		LocalEnv:   []string{"PATH=/usr/bin:/bin", "LOCAL=1"},
 		Exec:       &rexec.Client{Opener: m},
 		Scratch:    sm,
 	})
@@ -227,6 +232,83 @@ func TestLocalProxy(t *testing.T) {
 	}
 	if got := strings.TrimSpace(c.stdout.String()); got != strconv.Itoa(os.Getuid()) {
 		t.Errorf("local id -u = %q", got)
+	}
+}
+
+// TestLocalProxyEnvironment checks that a local exec proxy gets this
+// machine's environment and directory: Claude's PATH and working directory
+// are paths in the remote view, which session main does not have.
+func TestLocalProxyEnvironment(t *testing.T) {
+	e := newEnv(t, "/nonexistent")
+	c := newCall(t, "env")
+	c.req.Env = []string{"PATH=" + sessDir + "/bin", "CLAUDE=1"}
+	c.req.Dir = "/remote/only/project"
+	if st := c.run(t.Context(), e.relay, nil); st.Code != 0 {
+		t.Fatalf("status %+v, stderr %q", st, c.stderr.String())
+	}
+	if got := strings.Fields(c.stdout.String()); !slices.Equal(got, []string{"PATH=/usr/bin:/bin", "LOCAL=1"}) {
+		t.Errorf("local environment %q", got)
+	}
+	c = newCall(t, "pwd")
+	c.req.Dir = "/remote/only/project"
+	if st := c.run(t.Context(), e.relay, nil); st.Code != 0 {
+		t.Fatalf("status %+v, stderr %q", st, c.stderr.String())
+	}
+	if got := strings.TrimSpace(c.stdout.String()); got != e.localDir {
+		t.Errorf("local working directory %q, want %q", got, e.localDir)
+	}
+}
+
+// TestBrowser checks that the browser is the user's BROWSER when set.
+func TestBrowser(t *testing.T) {
+	e := newEnv(t, "/nonexistent")
+	c := newCall(t, "xdg-open", "https://example.com/a")
+	e.relay.cfg.LocalEnv = append(e.relay.cfg.LocalEnv, "BROWSER=echo")
+	if st := c.run(t.Context(), e.relay, nil); st.Code != 0 {
+		t.Fatalf("status %+v, stderr %q", st, c.stderr.String())
+	}
+	if got := strings.TrimSpace(c.stdout.String()); got != "https://example.com/a" {
+		t.Errorf("BROWSER got %q", got)
+	}
+	c = newCall(t, "xdg-open", "file:///etc/passwd")
+	if st := c.run(t.Context(), e.relay, nil); st.Code != codeFailure || !strings.Contains(st.Msg, "http") {
+		t.Errorf("file URL: status %+v, want a refusal", st)
+	}
+	if c.stdout.Len() != 0 {
+		t.Errorf("refused URL ran the browser: %q", c.stdout.String())
+	}
+}
+
+// TestClipboardScript checks that the clipboard image scripts run locally,
+// writing the screenshot file where Claude reads it: the session directory
+// that the remote view shows at sessDir.
+func TestClipboardScript(t *testing.T) {
+	e := newEnv(t, "/nonexistent")
+	bin := t.TempDir()
+	xclip := "#!/bin/sh\nprintf png\n"
+	if err := os.WriteFile(filepath.Join(bin, "xclip"), []byte(xclip), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e.relay.cfg.LocalEnv = []string{"PATH=" + bin + ":/usr/bin:/bin"}
+	shot := filepath.Join(e.localDir, "tmp", "claude-1000", "claude_cli_latest_screenshot.png")
+	if err := os.MkdirAll(filepath.Dir(shot), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claudeShot := sessDir + "/tmp/claude-1000/claude_cli_latest_screenshot.png"
+	save := "xclip -selection clipboard -t image/png -o > %[1]s 2>/dev/null || wl-paste --type image/png > %[1]s 2>/dev/null || xclip -selection clipboard -t image/bmp -o > %[1]s 2>/dev/null || wl-paste --type image/bmp > %[1]s"
+	c := newCall(t, "sh", "-c", fmt.Sprintf(save, claudeShot))
+	if st := c.run(t.Context(), e.relay, nil); st.Code != 0 {
+		t.Fatalf("save: status %+v, stderr %q", st, c.stderr.String())
+	}
+	if b, err := os.ReadFile(shot); err != nil || string(b) != "png" {
+		t.Fatalf("screenshot %q, %v", b, err)
+	}
+	c = newCall(t, "sh", "-c", "rm -f -- "+claudeShot)
+	if st := c.run(t.Context(), e.relay, nil); st.Code != 0 {
+		t.Fatalf("remove: status %+v, stderr %q", st, c.stderr.String())
+	}
+	if _, err := os.Stat(shot); !os.IsNotExist(err) {
+		t.Errorf("screenshot still there: %v", err)
 	}
 }
 

@@ -90,6 +90,18 @@ Claude 写全局配置时，先在 `$HOME` 中创建 `.claude.json.tmp.<pid>.<�
 | 系统提示词中的操作系统和平台 | Claude 在进程内取得内核版本，不启动 `uname`，所以内置的环境信息（`OS Version: Linux <版本>`）在 tele 下是**本地**的内核。这是已知限制：tele 不拦截系统调用，UTS 命名空间也只隔离主机名，不隔离内核版本。目标主机的信息由[附加系统提示词](#附加系统提示词)给出 |
 | 会话存储 `~/.claude/projects/<cwd 编码>` | 以 cwd 路径为键，不同主机上的相同路径会共用会话历史（已知限制，见[启动流程](cli.md#启动流程)） |
 
+## 浏览器、剪贴板与通知
+
+这些功能服务于本机前的用户，所以它们启动的程序都作为本地 exec 代理在本地执行（见 [shim](exec.md#shim)）。
+
+- **只有设置了 `DISPLAY` 或 `WAYLAND_DISPLAY` 时**，Claude 才打开浏览器、启动剪贴板程序写剪贴板；都没有设置时只显示 URL，`/copy` 只发 OSC 52。所以 tele 把这两个变量原样交给 Claude（Claude 自己不连接显示服务器），但不转发到远端（见[环境变量](exec.md#环境变量)）。
+- **浏览器**：按名字启动 `xdg-open <URL>`。`/login` 打开的是授权 URL，回调由 Claude 在本地的 localhost 上监听，所以浏览器必须在本地打开。设置了 `BROWSER` 时，Claude 改为启动 `$BROWSER <URL>`；在 tele 下这要么是一个没有 shim 的名字，要么是远端视图中的路径，所以 tele 不把 `BROWSER` 交给 Claude，而由 `xdg-open` 代理按用户的 `BROWSER` 在本地打开。
+- **写剪贴板（`/copy`）**：先向终端发送 OSC 52，再按名字启动找得到的剪贴板程序，分别写 clipboard 和 primary：`xclip -selection clipboard|primary`、`xsel --clipboard|--primary --input`、`wl-copy [--primary]`。
+- **读剪贴板（Ctrl+V）**：先用 `/bin/sh -c` 运行固定的脚本，探测剪贴板中有没有图片（`xclip … -t TARGETS -o` 和 `wl-paste -l`）；有图片时再运行两个脚本，一个把图片保存到 `CLAUDE_CODE_TMPDIR/claude-<uid>/claude_cli_latest_screenshot.png`，Claude 随后在进程内读取它，另一个 `rm -f` 删掉它。没有图片时，按名字启动 `wl-paste --no-newline`、`xclip -selection clipboard -o` 或 `xsel --clipboard --output` 读取文本。
+  - 这些脚本经 `/bin/sh` 启动，本来会被 `sh` shim 送到远端，所以会话主进程逐字识别它们，改在本地执行。截图文件在会话目录中，本地和远端视图看到的是同一个文件。
+  - **已知限制**：截图文件在 `CLAUDE_CODE_TMPDIR` 中，Claude 删除它之前如果恰好有远端命令开始执行，它会随 scratch 同步上传到远端（见 [scratch 路径改写与回传](exec.md#scratch-路径改写与回传)）。
+- **通知**：只经过终端（响铃，或 iTerm2、kitty 等的 OSC 序列），不启动任何程序，所以本来就到达本地终端。
+
 ## 注入的环境
 
 ```bash
@@ -110,7 +122,7 @@ TELE_SESSION=<sess>                               # shim 据此找到会话主�
 LD_PRELOAD=<本地会话目录>/lib/teleswitch.so       # 由启动阶段设置；与 TELE_SWITCH_FD、TELE_SWITCH_DIR 一起，在视图切换后被清除
 ```
 
-用户原有环境中指向本地资源的变量（代理、CA、`TMPDIR`、`XDG_RUNTIME_DIR`、`SSH_AUTH_SOCK` 等）不传给 Claude，具体列表以代码为准。
+用户原有环境中指向本地资源的变量（代理、CA、`TMPDIR`、`XDG_RUNTIME_DIR`、`SSH_AUTH_SOCK` 等）和 `BROWSER` 不传给 Claude，具体列表以代码为准。`DISPLAY`、`WAYLAND_DISPLAY` 照传，原因见[浏览器、剪贴板与通知](#浏览器剪贴板与通知)。
 
 命令行参数：`--append-system-prompt-file <sess>/system-prompt.md`；需要时加 `--setting-sources`、`--settings`（改写后的 hooks）。
 
@@ -158,4 +170,4 @@ This session operates on the remote host "{{alias}}" via tele.
 - 在 `main` 之前，Claude（bun）仍然是单线程的，所以预加载库可以 `setns(CLONE_NEWNS)`。
 - 切换之后，Claude 不再加载或打开本地的运行时文件（动态库、证书、`/etc/passwd`、NSS 配置）：端到端测试让远端的 `/` 只是一棵几乎为空的目录树，没有任何库和证书，`/etc/passwd` 中也没有本地用户，Claude 照常运行、经 TLS 访问 API、读取远端文件。telefs 记录疑似运行时文件的查找（见[组成](telefs.md#组成)），测试要求除了[环境探测](#其它内置行为)之外一个都没有。
 - Claude 的运行时在 `main` 之前就要读取 `/proc`，没有 `/proc` 时直接中止，不发出任何请求。tele 据此让启动视图的 `/proc` 为空，使预加载没有生效的 Claude 无法在本地视图中运行（见[已知陷阱](filesystem.md#已知陷阱)）。
-- 兼容性测试覆盖的功能中，Claude 自己按绝对路径启动的只有 `/bin/sh`，其余都按 PATH 查找（见 [shim](exec.md#shim)）。没有覆盖的功能（打开浏览器、剪贴板、通知等）启动的程序要用 `strace` 逐个找出并处理（见[验证方法](#验证方法)）。
+- 兼容性测试覆盖的功能中，Claude 自己按绝对路径启动的只有 `/bin/sh`，其余都按 PATH 查找（见 [shim](exec.md#shim)）。

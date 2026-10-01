@@ -21,7 +21,7 @@ Claude 在项目之外需要访问的路径可以分为几类：自身的二进�
 | CA 证书 | **使用本地的 CA**：Claude 的 TLS 连接经本地代理从本机网络出站，信任关系应当与本地网络一致（例如公司的 HTTPS 中间人 CA），而远端可能根本没有装 `ca-certificates`，或者版本很旧。启动时把本地系统 CA 和用户原有的 `NODE_EXTRA_CA_CERTS`、`SSL_CERT_FILE`、`SSL_CERT_DIR` 合并成 `<sess>/ca-bundle.pem`（规则见下文的「CA bundle」），再用 `SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS` 指向它。Claude 的运行时还会扫描一个证书目录（见[代理与 CA](claude-code.md#代理与-ca)），所以 `SSL_CERT_DIR` 指向会话目录中的一个空目录：否则它会读远端的 `/etc/ssl/certs`，远端可以借此让 Claude 信任它放进去的 CA。**不** bind 到 `/etc/ssl`，所以远端视图中的 `/etc/ssl/certs` 仍然是远端的，但 Claude 不读它 | 用本地 CA，但不增加本地例外 |
 | `git`、`rg`、`uname` | `PATH` 中只有 `<sess>/bin` 里的转发 shim | 在远端执行 |
 | `/bin/sh`（`shell: true` 的 spawn 固定使用它） | 替换为 tele 的 `sh` shim（见 [shim](exec.md#shim)） | 语义上等同于远端的 sh |
-| 必须在本地运行的程序（例如 `ps`，它要看到本地进程） | `PATH` 中放**本地 exec 代理**（见 [shim](exec.md#shim)） | 在本地执行 |
+| 必须在本地运行的程序（`ps` 要看到本地进程，浏览器和剪贴板程序要用本地桌面） | `PATH` 中放**本地 exec 代理**（见 [shim](exec.md#shim)） | 在本地执行 |
 
 **CONNECT 代理**：
 

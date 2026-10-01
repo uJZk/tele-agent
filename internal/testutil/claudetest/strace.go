@@ -144,3 +144,83 @@ func (c Call) ExecPath() string {
 	p, _, _ := strings.Cut(c.Line[1:], `"`)
 	return p
 }
+
+// ExecArgv returns the argv of an execve call, or nil if strace cut it
+// short.
+func (c Call) ExecArgv() []string {
+	_, rest, ok := strings.Cut(c.Line, `", [`)
+	if !ok {
+		return nil
+	}
+	var argv []string
+	for {
+		s, n, ok := unquote(rest)
+		if !ok {
+			return nil
+		}
+		argv = append(argv, s)
+		rest = rest[n:]
+		switch {
+		case strings.HasPrefix(rest, ", "):
+			rest = rest[2:]
+		case strings.HasPrefix(rest, "]"):
+			return argv
+		default:
+			return nil // "..." after a truncated list
+		}
+	}
+}
+
+// unquote decodes the C string literal strace prints at the start of s,
+// returning it and the length of the literal; a literal strace truncated
+// ("..." follows) is not ok.
+func unquote(s string) (string, int, bool) {
+	if !strings.HasPrefix(s, `"`) {
+		return "", 0, false
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '"':
+			if strings.HasPrefix(s[i+1:], "...") {
+				return "", 0, false
+			}
+			return b.String(), i + 1, true
+		case '\\':
+			i++
+			if i == len(s) {
+				return "", 0, false
+			}
+			if e, ok := cEscapes[s[i]]; ok {
+				b.WriteByte(e)
+				continue
+			}
+			if s[i] == 'x' && i+2 < len(s) {
+				v, err := strconv.ParseUint(s[i+1:i+3], 16, 8)
+				if err != nil {
+					return "", 0, false
+				}
+				b.WriteByte(byte(v))
+				i += 2
+				continue
+			}
+			j := i
+			for j < len(s) && j < i+3 && s[j] >= '0' && s[j] <= '7' {
+				j++
+			}
+			if j == i {
+				return "", 0, false
+			}
+			v, _ := strconv.ParseUint(s[i:j], 8, 8)
+			b.WriteByte(byte(v))
+			i = j - 1
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return "", 0, false
+}
+
+var cEscapes = map[byte]byte{
+	'"': '"', '\\': '\\', 'n': '\n', 't': '\t', 'r': '\r', 'v': '\v', 'f': '\f', 'a': '\a', 'b': '\b',
+}

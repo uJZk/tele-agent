@@ -87,6 +87,6 @@ tele 让 Claude Code 仍在本地运行，但它看到和操作的「世界」�
 | Grep、Glob、Claude 内部的 git 调用 | PATH 中的 `rg`、`git` shim | 远端 |
 | Read、Write、Edit、NotebookEdit，加载项目配置 | 进程内的文件系统调用 → telefs | 远端文件，经 FUSE 访问 |
 | API 请求、WebFetch、OAuth 刷新 | CONNECT 代理 | 本地网络出站 |
-| 必须看到本地进程的程序（例如 tree-kill 调用的 `ps`） | 本地 exec 代理 | 本地 |
+| 必须看到本地进程或本地桌面的程序（tree-kill 调用的 `ps`，打开浏览器、读写剪贴板） | 本地 exec 代理 | 本地 |
 
 所有 stdio MCP server 都在远端运行，包括本地 `~/.claude.json` 中配置的。
